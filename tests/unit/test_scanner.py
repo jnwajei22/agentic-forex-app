@@ -9,7 +9,7 @@ from app.services.scanner import scan_forex_watchlist
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "mock_candles.json"
 
 
-def test_scan_forex_watchlist_returns_ranked_placeholder_setups():
+def test_scan_forex_watchlist_returns_ranked_technical_setups():
     candle_data = json.loads(FIXTURE.read_text(encoding="utf-8"))
     setups = scan_forex_watchlist(candle_data, timeframe="1h")
 
@@ -21,6 +21,7 @@ def test_scan_forex_watchlist_returns_ranked_placeholder_setups():
         "pair", "timeframe", "direction", "score", "setup", "status"
     }
     assert {setup.direction.value for setup in setups} == {"long", "short"}
+    assert all(setup.fib_levels for setup in setups)
 
 
 def test_scan_rejects_unknown_pair():

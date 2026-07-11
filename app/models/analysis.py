@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.models.enums import Direction, SetupStatus
 
 class FibLevels(BaseModel):
@@ -19,4 +19,9 @@ class SetupAnalysis(BaseModel):
     status: SetupStatus
     setup: str
     trend: str
+    swing_high: float | None = None
+    swing_low: float | None = None
+    fib_levels: dict[str, float] = Field(default_factory=dict)
+    support_zones: list[float] = Field(default_factory=list)
+    resistance_zones: list[float] = Field(default_factory=list)
     summary: str

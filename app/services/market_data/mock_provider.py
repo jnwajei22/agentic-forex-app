@@ -1,0 +1,26 @@
+import json
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from app.models.market import Candle
+
+
+def parse_mock_candles(
+    payload: Mapping[str, Sequence[Candle | dict]],
+) -> dict[str, list[Candle]]:
+    """Validate mocked candle mappings and order every series chronologically."""
+    parsed: dict[str, list[Candle]] = {}
+    for pair, values in payload.items():
+        candles = [
+            value if isinstance(value, Candle) else Candle.model_validate(value)
+            for value in values
+        ]
+        parsed[pair] = sorted(candles, key=lambda candle: candle.timestamp)
+    return parsed
+
+
+def load_mock_candles(path: str | Path) -> dict[str, list[Candle]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Mock candle JSON must contain a pair-to-candles object.")
+    return parse_mock_candles(payload)
