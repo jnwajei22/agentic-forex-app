@@ -22,7 +22,11 @@ def create_order_preview(order: OrderRequest, account_balance: float = 1000.0) -
 
     return OrderPreview(
         preview_id=f"fxprev_{uuid4().hex[:12]}",
-        status=OrderPreviewStatus.preview_only,
+        status=(
+            OrderPreviewStatus.preview_only
+            if decision.allowed
+            else OrderPreviewStatus.rejected
+        ),
         pair=order.pair,
         side=order.side,
         order_type=order.order_type,

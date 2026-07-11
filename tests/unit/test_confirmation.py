@@ -10,3 +10,7 @@ def test_rejects_vague_confirmation():
 
 def test_accepts_exact_confirmation():
     assert is_exact_confirmation("EUR/USD", "Submit the EURUSD order.")
+
+def test_rejects_near_but_not_exact_confirmation():
+    assert not is_exact_confirmation("EUR/USD", "Submit the EURUSD order. ")
+    assert not is_exact_confirmation("EUR/USD", "submit the EURUSD order.")

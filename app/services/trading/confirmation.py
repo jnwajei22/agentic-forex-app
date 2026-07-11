@@ -3,4 +3,4 @@ def expected_confirmation_phrase(pair: str) -> str:
     return f"Submit the {normalized} order."
 
 def is_exact_confirmation(pair: str, phrase: str) -> bool:
-    return phrase.strip() == expected_confirmation_phrase(pair)
+    return phrase == expected_confirmation_phrase(pair)
