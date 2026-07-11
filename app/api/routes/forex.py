@@ -13,7 +13,8 @@ from app.models.api import (
 )
 from app.models.market import ForexPairConfig
 from app.services.charting.generator import generate_forex_chart
-from app.services.market_data.mock_provider import DEFAULT_MOCK_CANDLE_PATH, load_mock_candles
+from app.brokers.tradelocker.client import TradeLockerError
+from app.services.market_data.service import get_candles
 from app.services.scanner import scan_forex_watchlist
 from app.services.technical_analysis.analyzer import analyze_pair_from_candles
 from app.services.trading.previews import create_order_preview
@@ -22,7 +23,6 @@ from app.services.watchlist import get_default_watchlist, is_allowed_pair, norma
 
 router = APIRouter(prefix="/forex", tags=["forex"])
 DISCLAIMER = "This is analysis, not financial advice. Live trading carries risk."
-MOCK_CANDLE_PATH = DEFAULT_MOCK_CANDLE_PATH
 
 
 @router.get("/watchlist", response_model=list[ForexPairConfig])
@@ -42,17 +42,16 @@ def forex_scan(request: ForexScanRequest) -> ForexScanResponse:
 
 
 @router.post("/chart", response_model=ForexChartResponse)
-def forex_chart(request: ForexChartRequest) -> ForexChartResponse:
+async def forex_chart(request: ForexChartRequest) -> ForexChartResponse:
     pair = normalize_pair(request.pair)
     if not is_allowed_pair(pair):
         raise HTTPException(status_code=400, detail="Pair is not allowed.")
     try:
-        candle_data = load_mock_candles(MOCK_CANDLE_PATH)
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Mock candle data is unavailable.") from exc
-    candles = candle_data.get(pair)
+        candles = await get_candles(pair, request.timeframe, 300)
+    except (OSError, ValueError, TradeLockerError) as exc:
+        raise HTTPException(status_code=503, detail="Market data is unavailable.") from exc
     if not candles:
-        raise HTTPException(status_code=404, detail="No mocked candles found for pair.")
+        raise HTTPException(status_code=404, detail="No candles found for pair.")
 
     analysis = analyze_pair_from_candles(pair, request.timeframe, candles, "chart")
     metadata = generate_forex_chart(

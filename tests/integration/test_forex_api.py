@@ -71,7 +71,7 @@ def test_post_forex_chart_rejects_invalid_or_missing_pair():
     assert invalid.status_code == 400
     assert invalid.json()["detail"] == "Pair is not allowed."
     assert missing.status_code == 404
-    assert missing.json()["detail"] == "No mocked candles found for pair."
+    assert missing.json()["detail"] == "No candles found for pair."
 
 
 def test_order_preview_returns_rejected_object_with_risk_violations(monkeypatch):

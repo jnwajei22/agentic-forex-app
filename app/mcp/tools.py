@@ -1,13 +1,27 @@
 from typing import Any
 
+from app.brokers.tradelocker.adapter import get_tradelocker_adapter
+from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.models.orders import OrderRequest
 from app.services.charting.generator import generate_forex_chart
-from app.services.market_data.mock_provider import DEFAULT_MOCK_CANDLE_PATH, load_mock_candles
+from app.services.market_data.service import get_candles
 from app.services.scanner import scan_forex_watchlist as scan_watchlist
 from app.services.technical_analysis.analyzer import analyze_pair_from_candles
 from app.services.trading.previews import create_order_preview
 from app.services.watchlist import get_default_watchlist, is_allowed_pair, normalize_pair
+
+
+def _tradelocker_configured() -> bool:
+    return all(
+        (
+            settings.tradelocker_username,
+            settings.tradelocker_password,
+            settings.tradelocker_server,
+            settings.tradelocker_account_id,
+            settings.tradelocker_account_number,
+        )
+    )
 
 
 def get_forex_watchlist() -> list[dict[str, Any]]:
@@ -15,7 +29,7 @@ def get_forex_watchlist() -> list[dict[str, Any]]:
     return [item.model_dump(mode="json") for item in get_default_watchlist()]
 
 
-def scan_forex_watchlist(
+async def scan_forex_watchlist(
     timeframes: list[str],
     strategy_profile: str = "default",
     max_results: int = 10,
@@ -26,17 +40,18 @@ def scan_forex_watchlist(
     if max_results < 1:
         raise ValueError("max_results must be at least 1.")
 
-    candle_data = load_mock_candles(DEFAULT_MOCK_CANDLE_PATH)
-    results = [
-        setup
-        for timeframe in timeframes
-        for setup in scan_watchlist(candle_data, timeframe, strategy_profile)
-    ]
+    results = []
+    for timeframe in timeframes:
+        candle_data = {
+            item.pair: await get_candles(item.pair, timeframe, 300)
+            for item in get_default_watchlist()
+        }
+        results.extend(scan_watchlist(candle_data, timeframe, strategy_profile))
     ranked = sorted(results, key=lambda setup: setup.score, reverse=True)[:max_results]
     return [setup.model_dump(mode="json") for setup in ranked]
 
 
-def generate_chart(
+async def generate_chart(
     pair: str,
     timeframe: str,
     overlays: list[str],
@@ -48,7 +63,7 @@ def generate_chart(
     normalized_pair = normalize_pair(pair)
     if not is_allowed_pair(normalized_pair):
         raise ValueError(f"Unknown forex pair: {pair}")
-    candles = load_mock_candles(DEFAULT_MOCK_CANDLE_PATH).get(normalized_pair)
+    candles = await get_candles(normalized_pair, timeframe, 300)
     if not candles:
         raise ValueError(f"No mocked candles found for pair: {normalized_pair}")
     analysis = analyze_pair_from_candles(normalized_pair, timeframe, candles, "chart")
@@ -73,8 +88,13 @@ def review_forex_order(order_request: dict[str, Any]) -> dict[str, Any]:
     return preview.model_dump(mode="json")
 
 
-def get_account_status() -> dict[str, Any]:
-    """Return development paper-mode status without contacting a broker."""
+async def get_account_status() -> dict[str, Any]:
+    """Return paper status or read-only TradeLocker account state."""
+    if _tradelocker_configured():
+        try:
+            return await get_tradelocker_adapter().get_account()
+        except TradeLockerError as exc:
+            return exc.as_dict()
     return {
         "environment": "paper",
         "app_env": settings.app_env,
@@ -85,9 +105,48 @@ def get_account_status() -> dict[str, Any]:
     }
 
 
-def get_open_positions() -> list[dict[str, Any]]:
-    """Return paper-mode positions; persistence is not implemented yet."""
+async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
+    """Return paper positions or read-only TradeLocker positions."""
+    if _tradelocker_configured():
+        try:
+            return await get_tradelocker_adapter().get_open_positions()
+        except TradeLockerError as exc:
+            return exc.as_dict()
     return []
+
+
+async def get_tradelocker_config() -> dict[str, Any] | list[Any]:
+    """Return TradeLocker's read-only API configuration and field definitions."""
+    try:
+        return await get_tradelocker_adapter().client.get_config()
+    except TradeLockerError as exc:
+        return exc.as_dict()
+
+
+async def get_tradelocker_symbols() -> dict[str, Any] | list[Any]:
+    """Return instruments available to the configured TradeLocker account."""
+    try:
+        return await get_tradelocker_adapter().client.get_symbols()
+    except TradeLockerError as exc:
+        return exc.as_dict()
+
+
+async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
+    """Return a current read-only TradeLocker quote for a symbol."""
+    try:
+        return await get_tradelocker_adapter().get_quote(symbol)
+    except TradeLockerError as exc:
+        return exc.as_dict()
+
+
+async def get_tradelocker_candles(
+    symbol: str, timeframe: str, lookback: int = 300
+) -> dict[str, Any] | list[Any]:
+    """Return raw read-only TradeLocker historical bars for a symbol."""
+    try:
+        return await get_tradelocker_adapter().get_candles(symbol, timeframe, lookback)
+    except TradeLockerError as exc:
+        return exc.as_dict()
 
 
 def get_trade_log(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:

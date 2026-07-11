@@ -23,6 +23,10 @@ EXPECTED_TOOLS = {
     "get_account_status",
     "get_open_positions",
     "get_trade_log",
+    "get_tradelocker_config",
+    "get_tradelocker_symbols",
+    "get_tradelocker_quote",
+    "get_tradelocker_candles",
 }
 INITIALIZE_PAYLOAD = {
     "jsonrpc": "2.0",
@@ -210,9 +214,10 @@ async def test_mcp_server_registers_expected_tools():
     assert registered == EXPECTED_TOOLS
 
 
-def test_mcp_watchlist_and_scan_are_usable_and_ranked():
+@pytest.mark.asyncio
+async def test_mcp_watchlist_and_scan_are_usable_and_ranked():
     watchlist = tools.get_forex_watchlist()
-    results = tools.scan_forex_watchlist(["1h"], "default", 5)
+    results = await tools.scan_forex_watchlist(["1h"], "default", 5)
 
     assert watchlist
     assert watchlist[0]["pair"] == "EUR/USD"

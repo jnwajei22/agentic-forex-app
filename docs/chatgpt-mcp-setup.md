@@ -42,12 +42,14 @@ In ChatGPT, enable developer mode for connectors/apps if your plan and workspace
 https://mcp.justinnwajei.com/mcp/
 ```
 
-Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all seven connector tools are available. ChatGPT should discover:
+Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all connector tools are available. In addition to the forex analysis tools, the server exposes read-only TradeLocker config, symbol, quote, and candle tools under `forex:read` when TradeLocker credentials are configured.
 
 - `get_forex_watchlist`, `scan_forex_watchlist`, `generate_chart`, `get_account_status`, `get_open_positions`, and `get_trade_log` with `forex:read`
 - `review_forex_order` with `forex:preview`
 
 `set_kill_switch` and TradeLocker execution tools are intentionally not registered with the MCP server.
+
+TradeLocker market data is opt-in. Keep `MARKET_DATA_PROVIDER=mock` (the default) unless you explicitly want scans and charts to read TradeLocker candles. No setting enables TradeLocker order submission.
 
 ## Run locally
 

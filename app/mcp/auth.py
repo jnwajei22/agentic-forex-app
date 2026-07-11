@@ -24,6 +24,10 @@ TOOL_SCOPES = {
     "get_account_status": "forex:read",
     "get_open_positions": "forex:read",
     "get_trade_log": "forex:read",
+    "get_tradelocker_config": "forex:read",
+    "get_tradelocker_symbols": "forex:read",
+    "get_tradelocker_quote": "forex:read",
+    "get_tradelocker_candles": "forex:read",
 }
 
 _jwks_clients: dict[str, PyJWKClient] = {}
