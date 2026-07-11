@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
 from app.api.routes import forex
+from app.services.charting import generator
 from app.brokers.tradelocker.adapter import TradeLockerAdapter
 from app.config.settings import settings
 from app.main import app
@@ -38,27 +39,39 @@ def test_post_forex_scan_returns_ranked_results():
     assert scores == sorted(scores, reverse=True)
 
 
-def test_post_forex_chart_returns_placeholder_metadata(monkeypatch):
-    monkeypatch.setattr(
-        forex,
-        "generate_chart_placeholder",
-        lambda pair, timeframe: {
-            "chart_id": "chart_test",
-            "path": "storage/charts/chart_test.txt",
-            "summary": "Chart generation placeholder.",
-        },
-    )
+def test_post_forex_chart_returns_valid_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
     response = client.post(
         "/forex/chart",
-        json={"pair": "EUR/USD", "timeframe": "1h", "overlays": ["fib"]},
+        json={
+            "pair": "EUR/USD",
+            "timeframe": "1h",
+            "overlays": ["fib"],
+            "entry": 1.104,
+            "stop_loss": 1.099,
+            "take_profit": 1.112,
+        },
     )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "chart_id": "chart_test",
-        "path": "storage/charts/chart_test.txt",
-        "summary": "Chart generation placeholder.",
-    }
+    body = response.json()
+    assert body["chart_id"].startswith("chart_")
+    assert Path(body["path"]).is_file()
+    assert "Static candlestick analysis chart" in body["summary"]
+    assert body["pair"] == "EUR/USD"
+    assert body["timeframe"] == "1h"
+    assert body["trend"] in {"bullish", "bearish", "neutral", "choppy"}
+    assert body["generated_at"]
+
+
+def test_post_forex_chart_rejects_invalid_or_missing_pair():
+    invalid = client.post("/forex/chart", json={"pair": "XYZ/ABC"})
+    missing = client.post("/forex/chart", json={"pair": "USD/JPY"})
+
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Pair is not allowed."
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "No mocked candles found for pair."
 
 
 def test_order_preview_returns_rejected_object_with_risk_violations(monkeypatch):

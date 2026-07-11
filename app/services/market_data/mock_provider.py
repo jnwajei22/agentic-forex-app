@@ -4,6 +4,10 @@ from pathlib import Path
 
 from app.models.market import Candle
 
+DEFAULT_MOCK_CANDLE_PATH = (
+    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "mock_candles.json"
+)
+
 
 def parse_mock_candles(
     payload: Mapping[str, Sequence[Candle | dict]],

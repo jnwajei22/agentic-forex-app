@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.models.api import (
     ForexChartRequest,
@@ -12,14 +12,17 @@ from app.models.api import (
     OrderPreviewResponse,
 )
 from app.models.market import ForexPairConfig
-from app.services.charting.generator import generate_chart_placeholder
+from app.services.charting.generator import generate_forex_chart
+from app.services.market_data.mock_provider import DEFAULT_MOCK_CANDLE_PATH, load_mock_candles
 from app.services.scanner import scan_forex_watchlist
+from app.services.technical_analysis.analyzer import analyze_pair_from_candles
 from app.services.trading.previews import create_order_preview
-from app.services.watchlist import get_default_watchlist
+from app.services.watchlist import get_default_watchlist, is_allowed_pair, normalize_pair
 
 
 router = APIRouter(prefix="/forex", tags=["forex"])
 DISCLAIMER = "This is analysis, not financial advice. Live trading carries risk."
+MOCK_CANDLE_PATH = DEFAULT_MOCK_CANDLE_PATH
 
 
 @router.get("/watchlist", response_model=list[ForexPairConfig])
@@ -40,10 +43,29 @@ def forex_scan(request: ForexScanRequest) -> ForexScanResponse:
 
 @router.post("/chart", response_model=ForexChartResponse)
 def forex_chart(request: ForexChartRequest) -> ForexChartResponse:
-    # Overlays are accepted for forward compatibility but charting remains a stub.
-    return ForexChartResponse(
-        **generate_chart_placeholder(request.pair, request.timeframe)
+    pair = normalize_pair(request.pair)
+    if not is_allowed_pair(pair):
+        raise HTTPException(status_code=400, detail="Pair is not allowed.")
+    try:
+        candle_data = load_mock_candles(MOCK_CANDLE_PATH)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Mock candle data is unavailable.") from exc
+    candles = candle_data.get(pair)
+    if not candles:
+        raise HTTPException(status_code=404, detail="No mocked candles found for pair.")
+
+    analysis = analyze_pair_from_candles(pair, request.timeframe, candles, "chart")
+    metadata = generate_forex_chart(
+        pair=pair,
+        timeframe=request.timeframe,
+        candles=candles,
+        analysis=analysis,
+        overlays=request.overlays,
+        entry=request.entry,
+        stop_loss=request.stop_loss,
+        take_profit=request.take_profit,
     )
+    return ForexChartResponse(**metadata)
 
 
 @router.post("/order-preview", response_model=OrderPreviewResponse)

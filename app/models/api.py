@@ -24,12 +24,19 @@ class ForexChartRequest(BaseModel):
     pair: str
     timeframe: str = "1h"
     overlays: list[str] = Field(default_factory=list)
+    entry: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
 
 class ForexChartResponse(BaseModel):
     chart_id: str
     path: str
     summary: str
+    pair: str
+    timeframe: str
+    trend: str
+    generated_at: datetime
 
 
 class OrderPreviewRequest(OrderRequest):
