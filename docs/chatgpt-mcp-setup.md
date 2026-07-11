@@ -4,7 +4,9 @@ Agentic Forex Desk exposes a Streamable HTTP MCP server at `https://mcp.justinnw
 
 ## Configure an OAuth provider
 
-Use an external OIDC/OAuth provider such as Auth0. Do not place a client secret in this server: the MCP server is the protected resource and verifies access tokens issued to ChatGPT.
+Use an external OIDC/OAuth provider such as Auth0. `AUTH_ISSUER` is required whenever `MCP_REQUIRE_OAUTH=true` and must be the real issuer URL published by that provider; it is not the MCP server URL and cannot be a placeholder. Do not place a client secret in this server: the MCP server is the protected resource and verifies access tokens issued to ChatGPT.
+
+If OAuth is required and `AUTH_ISSUER` is empty, the protected-resource metadata endpoint returns a `503` configuration error. This prevents it from advertising an empty `authorization_servers` list, which ChatGPT cannot use to begin OAuth discovery.
 
 For Auth0:
 
@@ -19,10 +21,12 @@ Configure the deployment environment:
 ```dotenv
 MCP_REQUIRE_OAUTH=true
 MCP_ALLOW_PUBLIC_NO_AUTH=false
-AUTH_ISSUER=https://YOUR_AUTH0_DOMAIN/
+AUTH_ISSUER=https://agentic-forex.us.auth0.com/
 AUTH_AUDIENCE=https://mcp.justinnwajei.com
-AUTH_JWKS_URL=https://YOUR_AUTH0_DOMAIN/.well-known/jwks.json
+AUTH_JWKS_URL=https://agentic-forex.us.auth0.com/.well-known/jwks.json
 ```
+
+Replace `agentic-forex.us.auth0.com` with the domain assigned by Auth0, or use the issuer and JWKS URL published by your chosen OIDC/OAuth provider. Preserve the issuer's trailing slash when the provider publishes one; JWT issuer validation requires an exact match.
 
 The audience defaults to `https://mcp.justinnwajei.com` when `AUTH_AUDIENCE` is empty. Restart the server after changing these values.
 
@@ -43,6 +47,8 @@ https://mcp.justinnwajei.com/mcp/
 ```
 
 Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all connector tools are available. In addition to the forex analysis tools, the server exposes read-only TradeLocker config, symbol, quote, and candle tools under `forex:read` when TradeLocker credentials are configured.
+
+TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_URL`, `TRADELOCKER_USERNAME`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`, then run `get_tradelocker_accounts`. Copy the returned `accountId` and `accNum` into `TRADELOCKER_ACCOUNT_ID` and `TRADELOCKER_ACCOUNT_NUMBER` before using account-specific config, status, positions, symbols, quotes, or candles. Discovery never returns the configured password or TradeLocker tokens.
 
 - `get_forex_watchlist`, `scan_forex_watchlist`, `generate_chart`, `get_account_status`, `get_open_positions`, and `get_trade_log` with `forex:read`
 - `review_forex_order` with `forex:preview`

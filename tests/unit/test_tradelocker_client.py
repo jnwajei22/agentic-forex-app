@@ -16,15 +16,19 @@ def _token() -> str:
     )
 
 
-def _client(handler) -> TradeLockerClient:
+def _client(handler, **overrides) -> TradeLockerClient:
+    config = {
+        "base_url": "https://demo.tradelocker.test/backend-api",
+        "username": "user@example.test",
+        "password": "never-log-this",
+        "server": "DEMO",
+        "account_id": "12345",
+        "account_number": "2",
+        "transport": httpx.MockTransport(handler),
+    }
+    config.update(overrides)
     return TradeLockerClient(
-        base_url="https://demo.tradelocker.test/backend-api",
-        username="user@example.test",
-        password="never-log-this",
-        server="DEMO",
-        account_id="12345",
-        account_number="2",
-        transport=httpx.MockTransport(handler),
+        **config,
     )
 
 
@@ -69,8 +73,95 @@ async def test_config_accounts_and_symbols_use_documented_read_routes():
 
     async with _client(handler) as client:
         assert "positionsConfig" in await client.get_config()
-        assert "accounts" in await client.get_accounts()
+        assert await client.get_accounts() == {
+            "accounts": [{"accountId": 12345, "accNum": 2}]
+        }
         assert await client.get_symbols() == {"instruments": []}
+
+
+@pytest.mark.asyncio
+async def test_account_discovery_does_not_require_account_selection():
+    secret_token = _token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/jwt/token"):
+            return httpx.Response(201, json={"accessToken": secret_token})
+        assert request.url.path.endswith("/auth/jwt/all-accounts")
+        assert "accnum" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "accounts": [{
+                    "id": 45678,
+                    "accNum": 3,
+                    "name": "Demo account",
+                    "currency": "USD",
+                    "accessToken": secret_token,
+                    "password": "must-not-escape",
+                }]
+            },
+        )
+
+    async with _client(handler, account_id=None, account_number=None) as client:
+        result = await client.get_accounts()
+
+    assert result == {
+        "accounts": [{
+            "accountId": 45678,
+            "accNum": 3,
+            "name": "Demo account",
+            "currency": "USD",
+        }]
+    }
+    assert secret_token not in str(result)
+    assert "must-not-escape" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_account_specific_config_requires_discovered_account_number():
+    client = _client(lambda request: httpx.Response(500), account_number=None)
+
+    with pytest.raises(TradeLockerError) as caught:
+        await client.get_config()
+    await client.aclose()
+
+    assert caught.value.code == "not_configured"
+    assert str(caught.value) == (
+        "Account number is required for account-specific config. "
+        "Run get_tradelocker_accounts first."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["password", "server"])
+async def test_discovery_rejects_incomplete_login_config(missing):
+    client = _client(lambda request: httpx.Response(500), **{missing: None}, account_number=None)
+
+    with pytest.raises(TradeLockerError) as caught:
+        await client.get_accounts()
+    await client.aclose()
+
+    expected_name = f"TRADELOCKER_{missing.upper()}"
+    assert caught.value.code == "not_configured"
+    assert expected_name in str(caught.value)
+    assert "never-log-this" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_discovery_does_not_log_password_or_token(caplog):
+    secret_token = _token()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/jwt/token"):
+            return httpx.Response(201, json={"accessToken": secret_token})
+        return httpx.Response(500, json={"accessToken": secret_token})
+
+    async with _client(handler, account_id=None, account_number=None) as client:
+        with pytest.raises(TradeLockerError):
+            await client.get_accounts()
+
+    assert "never-log-this" not in caplog.text
+    assert secret_token not in caplog.text
 
 
 @pytest.mark.asyncio

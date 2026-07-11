@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from app.api.routes.health import router as health_router
 from app.api.routes.forex import router as forex_router
 from app.webhooks.tradingview import router as tradingview_router
@@ -16,6 +16,14 @@ app.add_middleware(MCPAuthMiddleware)
 
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_protected_resource_metadata() -> dict[str, object]:
+    if settings.mcp_require_oauth and not settings.auth_issuer:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OAuth is required but AUTH_ISSUER is not configured. "
+                "Set AUTH_ISSUER to the issuer URL of a real OIDC/OAuth provider."
+            ),
+        )
     return {
         "resource": "https://mcp.justinnwajei.com",
         "authorization_servers": [settings.auth_issuer] if settings.auth_issuer else [],

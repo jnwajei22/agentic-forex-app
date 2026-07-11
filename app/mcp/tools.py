@@ -116,9 +116,23 @@ async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
 
 
 async def get_tradelocker_config() -> dict[str, Any] | list[Any]:
-    """Return TradeLocker's read-only API configuration and field definitions."""
+    """Return account-specific TradeLocker config. Run get_tradelocker_accounts first."""
     try:
         return await get_tradelocker_adapter().client.get_config()
+    except TradeLockerError as exc:
+        return exc.as_dict()
+
+
+async def get_tradelocker_accounts() -> dict[str, Any]:
+    """Discover TradeLocker accounts using login credentials only.
+
+    Run this first without an account ID or account number. Copy an accountId and
+    accNum from the sanitized result into TRADELOCKER_ACCOUNT_ID and
+    TRADELOCKER_ACCOUNT_NUMBER in .env, then restart the server before calling
+    account-specific TradeLocker tools.
+    """
+    try:
+        return await get_tradelocker_adapter().client.get_accounts()
     except TradeLockerError as exc:
         return exc.as_dict()
 

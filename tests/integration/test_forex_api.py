@@ -40,6 +40,7 @@ def test_post_forex_scan_returns_ranked_results():
 
 
 def test_post_forex_chart_returns_valid_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "market_data_provider", "mock")
     monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
     response = client.post(
         "/forex/chart",
@@ -64,7 +65,8 @@ def test_post_forex_chart_returns_valid_metadata(tmp_path, monkeypatch):
     assert body["generated_at"]
 
 
-def test_post_forex_chart_rejects_invalid_or_missing_pair():
+def test_post_forex_chart_rejects_invalid_or_missing_pair(monkeypatch):
+    monkeypatch.setattr(settings, "market_data_provider", "mock")
     invalid = client.post("/forex/chart", json={"pair": "XYZ/ABC"})
     missing = client.post("/forex/chart", json={"pair": "USD/JPY"})
 

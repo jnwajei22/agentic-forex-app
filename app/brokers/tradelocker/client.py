@@ -83,11 +83,43 @@ class TradeLockerClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    def _credentials(self) -> dict[str, str]:
-        if not self.username or not self.password or not self.server:
-            raise TradeLockerError(
-                "login", "TradeLocker credentials are not configured.", code="not_configured"
+    def validate_login_config(self, operation: str = "login") -> None:
+        missing = [
+            name
+            for name, value in (
+                ("TRADELOCKER_BASE_URL", self.base_url),
+                ("TRADELOCKER_USERNAME", self.username),
+                ("TRADELOCKER_PASSWORD", self.password),
+                ("TRADELOCKER_SERVER", self.server),
             )
+            if not value
+        ]
+        if missing:
+            raise TradeLockerError(
+                operation,
+                f"TradeLocker login configuration is incomplete: {', '.join(missing)}.",
+                code="not_configured",
+            )
+
+    def validate_account_config(self, operation: str = "account") -> None:
+        self.validate_login_config(operation)
+        missing = [
+            name
+            for name, value in (
+                ("TRADELOCKER_ACCOUNT_ID", self.account_id),
+                ("TRADELOCKER_ACCOUNT_NUMBER", self.account_number),
+            )
+            if not value
+        ]
+        if missing:
+            raise TradeLockerError(
+                operation,
+                f"TradeLocker account configuration is incomplete: {', '.join(missing)}.",
+                code="not_configured",
+            )
+
+    def _credentials(self) -> dict[str, str]:
+        self.validate_login_config()
         return {"email": self.username, "password": self.password, "server": self.server}
 
     async def login(self, *, force: bool = False) -> str:
@@ -122,10 +154,16 @@ class TradeLockerClient:
             pass
         return time.time() + 300
 
-    def _account_headers(self) -> dict[str, str]:
+    def _account_headers(self, operation: str = "account") -> dict[str, str]:
         if not self.account_number:
+            message = "TradeLocker account number is not configured."
+            if operation == "get_config":
+                message = (
+                    "Account number is required for account-specific config. "
+                    "Run get_tradelocker_accounts first."
+                )
             raise TradeLockerError(
-                "account", "TradeLocker account number is not configured.", code="not_configured"
+                operation, message, code="not_configured"
             )
         return {"accNum": self.account_number}
 
@@ -176,11 +214,39 @@ class TradeLockerClient:
 
     async def get_config(self) -> Any:
         return await self._optional_get(
-            "/trade/config", operation="get_config", headers=self._account_headers()
+            "/trade/config",
+            operation="get_config",
+            headers=self._account_headers("get_config"),
         )
 
     async def get_accounts(self) -> Any:
-        return await self._optional_get("/auth/jwt/all-accounts", operation="get_accounts")
+        self.validate_login_config("get_accounts")
+        payload = await self._optional_get(
+            "/auth/jwt/all-accounts", operation="get_accounts"
+        )
+        if isinstance(payload, dict) and payload.get("status") == "not_implemented":
+            return payload
+        container = payload.get("d", payload) if isinstance(payload, dict) else {}
+        records = container.get("accounts", []) if isinstance(container, dict) else []
+        if not isinstance(records, list):
+            raise TradeLockerError(
+                "get_accounts",
+                "TradeLocker returned an unusable accounts response.",
+                code="invalid_response",
+            )
+        safe_records = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            safe_record = {}
+            account_id = record.get("accountId", record.get("id"))
+            if account_id is not None:
+                safe_record["accountId"] = account_id
+            for key in ("accNum", "name", "currency", "status"):
+                if key in record:
+                    safe_record[key] = record[key]
+            safe_records.append(safe_record)
+        return {"accounts": safe_records}
 
     async def get_account_status(self) -> Any:
         return await self._optional_get(

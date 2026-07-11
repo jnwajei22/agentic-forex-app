@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from app.brokers.tradelocker.adapter import TradeLockerAdapter
+from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.main import app
 from app.mcp import tools
@@ -23,6 +24,7 @@ EXPECTED_TOOLS = {
     "get_account_status",
     "get_open_positions",
     "get_trade_log",
+    "get_tradelocker_accounts",
     "get_tradelocker_config",
     "get_tradelocker_symbols",
     "get_tradelocker_quote",
@@ -49,7 +51,19 @@ def _enable_test_oauth(monkeypatch, scopes="forex:read forex:preview"):
     monkeypatch.setattr(auth, "_verify_access_token", lambda token: {"scope": scopes})
 
 
-def test_protected_resource_metadata(monkeypatch):
+def test_missing_auth_issuer_is_invalid_when_oauth_is_required(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_require_oauth", True)
+    monkeypatch.setattr(settings, "auth_issuer", None)
+    with TestClient(app) as client:
+        response = client.get("/.well-known/oauth-protected-resource")
+
+    assert response.status_code == 503
+    assert "AUTH_ISSUER is not configured" in response.json()["detail"]
+    assert "authorization_servers" not in response.json()
+
+
+def test_protected_resource_metadata_contains_oauth_configuration(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_require_oauth", True)
     monkeypatch.setattr(settings, "auth_issuer", "https://tenant.auth0.com/")
     with TestClient(app) as client:
         response = client.get("/.well-known/oauth-protected-resource")
@@ -81,6 +95,7 @@ def test_mcp_endpoint_initializes_and_advertises_tools(monkeypatch):
     assert '"tools":{"listChanged":true}' in response.text
     assert '"name":"Agentic Forex Desk"' in response.text
     assert tool_response.status_code == 200
+    assert '"name":"get_tradelocker_accounts"' in tool_response.text
     for tool_name in EXPECTED_TOOLS:
         assert f'"name":"{tool_name}"' in tool_response.text
 
@@ -210,12 +225,56 @@ def test_shared_secret_remains_available_for_explicit_manual_mode(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mcp_server_registers_expected_tools():
-    registered = {tool.name for tool in await mcp.list_tools()}
+    listed_tools = await mcp.list_tools()
+    registered = {tool.name for tool in listed_tools}
     assert registered == EXPECTED_TOOLS
+    discovery = next(tool for tool in listed_tools if tool.name == "get_tradelocker_accounts")
+    assert "Run this first" in discovery.description
+    assert "TRADELOCKER_ACCOUNT_ID" in discovery.description
+    assert "restart the server" in discovery.description
 
 
 @pytest.mark.asyncio
-async def test_mcp_watchlist_and_scan_are_usable_and_ranked():
+async def test_mcp_account_discovery_tool_returns_client_result(monkeypatch):
+    result = {"accounts": [{"accountId": 12345, "accNum": 2}]}
+    client = SimpleNamespace(get_accounts=AsyncMock(return_value=result))
+    monkeypatch.setattr(
+        tools,
+        "get_tradelocker_adapter",
+        lambda: SimpleNamespace(client=client),
+    )
+
+    assert await tools.get_tradelocker_accounts() == result
+    client.get_accounts.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_mcp_account_discovery_tool_rejects_missing_login_config(monkeypatch):
+    client = SimpleNamespace(
+        get_accounts=AsyncMock(
+            side_effect=TradeLockerError(
+                "get_accounts",
+                "TradeLocker login configuration is incomplete: TRADELOCKER_PASSWORD.",
+                code="not_configured",
+            )
+        )
+    )
+    monkeypatch.setattr(
+        tools,
+        "get_tradelocker_adapter",
+        lambda: SimpleNamespace(client=client),
+    )
+
+    result = await tools.get_tradelocker_accounts()
+
+    assert result["status"] == "error"
+    assert result["error"] == "not_configured"
+    assert "TRADELOCKER_PASSWORD" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_watchlist_and_scan_are_usable_and_ranked(monkeypatch):
+    monkeypatch.setattr(settings, "market_data_provider", "mock")
     watchlist = tools.get_forex_watchlist()
     results = await tools.scan_forex_watchlist(["1h"], "default", 5)
 
