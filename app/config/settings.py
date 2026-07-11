@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     tradingview_webhook_secret: str | None = None
     mcp_shared_secret: str | None = None
     mcp_allow_public_no_auth: bool = False
+    mcp_require_oauth: bool = True
+    auth_issuer: str | None = None
+    auth_audience: str | None = None
+    auth_jwks_url: str | None = None
 
     live_trading_enabled: bool = False
     kill_switch_enabled: bool = True

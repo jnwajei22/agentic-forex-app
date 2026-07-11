@@ -1,14 +1,32 @@
 import hmac
+import json
 import logging
+from collections.abc import Iterable
 
+import anyio
+import jwt
+from jwt import PyJWKClient
 from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config.settings import settings
 
 
 logger = logging.getLogger(__name__)
-LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+RESOURCE = "https://mcp.justinnwajei.com"
+RESOURCE_METADATA_URL = f"{RESOURCE}/.well-known/oauth-protected-resource"
+OAUTH_CHALLENGE = f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'
+TOOL_SCOPES = {
+    "get_forex_watchlist": "forex:read",
+    "scan_forex_watchlist": "forex:read",
+    "generate_chart": "forex:read",
+    "review_forex_order": "forex:preview",
+    "get_account_status": "forex:read",
+    "get_open_positions": "forex:read",
+    "get_trade_log": "forex:read",
+}
+
+_jwks_clients: dict[str, PyJWKClient] = {}
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -18,35 +36,91 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-def _is_local_development_request(scope: Scope) -> bool:
-    client = scope.get("client")
-    client_host = client[0].lower() if client else ""
-    host = (_header(scope, b"host") or "").lower()
-    host_is_local = (
-        host == "localhost"
-        or host.startswith("localhost:")
-        or host == "127.0.0.1"
-        or host.startswith("127.0.0.1:")
-        or host == "::1"
-        or host.startswith("[::1]")
+def _bearer_token(scope: Scope) -> str | None:
+    scheme, separator, token = (_header(scope, b"authorization") or "").partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token:
+        return None
+    return token
+
+
+def _verify_access_token(token: str) -> dict:
+    if not settings.auth_issuer or not settings.auth_jwks_url:
+        raise RuntimeError("OAuth issuer and JWKS URL must be configured.")
+    client = _jwks_clients.setdefault(
+        settings.auth_jwks_url, PyJWKClient(settings.auth_jwks_url)
     )
-    return settings.app_env == "development" and client_host in LOCAL_HOSTS and host_is_local
+    signing_key = client.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+        audience=settings.auth_audience or RESOURCE,
+        issuer=settings.auth_issuer,
+        options={"require": ["exp", "iss", "aud"]},
+    )
+
+
+def _token_scopes(claims: dict) -> set[str]:
+    value = claims.get("scope", claims.get("scp", ""))
+    if isinstance(value, str):
+        return set(value.split())
+    if isinstance(value, Iterable):
+        return {str(scope) for scope in value}
+    return set()
+
+
+async def _read_body(receive: Receive) -> tuple[bytes, Receive]:
+    body = bytearray()
+    more_body = True
+    while more_body:
+        message = await receive()
+        body.extend(message.get("body", b""))
+        more_body = message.get("more_body", False)
+
+    delivered = False
+
+    async def replay() -> Message:
+        nonlocal delivered
+        if delivered:
+            return await receive()
+        delivered = True
+        return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+    return bytes(body), replay
+
+
+def _required_scopes(body: bytes) -> set[str]:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return set()
+    requests = payload if isinstance(payload, list) else [payload]
+    return {
+        TOOL_SCOPES[name]
+        for request in requests
+        if isinstance(request, dict) and request.get("method") == "tools/call"
+        if isinstance(request.get("params"), dict)
+        if (name := request["params"].get("name")) in TOOL_SCOPES
+    }
+
+
+async def _json_response(
+    scope: Scope, receive: Receive, send: Send, detail: str, status_code: int, challenge: str
+) -> None:
+    await JSONResponse(
+        {"detail": detail},
+        status_code=status_code,
+        headers={"WWW-Authenticate": challenge},
+    )(scope, receive, send)
 
 
 class MCPAuthMiddleware:
-    """Protect only the remote MCP transport with bearer authentication."""
+    """Protect the remote MCP transport with OAuth or an explicit test-only mode."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
         if settings.mcp_allow_public_no_auth:
-            logger.warning(
-                "WARNING: MCP public no-auth mode is enabled. Do not use with live "
-                "trading or broker credentials."
-            )
-        elif not settings.mcp_shared_secret and settings.app_env == "development":
-            logger.warning(
-                "MCP authentication is disabled for localhost development access only."
-            )
+            logger.warning("MCP public no-auth mode is enabled for manual testing.")
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not (
@@ -55,32 +129,49 @@ class MCPAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        secret = settings.mcp_shared_secret
-        if settings.mcp_allow_public_no_auth:
-            await self.app(scope, receive, send)
-            return
-
-        if not secret:
-            if _is_local_development_request(scope):
+        if not settings.mcp_require_oauth:
+            if settings.mcp_allow_public_no_auth:
                 await self.app(scope, receive, send)
                 return
-            await JSONResponse(
-                {"detail": "MCP authentication is not configured."}, status_code=503
-            )(scope, receive, send)
+            token = _bearer_token(scope)
+            if settings.mcp_shared_secret and token and hmac.compare_digest(
+                token, settings.mcp_shared_secret
+            ):
+                await self.app(scope, receive, send)
+                return
+            await _json_response(
+                scope, receive, send, "Invalid or missing MCP bearer token.", 401, "Bearer"
+            )
             return
 
-        authorization = _header(scope, b"authorization")
-        scheme, separator, token = (authorization or "").partition(" ")
-        if (
-            not separator
-            or scheme.lower() != "bearer"
-            or not hmac.compare_digest(token, secret)
-        ):
-            await JSONResponse(
-                {"detail": "Invalid or missing MCP bearer token."},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )(scope, receive, send)
+        token = _bearer_token(scope)
+        if not token:
+            await _json_response(
+                scope, receive, send, "OAuth access token is required.", 401, OAUTH_CHALLENGE
+            )
             return
 
-        await self.app(scope, receive, send)
+        try:
+            claims = await anyio.to_thread.run_sync(_verify_access_token, token)
+        except RuntimeError as exc:
+            logger.error("MCP OAuth configuration error: %s", exc)
+            await JSONResponse({"detail": str(exc)}, status_code=503)(scope, receive, send)
+            return
+        except jwt.PyJWTError:
+            await _json_response(
+                scope, receive, send, "Invalid OAuth access token.", 401, OAUTH_CHALLENGE
+            )
+            return
+
+        body, replay = await _read_body(receive)
+        required = _required_scopes(body)
+        missing = required - _token_scopes(claims)
+        if missing:
+            required_scope = " ".join(sorted(missing))
+            challenge = f'{OAUTH_CHALLENGE}, error="insufficient_scope", scope="{required_scope}"'
+            await _json_response(
+                scope, replay, send, "OAuth token has insufficient scope.", 403, challenge
+            )
+            return
+
+        await self.app(scope, replay, send)

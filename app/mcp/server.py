@@ -18,6 +18,5 @@ mcp.tool(tools.review_forex_order)
 mcp.tool(tools.get_account_status)
 mcp.tool(tools.get_open_positions)
 mcp.tool(tools.get_trade_log)
-mcp.tool(tools.set_kill_switch)
 
 mcp_app = mcp.http_app(path="/", stateless_http=True)
