@@ -62,6 +62,7 @@ def test_mcp_endpoint_initializes_and_advertises_tools(monkeypatch):
 
 def test_mcp_missing_auth_is_rejected_when_secret_is_set(monkeypatch):
     monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    monkeypatch.setattr(settings, "mcp_allow_public_no_auth", False)
     with TestClient(app) as client:
         response = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
 
@@ -71,6 +72,7 @@ def test_mcp_missing_auth_is_rejected_when_secret_is_set(monkeypatch):
 
 def test_mcp_invalid_auth_is_rejected(monkeypatch):
     monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    monkeypatch.setattr(settings, "mcp_allow_public_no_auth", False)
     with TestClient(app) as client:
         response = client.post(
             "/mcp",
@@ -83,6 +85,7 @@ def test_mcp_invalid_auth_is_rejected(monkeypatch):
 
 def test_mcp_valid_auth_is_accepted(monkeypatch):
     monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    monkeypatch.setattr(settings, "mcp_allow_public_no_auth", False)
     with TestClient(app) as client:
         response = client.post(
             "/mcp",
@@ -105,11 +108,27 @@ def test_mcp_without_secret_allows_localhost_development(monkeypatch):
 
 def test_mcp_without_secret_rejects_nonlocal_development(monkeypatch):
     monkeypatch.setattr(settings, "mcp_shared_secret", None)
+    monkeypatch.setattr(settings, "mcp_allow_public_no_auth", False)
     monkeypatch.setattr(settings, "app_env", "development")
     with TestClient(app, base_url="https://public.example") as client:
         response = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
 
     assert response.status_code == 503
+
+
+def test_public_no_auth_allows_mcp_tools_list(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", None)
+    monkeypatch.setattr(settings, "mcp_allow_public_no_auth", True)
+    with TestClient(app, base_url="https://public.example") as client:
+        response = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers=MCP_HEADERS,
+        )
+
+    assert response.status_code == 200
+    for tool_name in EXPECTED_TOOLS:
+        assert f'"name":"{tool_name}"' in response.text
 
 
 @pytest.mark.asyncio

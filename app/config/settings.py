@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     database_url: str | None = None
     tradingview_webhook_secret: str | None = None
     mcp_shared_secret: str | None = None
+    mcp_allow_public_no_auth: bool = False
 
     live_trading_enabled: bool = False
     kill_switch_enabled: bool = True

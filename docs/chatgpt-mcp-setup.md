@@ -23,6 +23,14 @@ ChatGPT cannot connect directly to localhost. Use an HTTPS tunnel for developmen
 
 If `MCP_SHARED_SECRET` is empty, `/mcp` accepts only localhost development requests and logs a warning that authentication is disabled. A tunnel uses a public Host header and will be rejected until a shared secret is configured.
 
+For temporary connector testing only, public no-auth mode can be explicitly enabled:
+
+```dotenv
+MCP_ALLOW_PUBLIC_NO_AUTH=true
+```
+
+Restart Uvicorn after changing it. This bypass affects only `/mcp`; it does not disable TradingView webhook authentication. The server logs: `WARNING: MCP public no-auth mode is enabled. Do not use with live trading or broker credentials.` Restore `MCP_ALLOW_PUBLIC_NO_AUTH=false` immediately after testing.
+
 ## Configure MCP authentication
 
 Generate a strong random secret outside the source tree and set it in your local `.env` file or deployment environment:
@@ -87,4 +95,4 @@ Current OpenAI guidance for building ChatGPT apps is available in the [Apps SDK 
 - TradeLocker submission is not implemented and is never called.
 - Remote MCP callers cannot disable the kill switch.
 - Do not put broker API keys, account credentials, webhook secrets, tokens, or other secrets in ChatGPT instructions.
-- Development tunnels expose the service publicly. `MCP_SHARED_SECRET` is required for tunneled access; add stronger production authentication and hardening before broader deployment.
+- Development tunnels expose the service publicly. Use `MCP_SHARED_SECRET` for normal tunneled access. The temporary public no-auth override must remain off outside short, controlled development tests.

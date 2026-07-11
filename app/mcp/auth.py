@@ -38,7 +38,12 @@ class MCPAuthMiddleware:
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
-        if not settings.mcp_shared_secret and settings.app_env == "development":
+        if settings.mcp_allow_public_no_auth:
+            logger.warning(
+                "WARNING: MCP public no-auth mode is enabled. Do not use with live "
+                "trading or broker credentials."
+            )
+        elif not settings.mcp_shared_secret and settings.app_env == "development":
             logger.warning(
                 "MCP authentication is disabled for localhost development access only."
             )
@@ -51,6 +56,10 @@ class MCPAuthMiddleware:
             return
 
         secret = settings.mcp_shared_secret
+        if settings.mcp_allow_public_no_auth:
+            await self.app(scope, receive, send)
+            return
+
         if not secret:
             if _is_local_development_request(scope):
                 await self.app(scope, receive, send)
