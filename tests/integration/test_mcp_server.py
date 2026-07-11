@@ -20,35 +20,35 @@ EXPECTED_TOOLS = {
     "get_trade_log",
     "set_kill_switch",
 }
+INITIALIZE_PAYLOAD = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "pytest", "version": "1.0"},
+    },
+}
+MCP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
 
 
-def test_mcp_endpoint_initializes_and_advertises_tools():
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "pytest", "version": "1.0"},
-        },
-    }
-    with TestClient(app) as client:
+def test_mcp_endpoint_initializes_and_advertises_tools(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", None)
+    monkeypatch.setattr(settings, "app_env", "development")
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.post(
             "/mcp",
-            json=payload,
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-            },
+            json=INITIALIZE_PAYLOAD,
+            headers=MCP_HEADERS,
         )
         tool_response = client.post(
             "/mcp",
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-            },
+            headers=MCP_HEADERS,
         )
 
     assert response.status_code == 200
@@ -58,6 +58,58 @@ def test_mcp_endpoint_initializes_and_advertises_tools():
     assert tool_response.status_code == 200
     for tool_name in EXPECTED_TOOLS:
         assert f'"name":"{tool_name}"' in tool_response.text
+
+
+def test_mcp_missing_auth_is_rejected_when_secret_is_set(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    with TestClient(app) as client:
+        response = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_mcp_invalid_auth_is_rejected(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            json=INITIALIZE_PAYLOAD,
+            headers={**MCP_HEADERS, "Authorization": "Bearer wrong-secret"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_mcp_valid_auth_is_accepted(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            json=INITIALIZE_PAYLOAD,
+            headers={**MCP_HEADERS, "Authorization": "Bearer test-mcp-secret"},
+        )
+
+    assert response.status_code == 200
+    assert '"name":"Agentic Forex Desk"' in response.text
+
+
+def test_mcp_without_secret_allows_localhost_development(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", None)
+    monkeypatch.setattr(settings, "app_env", "development")
+    with TestClient(app, base_url="http://localhost") as client:
+        response = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
+
+    assert response.status_code == 200
+
+
+def test_mcp_without_secret_rejects_nonlocal_development(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_shared_secret", None)
+    monkeypatch.setattr(settings, "app_env", "development")
+    with TestClient(app, base_url="https://public.example") as client:
+        response = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
+
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
