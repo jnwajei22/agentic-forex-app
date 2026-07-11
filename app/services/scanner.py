@@ -10,6 +10,7 @@ from app.services.watchlist import is_allowed_pair, normalize_pair
 def scan_forex_watchlist(
     candle_data: Mapping[str, Sequence[Candle | dict]],
     timeframe: str = "1h",
+    strategy_profile: str = "default",
 ) -> list[SetupAnalysis]:
     """Analyze and rank setups from caller-supplied mocked candles."""
     setups: list[SetupAnalysis] = []
@@ -23,7 +24,7 @@ def scan_forex_watchlist(
         if len(candles) < 2:
             continue
         setups.append(
-            analyze_pair_from_candles(pair, timeframe, candles, "default")
+            analyze_pair_from_candles(pair, timeframe, candles, strategy_profile)
         )
 
     return sorted(setups, key=lambda setup: setup.score, reverse=True)

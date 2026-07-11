@@ -12,3 +12,4 @@ sqlalchemy
 psycopg2-binary
 pytest
 pytest-asyncio
+fastmcp>=3.4.4,<4
