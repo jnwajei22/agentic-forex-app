@@ -29,7 +29,19 @@ const knownStatuses = new Set<string>(TRADELOCKER_STATUSES);
 
 export function parseTradeLockerStatus(value: unknown): TradeLockerStatus {
   const body = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const rawStatus = typeof body.status === "string" ? body.status : undefined;
+  const candidate = body.status ?? body.connection_status ?? body.connectionStatus;
+  let rawStatus = typeof candidate === "string" ? candidate : undefined;
+  const selectedValue = body.selected_account ?? body.selectedAccount;
+  if (!rawStatus && typeof body.connected === "boolean") {
+    rawStatus = body.connected
+      ? (selectedValue ? "ready" : "connected_no_account")
+      : "not_connected";
+  }
+  if (rawStatus === "setup_required") rawStatus = "not_connected";
+  if (rawStatus === "account_selection_required") rawStatus = "connected_no_account";
+  if (rawStatus === "connected") {
+    rawStatus = selectedValue || body.accountId ? "ready" : "connected_no_account";
+  }
   if (!rawStatus || !knownStatuses.has(rawStatus)) {
     return {
       status: "unavailable",
@@ -41,7 +53,7 @@ export function parseTradeLockerStatus(value: unknown): TradeLockerStatus {
       safeRawStatus: rawStatus?.slice(0, 80) ?? "<missing>",
     };
   }
-  const selected = body.selected_account;
+  const selected = selectedValue;
   const selectedAccount = selected && typeof selected === "object"
     ? selected as TradeLockerStatus["selected_account"]
     : null;

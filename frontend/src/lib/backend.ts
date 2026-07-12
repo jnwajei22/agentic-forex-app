@@ -10,13 +10,23 @@ export class BackendError extends Error {
     message: string,
     public code: "not_authenticated" | "token_acquisition_failed" | "backend_error" | "backend_unavailable" = "backend_error",
     public payload?: Record<string, unknown>,
+    public endpoint?: string,
+    public contentType?: string,
   ) {
     super(message);
     this.name = "BackendError";
   }
 }
 
-export async function backendFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export type BackendResponse<T> = {
+  data: T;
+  status: number;
+  contentType: string;
+  endpoint: string;
+  requestId?: string;
+};
+
+export async function backendFetchWithMetadata<T>(path: string, init?: RequestInit): Promise<BackendResponse<T>> {
   let session;
   try {
     session = await auth0.getSession();
@@ -54,12 +64,30 @@ export async function backendFetch<T>(path: string, init?: RequestInit): Promise
     console.error(`[backendFetch] Backend unavailable for ${path}:`, safeError(error));
     throw new BackendError(502, "Backend API unavailable.", "backend_unavailable");
   }
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const payload = typeof body.detail === "object" && body.detail ? body.detail : body;
-    const message = payload.message ?? payload.error ?? (typeof body.detail === "string" ? body.detail : "Backend request failed.");
-    console.error(`[backendFetch] Backend ${path} returned ${response.status}:`, message);
-    throw new BackendError(response.status, String(message), "backend_error", payload);
+  const contentType = response.headers.get("content-type") ?? "";
+  const text = await response.text();
+  let body: Record<string, unknown> = {};
+  if (text && contentType.toLowerCase().includes("json")) {
+    try { body = JSON.parse(text) as Record<string, unknown>; }
+    catch { body = {}; }
   }
-  return body as T;
+  if (!response.ok) {
+    const payload = typeof body.detail === "object" && body.detail ? body.detail as Record<string, unknown> : body;
+    const message = payload.message ?? payload.error ?? (typeof body.detail === "string" ? body.detail : "Backend request failed.");
+    throw new BackendError(response.status, String(message), "backend_error", payload, path, contentType);
+  }
+  if (!contentType.toLowerCase().includes("json")) {
+    throw new BackendError(502, "Backend returned a non-JSON response.", "backend_error", {}, path, contentType);
+  }
+  return {
+    data: body as T,
+    status: response.status,
+    contentType,
+    endpoint: `${baseUrl}${path}`,
+    requestId: typeof body.request_id === "string" ? body.request_id : undefined,
+  };
+}
+
+export async function backendFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await backendFetchWithMetadata<T>(path, init)).data;
 }

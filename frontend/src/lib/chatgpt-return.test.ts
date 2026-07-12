@@ -12,6 +12,7 @@ import {
   isAllowedOAuthCallback,
 } from "./onboarding-transaction.ts";
 import { onboardingDestination, parseTradeLockerStatus } from "./tradelocker-status.ts";
+import { onboardingHttpDisposition } from "./onboarding-http.ts";
 
 test("preserves an allowed returnTo through account selection and completion", () => {
   const returnTo = safeChatGptReturnTo("https://chatgpt.com");
@@ -54,7 +55,7 @@ test("routes authenticated users to the first incomplete onboarding step", () =>
 });
 
 test("malformed and unknown backend statuses become a safe unavailable state", () => {
-  const missing = parseTradeLockerStatus({ connected: false });
+  const missing = parseTradeLockerStatus({});
   assert.equal(missing.status, "unavailable");
   assert.equal(missing.safeRawStatus, "<missing>");
   assert.equal(missing.malformed, true);
@@ -70,6 +71,28 @@ test("parses the documented current backend response shape", () => {
   });
   assert.equal(status.status, "ready");
   assert.equal(status.selected_account?.account_id, "12345");
+});
+
+test("normalizes temporary legacy TradeLocker response shapes", () => {
+  assert.equal(parseTradeLockerStatus({ connected: false }).status, "not_connected");
+  assert.equal(parseTradeLockerStatus({ connected: true, selected_account: null }).status, "connected_no_account");
+  assert.equal(parseTradeLockerStatus({ connected: true, selected_account: { account_id: "1" } }).status, "ready");
+  assert.equal(parseTradeLockerStatus({ connection_status: "not_connected", connected: false }).status, "not_connected");
+  assert.equal(parseTradeLockerStatus({ connectionStatus: "ready", connected: true }).status, "ready");
+});
+
+test("does not normalize JSON error objects into connection states", () => {
+  const parsed = parseTradeLockerStatus({ detail: "Not authenticated" });
+  assert.equal(parsed.status, "unavailable");
+  assert.equal(parsed.malformed, true);
+});
+
+test("classifies onboarding HTTP errors before status parsing", () => {
+  assert.equal(onboardingHttpDisposition(401), "session_expired");
+  assert.equal(onboardingHttpDisposition(403), "session_expired");
+  assert.equal(onboardingHttpDisposition(404), "configuration_error");
+  assert.equal(onboardingHttpDisposition(500), "unavailable");
+  assert.equal(onboardingHttpDisposition(502), "unavailable");
 });
 
 test("only accepts exact approved OAuth callback origins", () => {
