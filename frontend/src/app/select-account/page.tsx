@@ -1,7 +1,16 @@
 import { requireSession } from "@/lib/session";
 import AccountSelector from "./selector";
+import { safeChatGptReturnTo, withReturnTo } from "@/lib/chatgpt-return";
+import { cookies } from "next/headers";
+import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
+import OnboardingShell from "@/components/onboarding-shell";
 
-export default async function SelectAccountPage() {
-  await requireSession();
-  return <main className="shell page"><div className="eyebrow">Broker onboarding</div><h1 style={{ fontSize: 44 }}>Select an account</h1><p>Choose which TradeLocker account this workspace should use for read-only charts and analysis.</p><AccountSelector /></main>;
+export default async function SelectAccountPage({ searchParams }: { searchParams: Promise<{ returnTo?: string }> }) {
+  const returnTo = safeChatGptReturnTo((await searchParams).returnTo);
+  const session = await requireSession(withReturnTo("/select-account", returnTo));
+  const onboarding = Boolean((await cookies()).get(ONBOARDING_COOKIE)?.value && session.user.sub);
+  return <OnboardingShell eyebrow="TradeLocker setup" title="Select TradeLocker account">
+    <p>Choose the TradeLocker account for this connection.</p>
+    <AccountSelector returnTo={returnTo} onboarding={onboarding} />
+  </OnboardingShell>;
 }

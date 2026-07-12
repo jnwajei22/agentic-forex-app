@@ -1,0 +1,270 @@
+import base64
+import hashlib
+import sqlite3
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock
+
+from app.api.routes import oauth, platform
+from app.config.settings import settings
+from app.main import app
+from app.storage.brokers import BrokerRepository
+from app.oauth.cimd import CIMDMetadata
+
+
+@pytest.fixture
+def oauth_storage(tmp_path, monkeypatch):
+    db_path = tmp_path / "oauth.db"
+    monkeypatch.setattr(settings, "sqlite_path", str(db_path))
+    monkeypatch.setattr(settings, "broker_secret_key", "test-broker-secret")
+    monkeypatch.setattr(settings, "oauth_transaction_secret", "test-oauth-secret")
+    monkeypatch.setattr(settings, "frontend_origin", "https://portal.example.test")
+    monkeypatch.setattr(settings, "public_base_url", "https://mcp.example.test")
+    monkeypatch.setattr(settings, "oauth_allowed_client_ids", "chatgpt-client")
+    return BrokerRepository()
+
+
+@pytest.fixture(autouse=True)
+def clear_overrides():
+    yield
+    app.dependency_overrides.clear()
+
+
+def claims(subject="auth0|user-a"):
+    return {"sub": subject, "email": f"{subject.replace('|', '-')}@example.test"}
+
+
+def authenticate(subject="auth0|user-a"):
+    app.dependency_overrides[platform.current_claims] = lambda: claims(subject)
+
+
+class FakeTradeLockerClient:
+    def __init__(self, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def get_accounts(self):
+        return {"accounts": [{"accountId": 12345, "accNum": 2, "name": "Primary"}]}
+
+
+def begin_authorization(client: TestClient, verifier="oauth-pkce-verifier", *,
+                        client_id="chatgpt-client",
+                        redirect_uri="https://chatgpt.com/aip/callback?existing=1"):
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    response = client.get(
+        "/oauth/authorize",
+        params={
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "state": "original-oauth-state",
+            "scope": "forex:read forex:preview",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": "https://mcp.example.test",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    location = urlparse(response.headers["location"])
+    assert f"{location.scheme}://{location.netloc}{location.path}" == "https://portal.example.test/oauth/start"
+    return parse_qs(location.query)["transaction"][0], verifier
+
+
+def test_first_time_oauth_stays_pending_until_tradelocker_setup(
+    oauth_storage, monkeypatch
+):
+    monkeypatch.setattr(platform, "TradeLockerClient", FakeTradeLockerClient)
+    authenticate()
+    with TestClient(app) as client:
+        transaction, verifier = begin_authorization(client)
+        assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).json() == {"status": "bound"}
+        initial = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        assert initial["status"] == "setup_required"
+
+        client.post("/api/broker/tradelocker/save-credentials", json={
+            "base_url": "https://demo.example/backend-api", "username": "user-a",
+            "password": "private-password", "server": "DEMO",
+        })
+        pending = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        assert pending["status"] == "account_selection_required"
+        discovered = client.post("/api/broker/tradelocker/discover-accounts").json()
+        assert discovered["accounts"][0]["accountId"] == 12345
+        client.post("/api/broker/tradelocker/select-account", json={"accountId": "12345", "accNum": "2"})
+        ready = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        assert ready["status"] == "connected"
+
+        completed = client.post("/api/oauth/onboarding/complete", json={
+            "transaction": transaction, "csrf_token": ready["csrf_token"],
+        })
+        callback = urlparse(completed.json()["redirect_url"])
+        callback_query = parse_qs(callback.query)
+        assert f"{callback.scheme}://{callback.netloc}{callback.path}" == "https://chatgpt.com/aip/callback"
+        assert callback_query["existing"] == ["1"]
+        assert callback_query["state"] == ["original-oauth-state"]
+        code = callback_query["code"][0]
+
+        rejected = client.post("/oauth/token", data={
+            "grant_type": "authorization_code", "code": code,
+            "client_id": "chatgpt-client",
+            "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
+            "code_verifier": "incorrect-pkce-verifier",
+            "resource": "https://mcp.example.test",
+        })
+        assert rejected.status_code == 400
+        wrong_resource = client.post("/oauth/token", data={
+            "grant_type": "authorization_code", "code": code,
+            "client_id": "chatgpt-client",
+            "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
+            "code_verifier": verifier, "resource": "https://wrong.example",
+        })
+        assert wrong_resource.status_code == 400
+        token = client.post("/oauth/token", data={
+            "grant_type": "authorization_code", "code": code,
+            "client_id": "chatgpt-client",
+            "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
+            "code_verifier": verifier,
+            "resource": "https://mcp.example.test",
+        })
+        assert token.status_code == 200
+        assert token.json()["token_type"] == "Bearer"
+        assert "private-password" not in token.text
+        mcp = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "chatgpt-test", "version": "1"},
+                },
+            },
+            headers={
+                "Authorization": f"Bearer {token.json()['access_token']}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        assert mcp.status_code == 200
+
+
+def test_oauth_rejects_invalid_callback(oauth_storage):
+    with TestClient(app) as client:
+        response = client.get("/oauth/authorize", params={
+            "client_id": "chatgpt-client", "redirect_uri": "https://evil.example/callback",
+            "response_type": "code", "state": "state", "scope": "forex:read",
+            "code_challenge": "a" * 43, "code_challenge_method": "S256",
+            "resource": "https://mcp.example.test",
+        })
+    assert response.status_code == 400
+
+
+def test_arbitrary_static_client_is_rejected(oauth_storage):
+    with TestClient(app) as client:
+        response = client.get("/oauth/authorize", params={
+            "client_id": "not-allowed", "redirect_uri": "https://chatgpt.com/aip/callback",
+            "response_type": "code", "state": "state", "scope": "forex:read",
+            "code_challenge": "a" * 43, "code_challenge_method": "S256",
+            "resource": "https://mcp.example.test",
+        })
+    assert response.status_code == 400
+    assert "Static OAuth client is not allowed" in response.text
+
+
+def test_cimd_identity_and_exact_redirect_survive_token_exchange(oauth_storage, monkeypatch):
+    cimd_url = "https://chatgpt.com/oauth/agentic-forex/client.json"
+    callback = "https://chatgpt.com/connector/oauth/callback-id"
+    monkeypatch.setattr(oauth.cimd_loader, "load", AsyncMock(return_value=CIMDMetadata(
+        client_id=cimd_url, redirect_uris=(callback,), token_endpoint_auth_methods=("none",),
+    )))
+    monkeypatch.setattr(platform, "TradeLockerClient", FakeTradeLockerClient)
+    oauth_storage.save_connection(
+        "auth0|user-a", base_url="https://demo.example/backend-api",
+        username="user-a", password="private-password", server="DEMO",
+    )
+    oauth_storage.select_account("auth0|user-a", "12345", "2")
+    authenticate()
+    with TestClient(app) as client:
+        transaction, verifier = begin_authorization(
+            client, client_id=cimd_url, redirect_uri=callback,
+        )
+        client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
+        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        completed = client.post("/api/oauth/onboarding/complete", json={
+            "transaction": transaction, "csrf_token": status["csrf_token"],
+        }).json()
+        query = parse_qs(urlparse(completed["redirect_url"]).query)
+        token = client.post("/oauth/token", data={
+            "grant_type": "authorization_code", "code": query["code"][0],
+            "client_id": cimd_url, "redirect_uri": callback,
+            "code_verifier": verifier, "resource": "https://mcp.example.test",
+        })
+    assert token.status_code == 200
+    oauth.cimd_loader.load.assert_awaited_once_with(cimd_url)
+
+
+def test_cimd_unknown_redirect_is_rejected(oauth_storage, monkeypatch):
+    cimd_url = "https://chatgpt.com/oauth/agentic-forex/client.json"
+    monkeypatch.setattr(oauth.cimd_loader, "load", AsyncMock(return_value=CIMDMetadata(
+        client_id=cimd_url,
+        redirect_uris=("https://chatgpt.com/connector/oauth/registered",),
+        token_endpoint_auth_methods=("none",),
+    )))
+    with TestClient(app) as client:
+        response = client.get("/oauth/authorize", params={
+            "client_id": cimd_url,
+            "redirect_uri": "https://chatgpt.com/connector/oauth/unknown",
+            "response_type": "code", "state": "state", "scope": "forex:read",
+            "code_challenge": "a" * 43, "code_challenge_method": "S256",
+            "resource": "https://mcp.example.test",
+        })
+    assert response.status_code == 400
+
+
+def test_existing_configured_user_skips_to_completion(oauth_storage, monkeypatch):
+    monkeypatch.setattr(platform, "TradeLockerClient", FakeTradeLockerClient)
+    oauth_storage.save_connection(
+        "auth0|user-a", base_url="https://demo.example/backend-api",
+        username="user-a", password="private-password", server="DEMO",
+    )
+    oauth_storage.select_account("auth0|user-a", "12345", "2")
+    authenticate()
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).status_code == 200
+        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+    assert status["status"] == "connected"
+    assert status["accountId"] == "12345"
+
+
+def test_oauth_rejects_incomplete_setup_and_wrong_user(oauth_storage):
+    authenticate("auth0|user-a")
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
+        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        incomplete = client.post("/api/oauth/onboarding/complete", json={
+            "transaction": transaction, "csrf_token": status["csrf_token"],
+        })
+        assert incomplete.status_code == 409
+        authenticate("auth0|user-b")
+        wrong_user = client.post("/api/oauth/onboarding/complete", json={
+            "transaction": transaction, "csrf_token": status["csrf_token"],
+        })
+        assert wrong_user.status_code == 403
+
+
+def test_oauth_rejects_expired_transaction(oauth_storage):
+    authenticate()
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        with sqlite3.connect(settings.sqlite_path) as connection:
+            connection.execute("UPDATE oauth_transactions SET expires_at = '2000-01-01T00:00:00+00:00'")
+        response = client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
+    assert response.status_code == 403

@@ -5,6 +5,11 @@ class Settings(BaseSettings):
     app_timezone: str = "America/Chicago"
     public_base_url: str = "https://mcp.justinnwajei.com"
     frontend_origin: str = "https://app.agenticforexdesk.com"
+    chatgpt_return_url: str = "https://chatgpt.com"
+    oauth_authorization_url: str | None = None
+    oauth_token_url: str | None = None
+    oauth_transaction_secret: str | None = None
+    oauth_allowed_client_ids: str | None = None
     sqlite_path: str = "storage/app.db"
     broker_secret_key: str | None = None
     allow_env_broker_fallback: bool = False

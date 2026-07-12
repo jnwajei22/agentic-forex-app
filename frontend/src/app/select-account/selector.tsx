@@ -2,10 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { completedSetupPath } from "@/lib/chatgpt-return";
+import { afterAccountSelected } from "@/lib/onboarding-transaction";
 
 type Account = { accountId?: string | number; accNum?: string | number; name?: string; currency?: string; status?: string };
 
-export default function AccountSelector() {
+export default function AccountSelector({ returnTo, onboarding = false }: { returnTo: string | null; onboarding?: boolean }) {
   const router = useRouter();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selected, setSelected] = useState("");
@@ -18,7 +20,7 @@ export default function AccountSelector() {
     fetch("/api/backend/broker/tradelocker/discover-accounts", { method: "POST" })
       .then(async response => {
         const body = await response.json();
-        if (!response.ok || body.status === "error" || body.status === "setup_required") throw new Error(body.error ?? body.message ?? "Connect TradeLocker first.");
+        if (!response.ok || body.status === "error" || body.status === "setup_required") throw new Error(body.message ?? "Unable to retrieve TradeLocker accounts. Check the credentials and server selection, then try again.");
         if (active) setAccounts(body.accounts ?? []);
       })
       .catch(caught => active && setError(caught instanceof Error ? caught.message : "Unable to discover accounts."))
@@ -35,14 +37,14 @@ export default function AccountSelector() {
       body: JSON.stringify({ accountId: String(account.accountId), accNum: String(account.accNum) }),
     }).catch(() => null);
     if (!response?.ok) { const body = await response?.json().catch(() => ({})); setError(body?.error ?? "Unable to select the account."); setSaving(false); return; }
-    router.push("/dashboard"); router.refresh();
+    router.push(afterAccountSelected(onboarding, completedSetupPath(returnTo))); router.refresh();
   }
 
   if (loading) return <div className="notice">Discovering TradeLocker accounts…</div>;
-  return <section style={{ maxWidth: 680 }}>
+  return <section className="account-selector">
     {error && <div className="error">{error}</div>}
     {!error && accounts.length === 0 && <div className="notice">No accounts were returned. Verify the username, password, and server.</div>}
     <div className="account-list">{accounts.map((account, index) => <label className="account" key={`${account.accountId}-${account.accNum}`}><input type="radio" name="account" value={index} checked={selected === String(index)} onChange={event => setSelected(event.target.value)} /><span><strong>{account.name ?? `Account #${account.accountId}`}</strong><br /><span className="label">accountId {account.accountId} · accNum {account.accNum}{account.currency ? ` · ${account.currency}` : ""}</span></span></label>)}</div>
-    <button className="button" onClick={save} disabled={!selected || saving}>{saving ? "Saving selection…" : "Use selected account"}</button>
+    <button className="button" onClick={save} disabled={!selected || saving}>{saving ? "Saving selection…" : "Use this account."}</button>
   </section>;
 }

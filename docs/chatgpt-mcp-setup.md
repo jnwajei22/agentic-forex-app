@@ -24,6 +24,10 @@ MCP_ALLOW_PUBLIC_NO_AUTH=false
 AUTH_ISSUER=https://agentic-forex.us.auth0.com/
 AUTH_AUDIENCE=https://mcp.justinnwajei.com
 AUTH_JWKS_URL=https://agentic-forex.us.auth0.com/.well-known/jwks.json
+OAUTH_AUTHORIZATION_URL=https://mcp.justinnwajei.com/oauth/authorize
+OAUTH_TOKEN_URL=https://mcp.justinnwajei.com/oauth/token
+OAUTH_TRANSACTION_SECRET=<long-random-server-side-secret>
+OAUTH_ALLOWED_CLIENT_IDS=<comma-separated-ChatGPT-OAuth-client-IDs>
 ```
 
 Replace `agentic-forex.us.auth0.com` with the domain assigned by Auth0, or use the issuer and JWKS URL published by your chosen OIDC/OAuth provider. Preserve the issuer's trailing slash when the provider publishes one; JWT issuer validation requires an exact match.
@@ -36,7 +40,9 @@ The public protected-resource metadata document is available at:
 https://mcp.justinnwajei.com/.well-known/oauth-protected-resource
 ```
 
-It identifies the configured authorization server and the supported `forex:read` and `forex:preview` scopes. An unauthenticated request to `/mcp/` receives a `401` response pointing ChatGPT to that metadata document through `WWW-Authenticate`.
+It identifies the Agentic Forex Desk authorization server and the supported `forex:read` and `forex:preview` scopes. The server stores ChatGPT's authorization request in SQLite while Auth0 establishes the portal identity and TradeLocker onboarding completes. Only the **Use with ChatGPT** action causes Agentic Forex Desk to issue a short-lived authorization code. ChatGPT exchanges that code at the Agentic Forex Desk token endpoint using the original PKCE verifier. An unauthenticated request to `/mcp/` receives a `401` response pointing ChatGPT to that metadata document through `WWW-Authenticate`.
+
+The authorization-server metadata advertises Client ID Metadata Documents (CIMD) as the preferred client-identification mechanism. When ChatGPT supplies an HTTPS CIMD URL as `client_id`, the backend fetches it with a short timeout and response-size limit, rejects unsafe network destinations and redirects, validates the exact callback URI and public-client `none` method, and briefly caches the validated document. `OAUTH_ALLOWED_CLIENT_IDS` is only an optional compatibility allowlist for predefined static clients; arbitrary static IDs are rejected. No dynamic registration endpoint is advertised.
 
 ## Connect from ChatGPT
 

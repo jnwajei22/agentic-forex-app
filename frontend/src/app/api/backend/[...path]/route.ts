@@ -5,6 +5,10 @@ import { BackendError, backendFetch } from "@/lib/backend";
 const allowed = new Set([
   "me",
   "broker/status",
+  "broker/onboarding-status",
+  "oauth/onboarding/bind",
+  "oauth/onboarding/status",
+  "oauth/onboarding/complete",
   "broker/tradelocker/save-credentials",
   "broker/tradelocker/discover-accounts",
   "broker/tradelocker/select-account",
@@ -20,8 +24,12 @@ async function forward(request: NextRequest, segments: string[], method: string)
     return NextResponse.json(result);
   } catch (error) {
     if (error instanceof BackendError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json(
+        error.payload ?? { error: error.message, code: error.code },
+        { status: error.status },
+      );
     }
+    console.error(`[backend proxy] Unexpected error forwarding /api/${path}:`, error instanceof Error ? `${error.name}: ${error.message}` : "Unknown error");
     return NextResponse.json({ error: "Unable to reach the backend." }, { status: 502 });
   }
 }

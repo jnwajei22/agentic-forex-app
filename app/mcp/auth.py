@@ -11,6 +11,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config.settings import settings
 from app.auth.identity import reset_current_claims, set_current_claims
+from app.storage.oauth import OAuthRepository, OAuthStorageError
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,13 @@ TOOL_SCOPES = {
     "get_account_status": "forex:read",
     "get_open_positions": "forex:read",
     "get_trade_log": "forex:read",
+    "get_tradelocker_connection_status": "forex:read",
+    "get_my_broker_connection_status": "forex:read",
+    "get_my_tradelocker_accounts": "forex:read",
+    "get_my_tradelocker_account_status": "forex:read",
+    "get_my_tradelocker_symbols": "forex:read",
+    "get_my_tradelocker_quote": "forex:read",
+    "get_my_tradelocker_candles": "forex:read",
     "get_tradelocker_accounts": "forex:read",
     "get_tradelocker_config": "forex:read",
     "get_tradelocker_symbols": "forex:read",
@@ -160,7 +168,14 @@ class MCPAuthMiddleware:
             return
 
         try:
-            claims = await anyio.to_thread.run_sync(_verify_access_token, token)
+            claims = await anyio.to_thread.run_sync(
+                lambda: OAuthRepository().access_token_claims(token)
+            )
+        except OAuthStorageError:
+            claims = None
+        try:
+            if claims is None:
+                claims = await anyio.to_thread.run_sync(_verify_access_token, token)
         except RuntimeError as exc:
             logger.error("MCP OAuth configuration error: %s", exc)
             await JSONResponse({"detail": str(exc)}, status_code=503)(scope, receive, send)

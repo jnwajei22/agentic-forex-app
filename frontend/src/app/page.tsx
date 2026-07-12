@@ -6,21 +6,18 @@ export default async function Home() {
   const session = await auth0.getSession();
   return (
     <main className="shell hero">
-      <div className="eyebrow">Read-only market intelligence</div>
-      <h1>TradeLocker charts with clearer forex context.</h1>
-      <p>
-        Connect your own TradeLocker account to analyze candles, indicators, spreads,
-        and multi-timeframe confluence. Agentic Forex Desk does not submit trades.
-      </p>
+      <div className="eyebrow">TradeLocker setup portal</div>
+      <h1>Connect TradeLocker to ChatGPT MCP.</h1>
+      <p>Connect your TradeLocker account once, then use the MCP server from ChatGPT.</p>
       <div className="actions">
-        <Link className="button" href={session ? "/dashboard" : "/login"}>
-          {session ? "Open dashboard" : "Log in to begin"}
+        <Link className="button" href={session ? "/dashboard" : "/auth/login?returnTo=/dashboard"}>
+          {session ? "Open dashboard" : "Log in"}
         </Link>
-        <a className="button secondary" href="#safety">How it works</a>
+        <a className="button secondary" href="#connection">How it works</a>
       </div>
-      <section id="safety" className="grid">
-        <article className="card"><h2>Private connection</h2><p>Your broker password is sent directly to the backend and encrypted at rest.</p></article>
-        <article className="card"><h2>Analysis only</h2><p>No order submission, position closing, cancellation, or modification tools.</p></article>
+      <section id="connection" className="grid">
+        <article className="card"><h2>One-time setup</h2><p>Save your TradeLocker credentials and select the TradeLocker account for the MCP server.</p></article>
+        <article className="card"><h2>Use it from ChatGPT</h2><p>After setup, ask ChatGPT to use the Agentic Forex Desk MCP server.</p></article>
       </section>
     </main>
   );

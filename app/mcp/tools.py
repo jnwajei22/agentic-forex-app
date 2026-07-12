@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import quote
 
 from app.brokers.tradelocker.adapter import get_tradelocker_adapter
 from app.brokers.tradelocker.client import TradeLockerError
@@ -12,6 +13,79 @@ from app.services.scanner import scan_forex_watchlist as scan_watchlist
 from app.services.technical_analysis.analyzer import analyze_pair_from_candles
 from app.services.trading.previews import create_order_preview
 from app.services.watchlist import get_default_watchlist, is_allowed_pair, normalize_pair
+from app.storage.brokers import BrokerRepository, BrokerStorageError
+
+
+def _setup_url() -> str:
+    origin = settings.frontend_origin.rstrip("/")
+    return (
+        f"{origin}/connect-tradelocker?source=chatgpt&returnTo="
+        f"{quote(settings.chatgpt_return_url, safe='')}"
+    )
+
+
+def _setup_required() -> dict[str, Any]:
+    return {
+        "status": "setup_required",
+        "message": "TradeLocker setup required.",
+        "setup_url": _setup_url(),
+        "instruction": (
+            "Open the setup URL, connect TradeLocker using the same login account, "
+            "then return to ChatGPT and run this again."
+        ),
+    }
+
+
+def _tradelocker_error_response(exc: TradeLockerError) -> dict[str, Any]:
+    if exc.code == "setup_required" or exc.status_code in {401, 403}:
+        return _setup_required()
+    return exc.as_dict()
+
+
+def _missing_user_connection() -> dict[str, Any] | None:
+    user_sub = get_current_user_sub()
+    if not user_sub:
+        return None
+    try:
+        status = BrokerRepository().status(user_sub)
+    except BrokerStorageError as exc:
+        return {"status": "error", "error": "broker_storage_error", "message": str(exc)}
+    return _setup_required() if status["status"] == "setup_required" else None
+
+
+def get_tradelocker_connection_status() -> dict[str, Any]:
+    """Return the current user's sanitized TradeLocker connection status."""
+    user_sub = get_current_user_sub()
+    if not user_sub:
+        return {
+            "connected": False,
+            "selected_account": False,
+            **_setup_required(),
+        }
+    try:
+        status = BrokerRepository().status(user_sub)
+    except BrokerStorageError as exc:
+        return {"connected": False, "selected_account": False, "status": "error", "message": str(exc)}
+    if status["status"] == "setup_required":
+        return {"connected": False, "selected_account": False, **_setup_required()}
+    selected = status["status"] == "connected"
+    result: dict[str, Any] = {
+        "connected": True,
+        "selected_account": selected,
+        "status": status["status"],
+    }
+    if selected:
+        result["selected_account_summary"] = {
+            "server": status["server"],
+            "account_id": status["accountId"],
+            "account_number": status["accNum"],
+        }
+    return result
+
+
+def get_my_broker_connection_status() -> dict[str, Any]:
+    """Backward-compatible alias for TradeLocker connection status."""
+    return get_tradelocker_connection_status()
 
 
 def _tradelocker_configured() -> bool:
@@ -37,6 +111,10 @@ async def scan_forex_watchlist(
     max_results: int = 10,
 ) -> dict[str, Any]:
     """Rank trend clarity and report missing data, spread availability, and weak setups."""
+    if settings.market_data_provider.lower() == "tradelocker":
+        missing = _missing_user_connection()
+        if missing:
+            return missing
     if not timeframes:
         raise ValueError("At least one timeframe is required.")
     if max_results < 1:
@@ -93,6 +171,10 @@ async def generate_chart(
     take_profit: float | None = None,
 ) -> dict[str, Any]:
     """Generate a local PNG analysis chart from mocked candles."""
+    if settings.market_data_provider.lower() == "tradelocker":
+        missing = _missing_user_connection()
+        if missing:
+            return missing
     normalized_pair = normalize_pair(pair)
     if not is_allowed_pair(normalized_pair):
         raise ValueError(f"Unknown forex pair: {pair}")
@@ -144,7 +226,7 @@ async def get_account_status() -> dict[str, Any]:
         try:
             return await get_tradelocker_adapter().get_account()
         except TradeLockerError as exc:
-            return exc.as_dict()
+            return _tradelocker_error_response(exc)
     return {
         "environment": "paper",
         "app_env": settings.app_env,
@@ -161,16 +243,19 @@ async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
         try:
             return await get_tradelocker_adapter().get_open_positions()
         except TradeLockerError as exc:
-            return exc.as_dict()
+            return _tradelocker_error_response(exc)
     return []
 
 
 async def get_tradelocker_config() -> dict[str, Any] | list[Any]:
     """Return account-specific TradeLocker config. Run get_tradelocker_accounts first."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
     try:
         return await get_tradelocker_adapter().client.get_config()
     except TradeLockerError as exc:
-        return exc.as_dict()
+        return _tradelocker_error_response(exc)
 
 
 async def get_tradelocker_accounts() -> dict[str, Any]:
@@ -181,36 +266,76 @@ async def get_tradelocker_accounts() -> dict[str, Any]:
     TRADELOCKER_ACCOUNT_NUMBER in .env, then restart the server before calling
     account-specific TradeLocker tools.
     """
+    missing = _missing_user_connection()
+    if missing:
+        return missing
     try:
         return await get_tradelocker_adapter().client.get_accounts()
     except TradeLockerError as exc:
-        return exc.as_dict()
+        return _tradelocker_error_response(exc)
 
 
 async def get_tradelocker_symbols() -> dict[str, Any] | list[Any]:
     """Return instruments available to the configured TradeLocker account."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
     try:
         return await get_tradelocker_adapter().client.get_symbols()
     except TradeLockerError as exc:
-        return exc.as_dict()
+        return _tradelocker_error_response(exc)
 
 
 async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
     """Return a current read-only TradeLocker quote for a symbol."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
     try:
         return await get_tradelocker_adapter().get_quote(symbol)
     except TradeLockerError as exc:
-        return exc.as_dict()
+        return _tradelocker_error_response(exc)
 
 
 async def get_tradelocker_candles(
     symbol: str, timeframe: str, lookback: int = 300
 ) -> dict[str, Any] | list[Any]:
     """Return raw read-only TradeLocker historical bars for a symbol."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
     try:
         return await get_tradelocker_adapter().get_candles(symbol, timeframe, lookback)
     except TradeLockerError as exc:
-        return exc.as_dict()
+        return _tradelocker_error_response(exc)
+
+
+async def get_my_tradelocker_accounts() -> dict[str, Any]:
+    return await get_tradelocker_accounts()
+
+
+async def get_my_tradelocker_account_status() -> dict[str, Any]:
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().get_account()
+    except TradeLockerError as exc:
+        return _tradelocker_error_response(exc)
+
+
+async def get_my_tradelocker_symbols() -> dict[str, Any] | list[Any]:
+    return await get_tradelocker_symbols()
+
+
+async def get_my_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
+    return await get_tradelocker_quote(symbol)
+
+
+async def get_my_tradelocker_candles(
+    symbol: str, timeframe: str, lookback: int = 300
+) -> dict[str, Any] | list[Any]:
+    return await get_tradelocker_candles(symbol, timeframe, lookback)
 
 
 def get_trade_log(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.forex import router as forex_router
 from app.api.routes.charts import router as charts_router
 from app.api.routes.platform import router as platform_router
+from app.api.routes.oauth import router as oauth_router
 from app.webhooks.tradingview import router as tradingview_router
 from app.mcp.server import mcp_app
 from app.mcp.auth import MCPAuthMiddleware
@@ -43,13 +44,37 @@ async def oauth_protected_resource_metadata() -> dict[str, object]:
         )
     return {
         "resource": "https://mcp.justinnwajei.com",
-        "authorization_servers": [settings.auth_issuer] if settings.auth_issuer else [],
+        "authorization_servers": [settings.public_base_url.rstrip("/")],
         "scopes_supported": ["forex:read", "forex:preview"],
+    }
+
+
+@app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/openid-configuration")
+async def oauth_authorization_server_metadata() -> dict[str, object]:
+    if not settings.oauth_transaction_secret and not settings.broker_secret_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OAuth onboarding authorization endpoints are not configured.",
+        )
+    return {
+        "issuer": settings.public_base_url.rstrip("/"),
+        "authorization_endpoint": settings.oauth_authorization_url
+        or f"{settings.public_base_url.rstrip('/')}/oauth/authorize",
+        "token_endpoint": settings.oauth_token_url
+        or f"{settings.public_base_url.rstrip('/')}/oauth/token",
+        "client_id_metadata_document_supported": True,
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["openid", "profile", "email", "forex:read", "forex:preview"],
+        "token_endpoint_auth_methods_supported": ["none"],
     }
 
 app.include_router(health_router)
 app.include_router(charts_router)
 app.include_router(forex_router)
 app.include_router(platform_router)
+app.include_router(oauth_router)
 app.include_router(tradingview_router, prefix="/webhooks", tags=["webhooks"])
 app.mount("/mcp", mcp_app)

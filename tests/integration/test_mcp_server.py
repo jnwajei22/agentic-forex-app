@@ -28,6 +28,13 @@ EXPECTED_TOOLS = {
     "get_account_status",
     "get_open_positions",
     "get_trade_log",
+    "get_tradelocker_connection_status",
+    "get_my_broker_connection_status",
+    "get_my_tradelocker_accounts",
+    "get_my_tradelocker_account_status",
+    "get_my_tradelocker_symbols",
+    "get_my_tradelocker_quote",
+    "get_my_tradelocker_candles",
     "get_tradelocker_accounts",
     "get_tradelocker_config",
     "get_tradelocker_symbols",
@@ -77,9 +84,26 @@ def test_protected_resource_metadata_contains_oauth_configuration(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {
         "resource": "https://mcp.justinnwajei.com",
-        "authorization_servers": ["https://tenant.auth0.com/"],
+        "authorization_servers": ["https://mcp.justinnwajei.com"],
         "scopes_supported": ["forex:read", "forex:preview"],
     }
+
+
+def test_authorization_server_metadata_uses_agentic_forex_oauth_endpoints(monkeypatch):
+    monkeypatch.setattr(settings, "auth_issuer", "https://tenant.auth0.com/")
+    monkeypatch.setattr(settings, "auth_jwks_url", "https://tenant.auth0.com/.well-known/jwks.json")
+    monkeypatch.setattr(settings, "oauth_authorization_url", "https://app.example.test/oauth/authorize")
+    monkeypatch.setattr(settings, "oauth_token_url", None)
+    with TestClient(app) as client:
+        response = client.get("/.well-known/oauth-authorization-server")
+
+    assert response.status_code == 200
+    metadata = response.json()
+    assert metadata["authorization_endpoint"] == "https://app.example.test/oauth/authorize"
+    assert metadata["token_endpoint"] == "https://mcp.justinnwajei.com/oauth/token"
+    assert metadata["code_challenge_methods_supported"] == ["S256"]
+    assert metadata["client_id_metadata_document_supported"] is True
+    assert "registration_endpoint" not in metadata
 
 
 def test_mcp_endpoint_initializes_and_advertises_tools(monkeypatch):
@@ -234,10 +258,7 @@ async def test_mcp_server_registers_expected_tools():
     listed_tools = await mcp.list_tools()
     registered = {tool.name for tool in listed_tools}
     assert registered == EXPECTED_TOOLS
-    discovery = next(tool for tool in listed_tools if tool.name == "get_tradelocker_accounts")
-    assert "Run this first" in discovery.description
-    assert "TRADELOCKER_ACCOUNT_ID" in discovery.description
-    assert "restart the server" in discovery.description
+    assert "get_tradelocker_connection_status" in registered
 
 
 @pytest.mark.asyncio

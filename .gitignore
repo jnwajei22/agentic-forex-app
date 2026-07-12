@@ -1,4 +1,14 @@
 .env
+.env.local
+.env.*
+!.env.example
+node_modules/
+.next/
+.vercel/
+__pycache__/
+*.db
+*.sqlite
+*.sqlite3
 .venv/
 __pycache__/
 *.py[cod]

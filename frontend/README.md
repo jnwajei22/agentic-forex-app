@@ -17,8 +17,8 @@ Configure `.env.local`:
 ```dotenv
 NEXT_PUBLIC_API_BASE_URL=https://api.agenticforexdesk.com
 AUTH0_SECRET=<64-hex-character-session-secret>
-AUTH0_BASE_URL=http://localhost:3000
-AUTH0_ISSUER_BASE_URL=https://YOUR_TENANT.auth0.com
+APP_BASE_URL=http://localhost:3000
+AUTH0_DOMAIN=YOUR_TENANT.auth0.com
 AUTH0_CLIENT_ID=<regular-web-app-client-id>
 AUTH0_CLIENT_SECRET=<regular-web-app-client-secret>
 AUTH0_AUDIENCE=https://mcp.justinnwajei.com
@@ -38,7 +38,7 @@ The `/login` page starts Auth0's `/auth/login` flow. Protected pages verify the 
 
 1. Import the repository into Vercel and set the project root directory to `frontend`.
 2. Add every variable from `.env.example` in Vercel Project Settings. Keep all `AUTH0_*` variables server-only; only `NEXT_PUBLIC_API_BASE_URL` is browser-visible.
-3. Set `AUTH0_BASE_URL` to the stable frontend domain, for example `https://app.agenticforexdesk.com`.
+3. Set `APP_BASE_URL` to the stable frontend domain, for example `https://app.agenticforexdesk.com`.
 4. Add `https://app.agenticforexdesk.com/auth/callback` to Auth0 Allowed Callback URLs.
 5. Add `https://app.agenticforexdesk.com` to Auth0 Allowed Logout URLs and Allowed Web Origins.
 6. Configure the Raspberry Pi backend with `FRONTEND_ORIGIN=https://app.agenticforexdesk.com` and expose it through Cloudflare Tunnel at the URL in `NEXT_PUBLIC_API_BASE_URL`.
