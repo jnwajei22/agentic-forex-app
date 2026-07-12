@@ -2,19 +2,12 @@ import { cookies } from "next/headers";
 import Link from "next/link";
 
 import { auth0 } from "@/lib/auth0";
-import { backendFetch } from "@/lib/backend";
+import { BackendError, backendFetch } from "@/lib/backend";
 import { safeChatGptReturnTo } from "@/lib/chatgpt-return";
 import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 import { requireSession } from "@/lib/session";
 import OnboardingShell from "@/components/onboarding-shell";
-
-type Status = {
-  status: string;
-  server?: string;
-  accountId?: string;
-  accNum?: string;
-  csrf_token?: string;
-};
+import { parseTradeLockerStatus } from "@/lib/tradelocker-status";
 
 export default async function SetupCompletePage({ searchParams }: { searchParams: Promise<{ returnTo?: string; onboardingError?: string }> }) {
   const query = await searchParams;
@@ -22,18 +15,34 @@ export default async function SetupCompletePage({ searchParams }: { searchParams
   await requireSession("/setup-complete");
   const session = await auth0.getSession();
   const transaction = (await cookies()).get(ONBOARDING_COOKIE)?.value;
-  let status: Status = { status: "invalid" };
+  let rawStatus: unknown;
+  let statusUnavailable = false;
+  let transactionExpired = false;
   if (transaction && session) {
     try {
-      status = await backendFetch<Status>("/api/oauth/onboarding/status", {
+      rawStatus = await backendFetch<unknown>("/api/oauth/onboarding/status", {
         method: "POST", body: JSON.stringify({ transaction }),
       });
-    } catch { /* Render the restart state below. */ }
+    } catch (error) {
+      transactionExpired = error instanceof BackendError && error.status === 410;
+      statusUnavailable = !transactionExpired;
+    }
   }
+  const status = parseTradeLockerStatus(rawStatus);
   const transactionReady = Boolean(transaction && session && status.csrf_token);
-  const setupReady = status.status === "connected" && status.accountId && status.accNum;
+  const setupReady = status.status === "ready" && status.selected_account;
 
-  if (query.onboardingError || !transactionReady) {
+  if (transaction && session && (statusUnavailable || (status.malformed && !transactionExpired))) {
+    if (status.malformed) {
+      console.error("[setup-complete] Malformed TradeLocker status", { status: status.safeRawStatus });
+    }
+    return <OnboardingShell eyebrow="Connection status" title="Unable to check TradeLocker">
+      <p>The connection status service is temporarily unavailable. Try again shortly.</p>
+      <div className="actions"><Link className="button" href="/setup-complete">Try again</Link></div>
+    </OnboardingShell>;
+  }
+
+  if (query.onboardingError || transactionExpired || !transactionReady) {
     return <OnboardingShell eyebrow="ChatGPT sign-in" title="Restart sign-in from ChatGPT">
       <p>The ChatGPT authorization request is missing, expired, or does not belong to this account.</p>
       {returnTo && <div className="actions"><Link className="button" href={returnTo}>Return to ChatGPT</Link></div>}
@@ -50,8 +59,8 @@ export default async function SetupCompletePage({ searchParams }: { searchParams
   return <OnboardingShell eyebrow="Setup complete" title="Agentic Forex Desk is connected">
     <p>Your selected TradeLocker account is ready.</p>
     <div className="card">
-      <div className="label">TradeLocker server</div><div className="value">{status.server}</div>
-      <div className="label" style={{ marginTop: 18 }}>TradeLocker account</div><div className="value">{status.accountId} · {status.accNum}</div>
+      <div className="label">TradeLocker server</div><div className="value">{status.selected_account?.server}</div>
+      <div className="label" style={{ marginTop: 18 }}>TradeLocker account</div><div className="value">{status.selected_account?.account_id} · {status.selected_account?.account_number}</div>
     </div>
     <form className="actions" action="/oauth/complete" method="post">
       <input type="hidden" name="csrfToken" value={status.csrf_token} />

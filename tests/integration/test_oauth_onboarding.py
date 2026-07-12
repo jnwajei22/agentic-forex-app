@@ -87,19 +87,19 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
         transaction, verifier = begin_authorization(client)
         assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).json() == {"status": "bound"}
         initial = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-        assert initial["status"] == "setup_required"
+        assert initial["status"] == "not_connected"
 
         client.post("/api/broker/tradelocker/save-credentials", json={
             "base_url": "https://demo.example/backend-api", "username": "user-a",
             "password": "private-password", "server": "DEMO",
         })
         pending = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-        assert pending["status"] == "account_selection_required"
+        assert pending["status"] == "connected_no_account"
         discovered = client.post("/api/broker/tradelocker/discover-accounts").json()
         assert discovered["accounts"][0]["accountId"] == 12345
         client.post("/api/broker/tradelocker/select-account", json={"accountId": "12345", "accNum": "2"})
         ready = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-        assert ready["status"] == "connected"
+        assert ready["status"] == "ready"
 
         completed = client.post("/api/oauth/onboarding/complete", json={
             "transaction": transaction, "csrf_token": ready["csrf_token"],
@@ -239,8 +239,8 @@ def test_existing_configured_user_skips_to_completion(oauth_storage, monkeypatch
         transaction, _ = begin_authorization(client)
         assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).status_code == 200
         status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-    assert status["status"] == "connected"
-    assert status["accountId"] == "12345"
+    assert status["status"] == "ready"
+    assert status["selected_account"]["account_id"] == "12345"
 
 
 def test_oauth_rejects_incomplete_setup_and_wrong_user(oauth_storage):

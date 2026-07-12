@@ -4,17 +4,16 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { backendErrorMessage } from "@/lib/backend-error-message";
-
-type Status = { status: string; username?: string; server?: string; accountId?: string; accNum?: string };
+import { parseTradeLockerStatus, type TradeLockerStatus } from "@/lib/tradelocker-status";
 
 export default function SettingsPanel() {
   const router = useRouter();
-  const [status, setStatus] = useState<Status | null>(null);
+  const [status, setStatus] = useState<TradeLockerStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
 
-  useEffect(() => { fetch("/api/backend/broker/status").then(async response => { const body = await response.json(); if (!response.ok) throw { status: response.status, code: body.code }; setStatus(body); }).catch(caught => setError(typeof caught === "object" && caught !== null && "status" in caught ? backendErrorMessage(caught as { status: number; code?: string }) : "Backend API unavailable. Is the FastAPI server running?")).finally(() => setLoading(false)); }, []);
+  useEffect(() => { fetch("/api/backend/broker/status").then(async response => { const body = await response.json(); if (!response.ok) throw { status: response.status, code: body.code }; setStatus(parseTradeLockerStatus(body)); }).catch(caught => setError(typeof caught === "object" && caught !== null && "status" in caught ? backendErrorMessage(caught as { status: number; code?: string }) : "Backend API unavailable. Is the FastAPI server running?")).finally(() => setLoading(false)); }, []);
 
   async function disconnect() {
     if (!window.confirm("Remove your encrypted TradeLocker connection?")) return;
@@ -27,9 +26,9 @@ export default function SettingsPanel() {
   if (loading) return <div className="notice">Loading TradeLocker settings…</div>;
   return <section className="card" style={{ maxWidth: 680 }}>
     {error && <div className="error">{error}</div>}
-    {status?.status === "setup_required" && <div className="notice">TradeLocker setup required.</div>}
+    {status?.status === "not_connected" && <div className="notice">TradeLocker setup required.</div>}
     <div className="label">Connection status</div><div className="value">{status?.status?.replaceAll("_", " ") ?? "Unavailable"}</div>
-    {status?.username && <p>{status.username} · {status.server}<br />{status.accountId ? `accountId ${status.accountId} · accNum ${status.accNum}` : "No account selected"}</p>}
-    <div className="actions"><Link className="button" href="/connect-tradelocker">Update TradeLocker credentials</Link>{status?.status === "account_selection_required" && <Link className="button secondary" href="/select-account">Select TradeLocker account</Link>}{status && status.status !== "setup_required" && <button className="button danger" onClick={disconnect} disabled={deleting}>{deleting ? "Removing…" : "Disconnect TradeLocker"}</button>}</div>
+    {status?.selected_account && <p>{status.selected_account.server}<br />accountId {status.selected_account.account_id} · accNum {status.selected_account.account_number}</p>}
+    <div className="actions"><Link className="button" href="/connect-tradelocker">Update TradeLocker credentials</Link>{status?.status === "connected_no_account" && <Link className="button secondary" href="/select-account">Select TradeLocker account</Link>}{status && status.status !== "not_connected" && <button className="button danger" onClick={disconnect} disabled={deleting}>{deleting ? "Removing…" : "Disconnect TradeLocker"}</button>}</div>
   </section>;
 }

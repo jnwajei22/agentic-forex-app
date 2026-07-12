@@ -20,7 +20,7 @@ export default function AccountSelector({ returnTo, onboarding = false }: { retu
     fetch("/api/backend/broker/tradelocker/discover-accounts", { method: "POST" })
       .then(async response => {
         const body = await response.json();
-        if (!response.ok || body.status === "error" || body.status === "setup_required") throw new Error(body.message ?? "Unable to retrieve TradeLocker accounts. Check the credentials and server selection, then try again.");
+        if (!response.ok || body.status === "error" || body.status === "not_connected") throw new Error(body.message ?? "Unable to retrieve TradeLocker accounts. Check the credentials and server selection, then try again.");
         if (active) setAccounts(body.accounts ?? []);
       })
       .catch(caught => active && setError(caught instanceof Error ? caught.message : "Unable to discover accounts."))

@@ -162,12 +162,14 @@ class BrokerRepository:
                 (auth0_sub,),
             ).fetchone()
         if row is None:
-            return {"status": "setup_required", "provider": "tradelocker"}
+            return {"status": "not_connected", "connected": False, "selected_account": None}
+        selected = bool(row["account_id"] and row["account_number"])
         return {
-            "status": "connected" if row["account_id"] and row["account_number"] else "account_selection_required",
-            "provider": "tradelocker",
-            "username": row["username"],
-            "server": row["server"],
-            "accountId": row["account_id"],
-            "accNum": row["account_number"],
+            "status": "ready" if selected else "connected_no_account",
+            "connected": True,
+            "selected_account": ({
+                "server": row["server"],
+                "account_id": row["account_id"],
+                "account_number": row["account_number"],
+            } if selected else None),
         }

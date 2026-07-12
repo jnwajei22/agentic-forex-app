@@ -10,8 +10,8 @@ import {
   afterAccountSelected,
   afterCredentialsSaved,
   isAllowedOAuthCallback,
-  onboardingDestination,
 } from "./onboarding-transaction.ts";
+import { onboardingDestination, parseTradeLockerStatus } from "./tradelocker-status.ts";
 
 test("preserves an allowed returnTo through account selection and completion", () => {
   const returnTo = safeChatGptReturnTo("https://chatgpt.com");
@@ -45,9 +45,31 @@ test("uses the dashboard after selection when returnTo is absent or unsafe", () 
 });
 
 test("routes authenticated users to the first incomplete onboarding step", () => {
-  assert.equal(onboardingDestination("setup_required"), "/connect-tradelocker");
-  assert.equal(onboardingDestination("account_selection_required"), "/select-account");
-  assert.equal(onboardingDestination("connected"), "/setup-complete");
+  assert.equal(onboardingDestination("not_connected"), "/connect-tradelocker");
+  assert.equal(onboardingDestination("connected_no_account"), "/select-account");
+  assert.equal(onboardingDestination("ready"), "/setup-complete");
+  assert.equal(onboardingDestination("invalid_credentials"), "/connect-tradelocker?connectionIssue=invalid_credentials");
+  assert.equal(onboardingDestination("expired"), "/connect-tradelocker?connectionIssue=expired");
+  assert.equal(onboardingDestination("unavailable"), null);
+});
+
+test("malformed and unknown backend statuses become a safe unavailable state", () => {
+  const missing = parseTradeLockerStatus({ connected: false });
+  assert.equal(missing.status, "unavailable");
+  assert.equal(missing.safeRawStatus, "<missing>");
+  assert.equal(missing.malformed, true);
+  const unknown = parseTradeLockerStatus({ status: "legacy_surprise", connected: false });
+  assert.equal(unknown.status, "unavailable");
+  assert.equal(unknown.safeRawStatus, "legacy_surprise");
+});
+
+test("parses the documented current backend response shape", () => {
+  const status = parseTradeLockerStatus({
+    status: "ready", connected: true,
+    selected_account: { account_id: "12345", account_number: "2", server: "DEMO" },
+  });
+  assert.equal(status.status, "ready");
+  assert.equal(status.selected_account?.account_id, "12345");
 });
 
 test("only accepts exact approved OAuth callback origins", () => {

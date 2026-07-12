@@ -90,7 +90,8 @@ async def oauth_onboarding_status(payload: TransactionRequest, claims: dict = De
     if transaction.user_sub != claims["sub"]:
         raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
     status = await validated_onboarding_status(claims["sub"])
-    return {**status, "transaction_valid": True, "csrf_token": transaction.csrf_token}
+    return {**status.model_dump(mode="json"), "transaction_valid": True,
+            "csrf_token": transaction.csrf_token}
 
 
 @router.post("/api/oauth/onboarding/complete")
@@ -104,7 +105,7 @@ async def complete_authorization(payload: CompletionRequest, claims: dict = Depe
     if payload.csrf_token != transaction.csrf_token:
         raise HTTPException(status_code=403, detail="Invalid onboarding request.")
     status = await validated_onboarding_status(claims["sub"])
-    if status["status"] != "connected":
+    if status.status != "ready":
         raise HTTPException(status_code=409, detail="A valid TradeLocker account must be selected before authorization.")
     issued = repo.issue_code(payload.transaction, claims["sub"])
     if issued is None:

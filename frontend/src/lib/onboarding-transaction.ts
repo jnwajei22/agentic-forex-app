@@ -11,13 +11,6 @@ export function onboardingCookieOptions() {
   };
 }
 
-export function onboardingDestination(status: string): string {
-  if (status === "setup_required") return "/connect-tradelocker";
-  if (status === "account_selection_required") return "/select-account";
-  if (status === "connected") return "/setup-complete";
-  throw new Error("Unknown TradeLocker connection status.");
-}
-
 export function isAllowedOAuthCallback(value: string): boolean {
   try {
     const origin = new URL(value).origin;

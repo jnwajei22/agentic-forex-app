@@ -49,7 +49,9 @@ def test_user_cannot_access_another_users_broker_connection(platform_storage):
     with _client_for("auth0|user-a") as client:
         response = client.get("/api/broker/status")
 
-    assert response.json() == {"status": "setup_required", "provider": "tradelocker"}
+    assert response.json()["status"] == "not_connected"
+    assert response.json()["connected"] is False
+    assert response.json()["selected_account"] is None
     assert platform_storage.get_connection("auth0|user-a") is None
 
 
@@ -116,7 +118,7 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
         )
         discovered = client.post("/api/broker/tradelocker/discover-accounts")
 
-    assert saved.json() == {"status": "saved", "provider": "tradelocker"}
+    assert saved.json()["status"] == "connected_no_account"
     assert discovered.json() == {"accounts": [{"accountId": 12345, "accNum": 2}]}
     assert captured["password"] == password
     output = saved.text + discovered.text
@@ -214,7 +216,7 @@ def test_selected_account_is_stored_per_user(platform_storage):
         )
 
     stored = platform_storage.get_connection("auth0|user-a")
-    assert response.json()["status"] == "connected"
+    assert response.json()["status"] == "ready"
     assert stored.account_id == "12345"
     assert stored.account_number == "2"
 
@@ -243,7 +245,7 @@ def test_onboarding_status_requires_valid_discovered_selected_account(platform_s
     with _client_for("auth0|user-a") as client:
         response = client.post("/api/broker/onboarding-status")
 
-    assert response.json()["status"] == "connected"
+    assert response.json()["status"] == "ready"
     assert "password" not in response.text.lower()
 
 
@@ -271,8 +273,60 @@ def test_onboarding_status_rejects_revoked_tradelocker_credentials(platform_stor
     with _client_for("auth0|user-a") as client:
         response = client.post("/api/broker/onboarding-status")
 
-    assert response.json()["status"] == "setup_required"
+    assert response.json()["status"] == "invalid_credentials"
     assert "Unauthorized" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "retryable"),
+    [
+        (TradeLockerError("get_accounts", "Expired", code="token_expired"), "expired", False),
+        (TradeLockerError("get_accounts", "Timeout", code="timeout"), "unavailable", True),
+    ],
+)
+def test_onboarding_status_classifies_expired_and_unavailable_connections(
+    platform_storage, monkeypatch, error, expected_status, retryable
+):
+    platform_storage.save_connection(
+        "auth0|user-a", base_url="https://demo.example/backend-api",
+        username="user-a", password="password-a", server="DEMO",
+    )
+
+    class FailedClient:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get_accounts(self): raise error
+
+    monkeypatch.setattr(platform, "TradeLockerClient", FailedClient)
+    with _client_for("auth0|user-a") as client:
+        response = client.post("/api/broker/onboarding-status")
+    assert response.status_code == 200
+    assert response.json()["status"] == expected_status
+    assert response.json()["connected"] is False
+    assert response.json()["selected_account"] is None
+    assert response.json()["retryable"] is retryable
+
+
+def test_onboarding_status_connected_without_account(platform_storage, monkeypatch):
+    platform_storage.save_connection(
+        "auth0|user-a", base_url="https://demo.example/backend-api",
+        username="user-a", password="password-a", server="DEMO",
+    )
+
+    class ValidClient:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get_accounts(self): return {"accounts": [{"accountId": 123, "accNum": 1}]}
+
+    monkeypatch.setattr(platform, "TradeLockerClient", ValidClient)
+    with _client_for("auth0|user-a") as client:
+        response = client.post("/api/broker/onboarding-status")
+    assert response.json() == {
+        "status": "connected_no_account", "connected": True,
+        "selected_account": None, "message": None, "retryable": False,
+    }
 
 
 @pytest.mark.asyncio

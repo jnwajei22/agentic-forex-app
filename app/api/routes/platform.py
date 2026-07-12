@@ -11,6 +11,11 @@ from pydantic import AliasChoices, BaseModel, Field
 from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.config.settings import settings
 from app.storage.brokers import BrokerRepository, BrokerStorageError
+from app.models.onboarding import (
+    SelectedTradeLockerAccount,
+    TradeLockerConnectionStatus,
+    TradeLockerOnboardingStatus,
+)
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -66,21 +71,22 @@ async def me(claims: dict = Depends(current_claims)) -> dict:
 
 @router.get("/broker/status")
 async def broker_status(claims: dict = Depends(current_claims)) -> dict:
-    return repository().status(claims["sub"])
+    return (await validated_onboarding_status(claims["sub"])).model_dump(mode="json")
 
 
 @router.post("/broker/onboarding-status")
 async def onboarding_status(claims: dict = Depends(current_claims)) -> dict:
-    return await validated_onboarding_status(claims["sub"])
+    return (await validated_onboarding_status(claims["sub"])).model_dump(mode="json")
 
 
-async def validated_onboarding_status(user_sub: str) -> dict:
+async def validated_onboarding_status(user_sub: str) -> TradeLockerOnboardingStatus:
     repo = repository()
     connection = repo.get_connection(user_sub)
     if connection is None:
-        return {"status": "setup_required", "provider": "tradelocker"}
-    if not connection.account_id or not connection.account_number:
-        return {"status": "account_selection_required", "provider": "tradelocker"}
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.NOT_CONNECTED,
+            connected=False,
+        )
     try:
         async with TradeLockerClient(
             base_url=connection.base_url, username=connection.username,
@@ -88,12 +94,33 @@ async def validated_onboarding_status(user_sub: str) -> dict:
             account_id=None, account_number=None,
         ) as client:
             discovered = await client.get_accounts()
-    except TradeLockerError:
-        return {
-            "status": "setup_required",
-            "provider": "tradelocker",
-            "message": "TradeLocker credentials must be reconnected.",
+    except TradeLockerError as exc:
+        expired = exc.code in {"expired", "token_expired", "session_expired"}
+        rejected = exc.status_code in {400, 401, 403} or exc.code in {
+            "unauthorized", "invalid_credentials", "authentication_failed"
         }
+        if expired or rejected:
+            return TradeLockerOnboardingStatus(
+                status=(TradeLockerConnectionStatus.EXPIRED if expired
+                        else TradeLockerConnectionStatus.INVALID_CREDENTIALS),
+                connected=False,
+                message="Reconnect TradeLocker credentials to continue.",
+            )
+        logger.warning(
+            "TradeLocker route=onboarding_status response_status=%s safe_code=%s",
+            exc.status_code, exc.code,
+        )
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.UNAVAILABLE,
+            connected=False,
+            message="TradeLocker connection status is temporarily unavailable.",
+            retryable=True,
+        )
+    if not connection.account_id or not connection.account_number:
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
+            connected=True,
+        )
     accounts = discovered.get("accounts", []) if isinstance(discovered, dict) else []
     selected_exists = any(
         str(account.get("accountId")) == connection.account_id
@@ -101,8 +128,19 @@ async def validated_onboarding_status(user_sub: str) -> dict:
         for account in accounts if isinstance(account, dict)
     )
     if not selected_exists:
-        return {"status": "account_selection_required", "provider": "tradelocker"}
-    return repo.status(user_sub)
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
+            connected=True,
+        )
+    return TradeLockerOnboardingStatus(
+        status=TradeLockerConnectionStatus.READY,
+        connected=True,
+        selected_account=SelectedTradeLockerAccount(
+            account_id=connection.account_id,
+            account_number=connection.account_number,
+            server=connection.server,
+        ),
+    )
 
 
 @router.post("/broker/tradelocker/save-credentials")
@@ -123,14 +161,20 @@ async def save_credentials(
         claims["sub"], base_url=payload.base_url, username=payload.username,
         password=payload.password, server=payload.server, email=claims.get("email"),
     )
-    return {"status": "saved", "provider": "tradelocker"}
+    return TradeLockerOnboardingStatus(
+        status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
+        connected=True,
+    ).model_dump(mode="json")
 
 
 @router.post("/broker/tradelocker/discover-accounts")
 async def discover_accounts(claims: dict = Depends(current_claims)):
     connection = repository().get_connection(claims["sub"])
     if connection is None:
-        return {"status": "setup_required", "provider": "tradelocker"}
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.NOT_CONNECTED,
+            connected=False,
+        ).model_dump(mode="json")
     try:
         async with TradeLockerClient(
             base_url=connection.base_url, username=connection.username,
@@ -181,11 +225,20 @@ async def select_account(
     if not repository().select_account(
         claims["sub"], payload.account_id, payload.account_number
     ):
-        return {"status": "setup_required", "provider": "tradelocker"}
-    return {
-        "status": "connected", "provider": "tradelocker",
-        "accountId": payload.account_id, "accNum": payload.account_number,
-    }
+        return TradeLockerOnboardingStatus(
+            status=TradeLockerConnectionStatus.NOT_CONNECTED,
+            connected=False,
+        ).model_dump(mode="json")
+    connection = repository().get_connection(claims["sub"])
+    return TradeLockerOnboardingStatus(
+        status=TradeLockerConnectionStatus.READY,
+        connected=True,
+        selected_account=SelectedTradeLockerAccount(
+            account_id=payload.account_id,
+            account_number=payload.account_number,
+            server=connection.server if connection else "TradeLocker",
+        ),
+    ).model_dump(mode="json")
 
 
 @router.delete("/broker/tradelocker")

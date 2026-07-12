@@ -50,7 +50,7 @@ def _missing_user_connection() -> dict[str, Any] | None:
         status = BrokerRepository().status(user_sub)
     except BrokerStorageError as exc:
         return {"status": "error", "error": "broker_storage_error", "message": str(exc)}
-    return _setup_required() if status["status"] == "setup_required" else None
+    return _setup_required() if status["status"] == "not_connected" else None
 
 
 def get_tradelocker_connection_status() -> dict[str, Any]:
@@ -66,20 +66,16 @@ def get_tradelocker_connection_status() -> dict[str, Any]:
         status = BrokerRepository().status(user_sub)
     except BrokerStorageError as exc:
         return {"connected": False, "selected_account": False, "status": "error", "message": str(exc)}
-    if status["status"] == "setup_required":
+    if status["status"] == "not_connected":
         return {"connected": False, "selected_account": False, **_setup_required()}
-    selected = status["status"] == "connected"
+    selected = status["status"] == "ready"
     result: dict[str, Any] = {
         "connected": True,
         "selected_account": selected,
         "status": status["status"],
     }
     if selected:
-        result["selected_account_summary"] = {
-            "server": status["server"],
-            "account_id": status["accountId"],
-            "account_number": status["accNum"],
-        }
+        result["selected_account_summary"] = status["selected_account"]
     return result
 
 
