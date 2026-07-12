@@ -57,6 +57,23 @@ TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_UR
 
 TradeLocker market data is opt-in. Keep `MARKET_DATA_PROVIDER=mock` (the default) unless you explicitly want scans and charts to read TradeLocker candles. No setting enables TradeLocker order submission.
 
+Generated charts are written to `storage/charts` and returned with both a local path and a public URL. Set `PUBLIC_BASE_URL=https://mcp.justinnwajei.com`; a chart such as `chart_abc123def4` is then available at `https://mcp.justinnwajei.com/charts/chart_abc123def4.png`.
+
+## Vercel frontend and multi-user broker storage
+
+For a Vercel frontend calling the Raspberry Pi API through Cloudflare Tunnel, configure:
+
+```dotenv
+FRONTEND_ORIGIN=https://app.agenticforexdesk.com
+SQLITE_PATH=storage/app.db
+BROKER_SECRET_KEY=<long-random-secret-kept-only-on-the-backend>
+ALLOW_ENV_BROKER_FALLBACK=false
+```
+
+The `/api/*` onboarding routes require an Auth0 access token. Users are keyed by the token's immutable `sub` claim, and each TradeLocker password is encrypted before it is written to SQLite. Keep `BROKER_SECRET_KEY` stable and backed up securely; changing or losing it makes existing encrypted connections unreadable. Never expose this key to Vercel or browser code.
+
+The browser onboarding sequence is: save TradeLocker credentials, discover accounts, select an `accountId` and `accNum`, then query broker status. MCP tools resolve the same saved connection from the authenticated caller's Auth0 `sub`. Environment-based TradeLocker credentials are disabled unless `ALLOW_ENV_BROKER_FALLBACK=true` is deliberately enabled for local/manual testing.
+
 ## Run locally
 
 Install dependencies and start the combined FastAPI/MCP process:

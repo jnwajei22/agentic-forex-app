@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config.settings import settings
+from app.auth.identity import reset_current_claims, set_current_claims
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,8 @@ TOOL_SCOPES = {
     "get_forex_watchlist": "forex:read",
     "scan_forex_watchlist": "forex:read",
     "generate_chart": "forex:read",
+    "analyze_multi_timeframe": "forex:read",
+    "generate_multi_timeframe_report": "forex:read",
     "review_forex_order": "forex:preview",
     "get_account_status": "forex:read",
     "get_open_positions": "forex:read",
@@ -168,6 +171,12 @@ class MCPAuthMiddleware:
             )
             return
 
+        if not isinstance(claims.get("sub"), str) or not claims["sub"]:
+            await _json_response(
+                scope, receive, send, "OAuth token is missing the subject claim.", 401, OAUTH_CHALLENGE
+            )
+            return
+
         body, replay = await _read_body(receive)
         required = _required_scopes(body)
         missing = required - _token_scopes(claims)
@@ -179,4 +188,8 @@ class MCPAuthMiddleware:
             )
             return
 
-        await self.app(scope, replay, send)
+        identity_token = set_current_claims(claims)
+        try:
+            await self.app(scope, replay, send)
+        finally:
+            reset_current_claims(identity_token)

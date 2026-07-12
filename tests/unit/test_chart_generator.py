@@ -16,6 +16,7 @@ def chart_inputs():
 
 def test_chart_png_file_is_created_without_trade_overlay(tmp_path, monkeypatch):
     monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
+    monkeypatch.setattr(generator.settings, "public_base_url", "https://charts.example.test")
     candles, analysis = chart_inputs()
 
     metadata = generator.generate_forex_chart(
@@ -26,7 +27,13 @@ def test_chart_png_file_is_created_without_trade_overlay(tmp_path, monkeypatch):
     assert path.exists()
     assert path.suffix == ".png"
     assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-    assert metadata.keys() >= {"chart_id", "path", "summary"}
+    assert metadata.keys() >= {
+        "chart_id", "public_chart_url", "local_path", "path", "summary"
+    }
+    assert metadata["public_chart_url"] == (
+        f"https://charts.example.test/charts/{metadata['chart_id']}.png"
+    )
+    assert metadata["local_path"] == metadata["path"]
 
 
 def test_chart_works_with_trade_overlay(tmp_path, monkeypatch):

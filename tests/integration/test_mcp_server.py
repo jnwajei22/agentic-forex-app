@@ -11,15 +11,19 @@ from app.brokers.tradelocker.adapter import TradeLockerAdapter
 from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.main import app
+from app.models.market import Candle
 from app.mcp import tools
 from app.mcp import auth
 from app.mcp.server import mcp
+from app.services.charting import generator
 
 
 EXPECTED_TOOLS = {
     "get_forex_watchlist",
     "scan_forex_watchlist",
     "generate_chart",
+    "analyze_multi_timeframe",
+    "generate_multi_timeframe_report",
     "review_forex_order",
     "get_account_status",
     "get_open_positions",
@@ -48,7 +52,9 @@ MCP_HEADERS = {
 
 def _enable_test_oauth(monkeypatch, scopes="forex:read forex:preview"):
     monkeypatch.setattr(settings, "mcp_require_oauth", True)
-    monkeypatch.setattr(auth, "_verify_access_token", lambda token: {"scope": scopes})
+    monkeypatch.setattr(
+        auth, "_verify_access_token", lambda token: {"sub": "auth0|test", "scope": scopes}
+    )
 
 
 def test_missing_auth_issuer_is_invalid_when_oauth_is_required(monkeypatch):
@@ -280,11 +286,71 @@ async def test_mcp_watchlist_and_scan_are_usable_and_ranked(monkeypatch):
 
     assert watchlist
     assert watchlist[0]["pair"] == "EUR/USD"
-    assert results
-    assert [result["score"] for result in results] == sorted(
-        [result["score"] for result in results], reverse=True
+    assert results["results"]
+    assert [result["score"] for result in results["results"]] == sorted(
+        [result["score"] for result in results["results"]], reverse=True
     )
-    assert len(results) <= 5
+    assert len(results["results"]) <= 5
+    assert results["strongest_pairs"]
+    assert "spread_warning" in results["results"][0]
+
+
+@pytest.mark.asyncio
+async def test_mcp_scan_reports_missing_timeframe_data(monkeypatch):
+    async def no_candles(pair, timeframe, lookback):
+        return []
+
+    monkeypatch.setattr(tools, "get_candles", no_candles)
+
+    report = await tools.scan_forex_watchlist(["15m"], max_results=5)
+
+    assert report["results"] == []
+    assert report["warnings"]
+    assert all("Missing data" in warning for warning in report["warnings"])
+    assert "No trade / no clean setup" in report["summary"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_generate_chart_returns_public_and_local_urls(tmp_path, monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=index),
+            open=1.1 + index * 0.0001,
+            high=1.101 + index * 0.0001,
+            low=1.099 + index * 0.0001,
+            close=1.1005 + index * 0.0001,
+        )
+        for index in range(60)
+    ]
+
+    async def candle_source(pair, timeframe, lookback):
+        return candles
+
+    async def spread_source(pair):
+        return 0.0001
+
+    monkeypatch.setattr(tools, "get_candles", candle_source)
+    monkeypatch.setattr(tools, "get_spread", spread_source)
+    monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
+    monkeypatch.setattr(settings, "public_base_url", "https://charts.example.test")
+
+    result = await tools.generate_chart("EUR/USD", "1h")
+
+    assert result.keys() >= {
+        "chart_id",
+        "public_chart_url",
+        "local_path",
+        "pair",
+        "timeframe",
+        "trend",
+        "generated_at",
+        "summary",
+    }
+    assert result["public_chart_url"] == (
+        f"https://charts.example.test/charts/{result['chart_id']}.png"
+    )
+    assert result["local_path"].endswith(f"{result['chart_id']}.png")
 
 
 def test_mcp_order_review_is_rejected_without_live_submission(monkeypatch):

@@ -11,6 +11,7 @@ def scan_forex_watchlist(
     candle_data: Mapping[str, Sequence[Candle | dict]],
     timeframe: str = "1h",
     strategy_profile: str = "default",
+    spreads: Mapping[str, float | None] | None = None,
 ) -> list[SetupAnalysis]:
     """Analyze and rank setups from caller-supplied mocked candles."""
     setups: list[SetupAnalysis] = []
@@ -24,7 +25,13 @@ def scan_forex_watchlist(
         if len(candles) < 2:
             continue
         setups.append(
-            analyze_pair_from_candles(pair, timeframe, candles, strategy_profile)
+            analyze_pair_from_candles(
+                pair,
+                timeframe,
+                candles,
+                strategy_profile,
+                spread=(spreads or {}).get(pair),
+            )
         )
 
     return sorted(setups, key=lambda setup: setup.score, reverse=True)

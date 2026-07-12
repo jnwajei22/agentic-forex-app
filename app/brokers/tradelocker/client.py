@@ -191,18 +191,20 @@ class TradeLockerClient:
             response.raise_for_status()
             return response.json()
         except httpx.TimeoutException as exc:
-            raise TradeLockerError(operation, "TradeLocker request timed out.", code="timeout") from exc
+            raise TradeLockerError(
+                operation, "TradeLocker request timed out.", code="timeout"
+            ) from None
         except httpx.HTTPStatusError as exc:
             raise TradeLockerError(
                 operation,
                 "TradeLocker rejected the request.",
                 code="http_error",
                 status_code=exc.response.status_code,
-            ) from exc
+            ) from None
         except (httpx.RequestError, ValueError) as exc:
             raise TradeLockerError(
                 operation, "TradeLocker returned an unusable response.", code="request_failed"
-            ) from exc
+            ) from None
 
     async def _optional_get(self, path: str, *, operation: str, **kwargs: Any) -> Any:
         try:

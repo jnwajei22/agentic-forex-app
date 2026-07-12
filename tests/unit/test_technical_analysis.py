@@ -4,7 +4,12 @@ import pytest
 
 from app.models.market import Candle
 from app.services.technical_analysis.analyzer import analyze_pair_from_candles
-from app.services.technical_analysis.indicators import calculate_ema, candle_emas
+from app.services.technical_analysis.indicators import (
+    calculate_atr,
+    calculate_ema,
+    calculate_rsi,
+    candle_emas,
+)
 from app.services.technical_analysis.support_resistance import detect_support_resistance
 from app.services.technical_analysis.swings import find_pivot_swings
 from app.services.technical_analysis.trend import classify_trend
@@ -31,6 +36,18 @@ def test_ema_calculation_and_standard_period_availability():
     assert emas["ema_20"] is not None
     assert emas["ema_50"] is not None
     assert emas["ema_200"] is None
+
+
+def test_rsi_calculation():
+    assert calculate_rsi([float(value) for value in range(1, 16)]) == pytest.approx(100.0)
+    assert calculate_rsi([1.0] * 15) == pytest.approx(50.0)
+    assert calculate_rsi([1.0, 2.0], period=14) is None
+
+
+def test_atr_calculation():
+    candles = make_candles([float(value) for value in range(1, 17)])
+    assert calculate_atr(candles) == pytest.approx(1.2)
+    assert calculate_atr(candles[:10]) is None
 
 
 def test_trend_classification_bullish():

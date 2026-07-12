@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from app.brokers.tradelocker.client import TradeLockerClient
@@ -11,12 +13,13 @@ REAL_CONFIG = (
     settings.tradelocker_account_id,
     settings.tradelocker_account_number,
 )
+RUN_LIVE = os.getenv("RUN_TRADELOCKER_INTEGRATION") == "1"
 
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not all(REAL_CONFIG),
-    reason="real TradeLocker credentials are not configured",
+    not RUN_LIVE or not all(REAL_CONFIG),
+    reason="set RUN_TRADELOCKER_INTEGRATION=1 with real credentials to run",
 )
 async def test_real_tradelocker_read_only_account_status():
     async with TradeLockerClient(

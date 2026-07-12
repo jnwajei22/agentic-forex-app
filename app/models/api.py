@@ -31,6 +31,8 @@ class ForexChartRequest(BaseModel):
 
 class ForexChartResponse(BaseModel):
     chart_id: str
+    public_chart_url: str
+    local_path: str
     path: str
     summary: str
     pair: str

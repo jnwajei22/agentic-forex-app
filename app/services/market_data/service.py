@@ -60,3 +60,36 @@ async def get_candles(pair: str, timeframe: str, lookback: int = 300) -> list[Ca
             )
         return candles
     raise ValueError("MARKET_DATA_PROVIDER must be 'mock' or 'tradelocker'.")
+
+
+def _quote_value(payload: Any, names: tuple[str, ...]) -> float | None:
+    if isinstance(payload, dict):
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, (int, float)):
+                return float(value)
+        for value in payload.values():
+            found = _quote_value(value, names)
+            if found is not None:
+                return found
+    if isinstance(payload, list):
+        for value in payload:
+            found = _quote_value(value, names)
+            if found is not None:
+                return found
+    return None
+
+
+async def get_spread(pair: str) -> float | None:
+    """Return ask-minus-bid when the selected provider exposes a usable quote."""
+    if settings.market_data_provider.lower() != "tradelocker":
+        return None
+    try:
+        payload = await get_tradelocker_adapter().get_quote(pair)
+    except TradeLockerError:
+        return None
+    ask = _quote_value(payload, ("ask", "askPrice", "ap"))
+    bid = _quote_value(payload, ("bid", "bidPrice", "bp"))
+    if ask is None or bid is None or ask < bid:
+        return None
+    return ask - bid

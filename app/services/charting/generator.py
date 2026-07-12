@@ -12,6 +12,8 @@ import pandas as pd
 
 from app.models.analysis import SetupAnalysis
 from app.models.market import Candle
+from app.config.settings import settings
+from app.services.technical_analysis.indicators import calculate_ema_series
 
 
 CHART_DIR = Path("storage/charts")
@@ -56,17 +58,33 @@ def generate_forex_chart(
     CHART_DIR.mkdir(parents=True, exist_ok=True)
     path = CHART_DIR / f"{chart_id}.png"
 
+    closes = [candle.close for candle in ordered_candles]
+    ema_plots = []
+    for period, color in ((20, "#1f77b4"), (50, "#ff7f0e"), (200, "#9467bd")):
+        series = calculate_ema_series(closes, period)
+        if any(value is not None for value in series):
+            ema_plots.append(
+                mpf.make_addplot(
+                    pd.Series(series, index=frame.index),
+                    color=color,
+                    width=1.0,
+                    label=f"EMA {period}",
+                )
+            )
+
     style = mpf.make_mpf_style(base_mpf_style="charles", gridstyle=":")
-    fig, axes = mpf.plot(
-        frame,
-        type="candle",
-        style=style,
-        volume=False,
-        returnfig=True,
-        figsize=(13, 8),
-        datetime_format="%m-%d %H:%M",
-        xrotation=15,
-    )
+    plot_options = {
+        "type": "candle",
+        "style": style,
+        "volume": False,
+        "returnfig": True,
+        "figsize": (13, 8),
+        "datetime_format": "%m-%d %H:%M",
+        "xrotation": 15,
+    }
+    if ema_plots:
+        plot_options["addplot"] = ema_plots
+    fig, axes = mpf.plot(frame, **plot_options)
     price_axis = axes[0]
 
     def level(value: float | None, color: str, label: str, linestyle: str = "--") -> None:
@@ -97,13 +115,27 @@ def generate_forex_chart(
     level(stop_loss, "red", "Stop", "-")
     level(take_profit, "green", "Target", "-")
 
+    if ema_plots:
+        price_axis.legend(loc="upper left", fontsize=8)
+
     price_axis.set_title(
         f"{pair} · {timeframe} · {analysis.trend.upper()} · Current {current_price:.5f}",
         fontsize=13,
         pad=14,
     )
     price_axis.set_ylabel("Price")
-    overlay_text = f"Overlays: {', '.join(overlays)}" if overlays else "Overlays: analysis"
+    indicator_text = (
+        f"RSI 14: {analysis.rsi_14:.1f}" if analysis.rsi_14 is not None else "RSI 14: n/a"
+    )
+    indicator_text += (
+        f" | ATR 14: {analysis.atr_14:.5f}" if analysis.atr_14 is not None else " | ATR 14: n/a"
+    )
+    indicator_text += f" | Range: {(analysis.candle_range or 0):.5f}"
+    if analysis.spread is not None:
+        indicator_text += f" | Spread: {analysis.spread:.5f}"
+    overlay_text = (
+        f"Overlays: candlesticks, EMA, Fibonacci, support/resistance, swings | {indicator_text}"
+    )
     fig.text(0.01, 0.025, overlay_text, fontsize=8, color="dimgray")
     fig.text(
         0.99,
@@ -119,12 +151,17 @@ def generate_forex_chart(
     finally:
         plt.close(fig)
 
+    public_chart_url = (
+        f"{settings.public_base_url.rstrip('/')}/charts/{chart_id}.png"
+    )
     return {
         "chart_id": chart_id,
+        "public_chart_url": public_chart_url,
+        "local_path": str(path),
         "path": str(path),
         "summary": (
             f"Static candlestick analysis chart for {pair} {timeframe}; "
-            f"trend {analysis.trend}. {DISCLAIMER}"
+            f"trend {analysis.trend}, RSI {analysis.rsi_14}, ATR {analysis.atr_14}. {DISCLAIMER}"
         ),
         "pair": pair,
         "timeframe": timeframe,

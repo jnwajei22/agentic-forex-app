@@ -1,6 +1,8 @@
 from app.brokers.base import BrokerAdapter
-from app.brokers.tradelocker.client import TradeLockerClient
+from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.config.settings import settings
+from app.auth.identity import get_current_user_sub
+from app.storage.brokers import BrokerRepository, BrokerStorageError
 from app.models.orders import OrderPreview
 
 
@@ -31,21 +33,35 @@ class TradeLockerAdapter(BrokerAdapter):
         raise NotImplementedError("Live TradeLocker execution is intentionally disabled.")
 
 
-_adapter: TradeLockerAdapter | None = None
-_adapter_config: tuple[str | None, ...] | None = None
-
-
 def get_tradelocker_adapter() -> TradeLockerAdapter:
-    global _adapter, _adapter_config
-    config = (
-        settings.tradelocker_base_url,
-        settings.tradelocker_username,
-        settings.tradelocker_password,
-        settings.tradelocker_server,
-        settings.tradelocker_account_id,
-        settings.tradelocker_account_number,
+    user_sub = get_current_user_sub()
+    if user_sub:
+        try:
+            connection = BrokerRepository().get_connection(user_sub)
+        except BrokerStorageError as exc:
+            raise TradeLockerError(
+                "broker_connection", str(exc), code="broker_storage_error"
+            ) from None
+        if connection:
+            return TradeLockerAdapter(
+                TradeLockerClient(
+                    base_url=connection.base_url,
+                    username=connection.username,
+                    password=connection.password,
+                    server=connection.server,
+                    account_id=connection.account_id,
+                    account_number=connection.account_number,
+                )
+            )
+        raise TradeLockerError(
+            "broker_connection",
+            "TradeLocker connection setup is required for the current user.",
+            code="setup_required",
+        )
+    if settings.allow_env_broker_fallback:
+        return TradeLockerAdapter()
+    raise TradeLockerError(
+        "broker_connection",
+        "TradeLocker connection setup is required for the current user.",
+        code="setup_required",
     )
-    if _adapter is None or config != _adapter_config:
-        _adapter = TradeLockerAdapter()
-        _adapter_config = config
-    return _adapter
