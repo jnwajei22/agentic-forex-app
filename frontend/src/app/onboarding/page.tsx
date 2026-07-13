@@ -1,11 +1,11 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
-import { backendFetchWithMetadata } from "@/lib/backend";
 import { auth0 } from "@/lib/auth0";
 import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 import { onboardingDestination, parseTradeLockerStatus } from "@/lib/tradelocker-status";
 import { BackendError, type BackendResponse } from "@/lib/backend";
+import { onboardingBackendFetchWithMetadata } from "@/lib/onboarding-backend";
 import OnboardingShell from "@/components/onboarding-shell";
 import Link from "next/link";
 import { onboardingHttpDisposition } from "@/lib/onboarding-http";
@@ -21,7 +21,7 @@ export default async function OnboardingPage() {
   }
   let response: BackendResponse<unknown>;
   try {
-    response = await backendFetchWithMetadata<unknown>("/api/oauth/onboarding/status", {
+    response = await onboardingBackendFetchWithMetadata<unknown>("/api/oauth/onboarding/status", transaction, {
       method: "POST", body: JSON.stringify({ transaction }),
     });
   } catch (error) {

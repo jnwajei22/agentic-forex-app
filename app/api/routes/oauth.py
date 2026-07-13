@@ -4,10 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from app.api.routes.platform import current_claims, validated_onboarding_status
+from app.api.routes.platform import validated_onboarding_status
 from app.config.settings import settings
 from app.storage.oauth import OAuthRepository, OAuthStorageError
 from app.oauth.cimd import CIMDError, cimd_loader
+from app.auth.onboarding import current_onboarding_claims, transaction_digest
 
 
 router = APIRouter(tags=["oauth"])
@@ -67,7 +68,7 @@ async def authorize(
 
 
 class TransactionRequest(BaseModel):
-    transaction: str
+    transaction: str | None = None
 
 
 class CompletionRequest(TransactionRequest):
@@ -75,29 +76,42 @@ class CompletionRequest(TransactionRequest):
 
 
 @router.post("/api/oauth/onboarding/bind")
-async def bind_transaction(payload: TransactionRequest, claims: dict = Depends(current_claims)) -> dict:
-    transaction = oauth_repository().bind_user(payload.transaction, claims["sub"])
+async def bind_transaction(payload: TransactionRequest, claims: dict = Depends(current_onboarding_claims)) -> dict:
+    reference = _require_transaction(payload.transaction)
+    _validate_assertion_transaction(reference, claims)
+    existing = oauth_repository().get_transaction(reference)
+    if existing is None:
+        raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
+    if existing.user_sub and existing.user_sub != claims["sub"]:
+        raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
+    transaction = oauth_repository().bind_user(reference, claims["sub"])
     if transaction is None:
-        raise HTTPException(status_code=403, detail="The onboarding transaction is invalid, expired, or belongs to another user.")
+        raise HTTPException(status_code=409, detail="The onboarding transaction could not be bound.")
     return {"status": "bound"}
 
 
 @router.post("/api/oauth/onboarding/status")
-async def oauth_onboarding_status(payload: TransactionRequest, claims: dict = Depends(current_claims)) -> dict:
-    transaction = oauth_repository().get_transaction(payload.transaction)
+async def oauth_onboarding_status(payload: TransactionRequest, claims: dict = Depends(current_onboarding_claims)) -> dict:
+    reference = _require_transaction(payload.transaction)
+    _validate_assertion_transaction(reference, claims)
+    transaction = oauth_repository().get_transaction(reference)
     if transaction is None:
         raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
     if transaction.user_sub != claims["sub"]:
         raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
+    if transaction.status != "AUTH0_COMPLETE":
+        raise HTTPException(status_code=409, detail="The onboarding transaction is not ready for status checks.")
     status = await validated_onboarding_status(claims["sub"])
     return {**status.model_dump(mode="json"), "transaction_valid": True,
             "csrf_token": transaction.csrf_token}
 
 
 @router.post("/api/oauth/onboarding/complete")
-async def complete_authorization(payload: CompletionRequest, claims: dict = Depends(current_claims)) -> dict:
+async def complete_authorization(payload: CompletionRequest, claims: dict = Depends(current_onboarding_claims)) -> dict:
+    reference = _require_transaction(payload.transaction)
+    _validate_assertion_transaction(reference, claims)
     repo = oauth_repository()
-    transaction = repo.get_transaction(payload.transaction)
+    transaction = repo.get_transaction(reference)
     if transaction is None:
         raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
     if transaction.user_sub != claims["sub"]:
@@ -107,13 +121,30 @@ async def complete_authorization(payload: CompletionRequest, claims: dict = Depe
     status = await validated_onboarding_status(claims["sub"])
     if status.status != "ready":
         raise HTTPException(status_code=409, detail="A valid TradeLocker account must be selected before authorization.")
-    issued = repo.issue_code(payload.transaction, claims["sub"])
+    issued = repo.issue_code(reference, claims["sub"])
     if issued is None:
         raise HTTPException(status_code=409, detail="The authorization request could not be completed.")
     code, original = issued
     separator = "&" if "?" in original.redirect_uri else "?"
     callback_url = f"{original.redirect_uri}{separator}{urlencode({'code': code, 'state': original.state})}"
     return {"redirect_url": callback_url}
+
+
+def _validate_assertion_transaction(reference: str, claims: dict) -> None:
+    if claims.get("tx_hash") != transaction_digest(reference):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "onboarding_transaction_mismatch", "message": "The assertion does not match this onboarding transaction."},
+        )
+
+
+def _require_transaction(reference: str | None) -> str:
+    if not reference:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "onboarding_transaction_required", "message": "The onboarding transaction is missing."},
+        )
+    return reference
 
 
 @router.post("/oauth/token")

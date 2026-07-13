@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     oauth_token_url: str | None = None
     oauth_transaction_secret: str | None = None
     oauth_allowed_client_ids: str | None = None
+    onboarding_assertion_secret: str | None = None
+    onboarding_assertion_issuers: str | None = None
     sqlite_path: str = "storage/app.db"
     broker_secret_key: str | None = None
     allow_env_broker_fallback: bool = False

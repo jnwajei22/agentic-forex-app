@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { auth0 } from "@/lib/auth0";
-import { backendFetch } from "@/lib/backend";
+import { onboardingBackendFetch } from "@/lib/onboarding-backend";
 import {
   isAllowedOAuthCallback,
   ONBOARDING_COOKIE,
@@ -13,7 +13,7 @@ export async function POST(request: NextRequest) {
   const transaction = request.cookies.get(ONBOARDING_COOKIE)?.value;
   if (!transaction) return NextResponse.json({ error: "The ChatGPT sign-in request expired. Restart sign-in from ChatGPT." }, { status: 400 });
   const form = await request.formData();
-  const result = await backendFetch<{ redirect_url: string }>("/api/oauth/onboarding/complete", {
+  const result = await onboardingBackendFetch<{ redirect_url: string }>("/api/oauth/onboarding/complete", transaction, {
     method: "POST",
     body: JSON.stringify({ transaction, csrf_token: String(form.get("csrfToken") ?? "") }),
   });

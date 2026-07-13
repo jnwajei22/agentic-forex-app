@@ -1,9 +1,12 @@
 import base64
 import hashlib
 import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import jwt
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock
 
@@ -23,6 +26,8 @@ def oauth_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "frontend_origin", "https://portal.example.test")
     monkeypatch.setattr(settings, "public_base_url", "https://mcp.example.test")
     monkeypatch.setattr(settings, "oauth_allowed_client_ids", "chatgpt-client")
+    monkeypatch.setattr(settings, "onboarding_assertion_secret", "test-onboarding-assertion-secret")
+    monkeypatch.setattr(settings, "onboarding_assertion_issuers", "https://portal.example.test")
     return BrokerRepository()
 
 
@@ -38,6 +43,33 @@ def claims(subject="auth0|user-a"):
 
 def authenticate(subject="auth0|user-a"):
     app.dependency_overrides[platform.current_claims] = lambda: claims(subject)
+
+
+def onboarding_assertion(transaction, subject="auth0|user-a", nonce=None):
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "sub": subject,
+            "iss": "https://portal.example.test",
+            "aud": "https://mcp.example.test/api/oauth/onboarding",
+            "iat": now,
+            "exp": now + timedelta(seconds=60),
+            "jti": nonce or str(uuid.uuid4()),
+            "tx_hash": hashlib.sha256(transaction.encode()).hexdigest(),
+            "typ": "onboarding",
+        },
+        settings.onboarding_assertion_secret,
+        algorithm="HS256",
+    )
+
+
+def onboarding_post(client, path, transaction, body=None, subject="auth0|user-a"):
+    assertion = onboarding_assertion(transaction, subject)
+    return client.post(
+        path,
+        json={"transaction": transaction, **(body or {})},
+        headers={"Authorization": f"Onboarding {assertion}"},
+    )
 
 
 class FakeTradeLockerClient:
@@ -85,25 +117,26 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
     authenticate()
     with TestClient(app) as client:
         transaction, verifier = begin_authorization(client)
-        assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).json() == {"status": "bound"}
-        initial = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        assert onboarding_post(client, "/api/oauth/onboarding/bind", transaction).json() == {"status": "bound"}
+        initial = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
         assert initial["status"] == "not_connected"
 
         client.post("/api/broker/tradelocker/save-credentials", json={
             "base_url": "https://demo.example/backend-api", "username": "user-a",
             "password": "private-password", "server": "DEMO",
         })
-        pending = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        pending = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
         assert pending["status"] == "connected_no_account"
         discovered = client.post("/api/broker/tradelocker/discover-accounts").json()
         assert discovered["accounts"][0]["accountId"] == 12345
         client.post("/api/broker/tradelocker/select-account", json={"accountId": "12345", "accNum": "2"})
-        ready = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        ready = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
         assert ready["status"] == "ready"
 
-        completed = client.post("/api/oauth/onboarding/complete", json={
-            "transaction": transaction, "csrf_token": ready["csrf_token"],
-        })
+        completed = onboarding_post(
+            client, "/api/oauth/onboarding/complete", transaction,
+            {"csrf_token": ready["csrf_token"]},
+        )
         callback = urlparse(completed.json()["redirect_url"])
         callback_query = parse_qs(callback.query)
         assert f"{callback.scheme}://{callback.netloc}{callback.path}" == "https://chatgpt.com/aip/callback"
@@ -194,11 +227,12 @@ def test_cimd_identity_and_exact_redirect_survive_token_exchange(oauth_storage, 
         transaction, verifier = begin_authorization(
             client, client_id=cimd_url, redirect_uri=callback,
         )
-        client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
-        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-        completed = client.post("/api/oauth/onboarding/complete", json={
-            "transaction": transaction, "csrf_token": status["csrf_token"],
-        }).json()
+        onboarding_post(client, "/api/oauth/onboarding/bind", transaction)
+        status = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
+        completed = onboarding_post(
+            client, "/api/oauth/onboarding/complete", transaction,
+            {"csrf_token": status["csrf_token"]},
+        ).json()
         query = parse_qs(urlparse(completed["redirect_url"]).query)
         token = client.post("/oauth/token", data={
             "grant_type": "authorization_code", "code": query["code"][0],
@@ -237,8 +271,8 @@ def test_existing_configured_user_skips_to_completion(oauth_storage, monkeypatch
     authenticate()
     with TestClient(app) as client:
         transaction, _ = begin_authorization(client)
-        assert client.post("/api/oauth/onboarding/bind", json={"transaction": transaction}).status_code == 200
-        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
+        assert onboarding_post(client, "/api/oauth/onboarding/bind", transaction).status_code == 200
+        status = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
     assert status["status"] == "ready"
     assert status["selected_account"]["account_id"] == "12345"
 
@@ -247,16 +281,18 @@ def test_oauth_rejects_incomplete_setup_and_wrong_user(oauth_storage):
     authenticate("auth0|user-a")
     with TestClient(app) as client:
         transaction, _ = begin_authorization(client)
-        client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
-        status = client.post("/api/oauth/onboarding/status", json={"transaction": transaction}).json()
-        incomplete = client.post("/api/oauth/onboarding/complete", json={
-            "transaction": transaction, "csrf_token": status["csrf_token"],
-        })
+        onboarding_post(client, "/api/oauth/onboarding/bind", transaction)
+        status = onboarding_post(client, "/api/oauth/onboarding/status", transaction).json()
+        incomplete = onboarding_post(
+            client, "/api/oauth/onboarding/complete", transaction,
+            {"csrf_token": status["csrf_token"]},
+        )
         assert incomplete.status_code == 409
         authenticate("auth0|user-b")
-        wrong_user = client.post("/api/oauth/onboarding/complete", json={
-            "transaction": transaction, "csrf_token": status["csrf_token"],
-        })
+        wrong_user = onboarding_post(
+            client, "/api/oauth/onboarding/complete", transaction,
+            {"csrf_token": status["csrf_token"]}, subject="auth0|user-b",
+        )
         assert wrong_user.status_code == 403
 
 
@@ -266,5 +302,40 @@ def test_oauth_rejects_expired_transaction(oauth_storage):
         transaction, _ = begin_authorization(client)
         with sqlite3.connect(settings.sqlite_path) as connection:
             connection.execute("UPDATE oauth_transactions SET expires_at = '2000-01-01T00:00:00+00:00'")
-        response = client.post("/api/oauth/onboarding/bind", json={"transaction": transaction})
-    assert response.status_code == 403
+        response = onboarding_post(client, "/api/oauth/onboarding/bind", transaction)
+    assert response.status_code == 410
+
+
+def test_onboarding_route_rejects_missing_assertion_and_transaction(oauth_storage):
+    authenticate()
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        missing_assertion = client.post(
+            "/api/oauth/onboarding/status", json={"transaction": transaction}
+        )
+        missing_transaction = onboarding_post(
+            client, "/api/oauth/onboarding/status", ""
+        )
+    assert missing_assertion.status_code == 401
+    assert missing_assertion.json()["detail"]["error"] == "onboarding_assertion_required"
+    assert missing_transaction.status_code == 401
+    assert missing_transaction.json()["detail"]["error"] == "onboarding_transaction_required"
+
+
+def test_onboarding_assertion_nonce_cannot_be_replayed(oauth_storage):
+    authenticate()
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        assertion = onboarding_assertion(transaction, nonce="one-use-nonce")
+        headers = {"Authorization": f"Onboarding {assertion}"}
+        first = client.post(
+            "/api/oauth/onboarding/bind",
+            json={"transaction": transaction}, headers=headers,
+        )
+        replay = client.post(
+            "/api/oauth/onboarding/status",
+            json={"transaction": transaction}, headers=headers,
+        )
+    assert first.status_code == 200
+    assert replay.status_code == 401
+    assert replay.json()["detail"]["error"] == "onboarding_assertion_replayed"

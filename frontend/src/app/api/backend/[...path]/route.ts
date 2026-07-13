@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { BackendError, backendFetch } from "@/lib/backend";
+import { onboardingBackendFetch } from "@/lib/onboarding-backend";
 
 const allowed = new Set([
   "me",
@@ -20,7 +21,18 @@ async function forward(request: NextRequest, segments: string[], method: string)
   if (!allowed.has(path)) return NextResponse.json({ error: "Not found" }, { status: 404 });
   try {
     const body = method === "GET" || method === "DELETE" ? undefined : await request.text();
-    const result = await backendFetch(`/api/${path}`, { method, body: body || undefined });
+    let result;
+    if (path.startsWith("oauth/onboarding/")) {
+      const parsed = body ? JSON.parse(body) as { transaction?: string } : {};
+      if (!parsed.transaction) {
+        return NextResponse.json({ error: "Missing onboarding transaction." }, { status: 401 });
+      }
+      result = await onboardingBackendFetch(`/api/${path}`, parsed.transaction, {
+        method, body: body || undefined,
+      });
+    } else {
+      result = await backendFetch(`/api/${path}`, { method, body: body || undefined });
+    }
     return NextResponse.json(result);
   } catch (error) {
     if (error instanceof BackendError) {

@@ -35,3 +35,21 @@ OAuth transaction errors are separate from this status vocabulary. A missing
 browser transaction reference is handled by the frontend before the status call.
 An expired server-side OAuth transaction returns HTTP 410, and an ownership
 failure returns HTTP 403.
+
+## Pre-authorization authentication
+
+The `/api/oauth/onboarding/bind`, `/api/oauth/onboarding/status`, and
+`/api/oauth/onboarding/complete` routes do not accept or require the final MCP
+OAuth access token. The Next.js server reads its HttpOnly Auth0 session and
+creates a single-use, 60-second `Onboarding` assertion bound to the opaque
+transaction reference. The backend verifies its HMAC signature, allowed issuer,
+backend audience, Auth0 subject, transaction digest, expiry, and nonce. The
+assertion is server-to-server and must never be returned to browser JavaScript.
+
+Configure the same `ONBOARDING_ASSERTION_SECRET` on the backend and Vercel.
+Configure `ONBOARDING_ASSERTION_AUDIENCE=https://mcp.justinnwajei.com` on
+Vercel. The backend may allow both production and local issuers with:
+
+```dotenv
+ONBOARDING_ASSERTION_ISSUERS=https://agentic-forex-app.vercel.app,http://localhost:3000
+```

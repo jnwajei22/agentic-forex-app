@@ -13,6 +13,7 @@ import {
 } from "./onboarding-transaction.ts";
 import { onboardingDestination, parseTradeLockerStatus } from "./tradelocker-status.ts";
 import { onboardingHttpDisposition } from "./onboarding-http.ts";
+import { signOnboardingAssertion } from "./onboarding-assertion.ts";
 
 test("preserves an allowed returnTo through account selection and completion", () => {
   const returnTo = safeChatGptReturnTo("https://chatgpt.com");
@@ -93,6 +94,22 @@ test("classifies onboarding HTTP errors before status parsing", () => {
   assert.equal(onboardingHttpDisposition(404), "configuration_error");
   assert.equal(onboardingHttpDisposition(500), "unavailable");
   assert.equal(onboardingHttpDisposition(502), "unavailable");
+});
+
+test("Vercel server assertion binds Auth0 identity, transaction, audience, and expiry", () => {
+  const token = signOnboardingAssertion({
+    subject: "auth0|user-a", transaction: "opaque-reference", secret: "test-secret",
+    issuer: "https://agentic-forex-app.vercel.app",
+    audience: "https://mcp.justinnwajei.com/api/oauth/onboarding",
+    issuedAt: 1_700_000_000, nonce: "single-use-nonce",
+  });
+  const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString()) as Record<string, unknown>;
+  assert.equal(payload.sub, "auth0|user-a");
+  assert.equal(payload.aud, "https://mcp.justinnwajei.com/api/oauth/onboarding");
+  assert.equal(payload.exp, 1_700_000_060);
+  assert.equal(payload.jti, "single-use-nonce");
+  assert.equal(typeof payload.tx_hash, "string");
+  assert.equal(token.includes("opaque-reference"), false);
 });
 
 test("only accepts exact approved OAuth callback origins", () => {

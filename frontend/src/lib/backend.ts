@@ -43,6 +43,14 @@ export async function backendFetchWithMetadata<T>(path: string, init?: RequestIn
     console.error("[backendFetch] Auth0 access-token acquisition failed:", safeError(error));
     throw new BackendError(500, "Could not get backend access token.", "token_acquisition_failed");
   }
+  return backendFetchWithAuthorization<T>(path, `Bearer ${token}`, init);
+}
+
+export async function backendFetchWithAuthorization<T>(
+  path: string,
+  authorization: string,
+  init?: RequestInit,
+): Promise<BackendResponse<T>> {
   const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "");
   if (!baseUrl) {
     console.error("[backendFetch] Backend API URL is not configured.");
@@ -55,7 +63,7 @@ export async function backendFetchWithMetadata<T>(path: string, init?: RequestIn
       ...init,
       cache: "no-store",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: authorization,
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },

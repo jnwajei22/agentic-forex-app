@@ -97,6 +97,10 @@ class OAuthRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS oauth_onboarding_assertion_nonces (
+                    nonce_hash TEXT PRIMARY KEY,
+                    expires_at TEXT NOT NULL
+                );
                 """
             )
             for table in ("oauth_transactions", "oauth_authorization_codes", "oauth_access_tokens"):
@@ -223,3 +227,19 @@ class OAuthRepository:
             return None
         return {"sub": row["user_sub"], "scope": row["scope"], "client_id": row["client_id"],
                 "aud": row["resource"], "resource": row["resource"]}
+
+    def consume_onboarding_assertion_nonce(self, nonce: str, expires_at: datetime) -> bool:
+        now = _now()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM oauth_onboarding_assertion_nonces WHERE expires_at <= ?",
+                    (_iso(now),),
+                )
+                connection.execute(
+                    "INSERT INTO oauth_onboarding_assertion_nonces(nonce_hash, expires_at) VALUES (?, ?)",
+                    (_hash(nonce), _iso(expires_at)),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False

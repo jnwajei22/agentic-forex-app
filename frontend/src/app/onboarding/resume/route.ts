@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { auth0 } from "@/lib/auth0";
-import { backendFetch } from "@/lib/backend";
+import { onboardingBackendFetch } from "@/lib/onboarding-backend";
 import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 
 export async function GET(request: NextRequest) {
@@ -10,7 +10,7 @@ export async function GET(request: NextRequest) {
   const transaction = request.cookies.get(ONBOARDING_COOKIE)?.value;
   if (!transaction) return NextResponse.redirect(new URL("/setup-complete?onboardingError=expired", request.url));
   try {
-    await backendFetch("/api/oauth/onboarding/bind", {
+    await onboardingBackendFetch("/api/oauth/onboarding/bind", transaction, {
       method: "POST", body: JSON.stringify({ transaction }),
     });
   } catch {

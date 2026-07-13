@@ -2,7 +2,8 @@ import { cookies } from "next/headers";
 import Link from "next/link";
 
 import { auth0 } from "@/lib/auth0";
-import { BackendError, backendFetch } from "@/lib/backend";
+import { BackendError } from "@/lib/backend";
+import { onboardingBackendFetch } from "@/lib/onboarding-backend";
 import { safeChatGptReturnTo } from "@/lib/chatgpt-return";
 import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 import { requireSession } from "@/lib/session";
@@ -20,7 +21,7 @@ export default async function SetupCompletePage({ searchParams }: { searchParams
   let transactionExpired = false;
   if (transaction && session) {
     try {
-      rawStatus = await backendFetch<unknown>("/api/oauth/onboarding/status", {
+      rawStatus = await onboardingBackendFetch<unknown>("/api/oauth/onboarding/status", transaction, {
         method: "POST", body: JSON.stringify({ transaction }),
       });
     } catch (error) {
