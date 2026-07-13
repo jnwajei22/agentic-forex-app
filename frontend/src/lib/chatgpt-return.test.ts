@@ -14,6 +14,7 @@ import {
 import { onboardingDestination, parseTradeLockerStatus } from "./tradelocker-status.ts";
 import { onboardingBindDisposition, onboardingHttpDisposition } from "./onboarding-http.ts";
 import { onboardingCookieOptions } from "./onboarding-transaction.ts";
+import { getConnectionAlert } from "./connection-alert.ts";
 import { signOnboardingAssertion } from "./onboarding-assertion.ts";
 
 test("preserves an allowed returnTo through account selection and completion", () => {
@@ -128,6 +129,44 @@ test("production transaction cookie survives across every onboarding route", () 
   assert.equal(options.sameSite, "lax");
   assert.equal(options.path, "/");
   assert.equal(options.maxAge, 600);
+});
+
+test("invalid credentials shows only the specific rejection alert", () => {
+  const alert = getConnectionAlert({
+    connectionIssue: "invalid_credentials", reconnectRequired: true, hasStoredConnection: true,
+  });
+  assert.equal(alert?.message, "TradeLocker rejected the credentials or server selection. Confirm the trading credentials, exact server code, and environment.");
+});
+
+test("reconnect required shows only the generic reconnect alert", () => {
+  const alert = getConnectionAlert({
+    connectionIssue: null, reconnectRequired: true, hasStoredConnection: true,
+  });
+  assert.equal(alert?.message, "Reconnect your TradeLocker credentials to continue.");
+});
+
+test("upstream failure shows only the availability alert", () => {
+  const alert = getConnectionAlert({
+    connectionIssue: "upstream_unavailable", reconnectRequired: true, hasStoredConnection: true,
+  });
+  assert.equal(alert?.message, "TradeLocker is temporarily unavailable. Try again shortly.");
+});
+
+test("first-time connection shows no alert", () => {
+  assert.equal(getConnectionAlert({
+    connectionIssue: null, reconnectRequired: false, hasStoredConnection: false,
+  }), null);
+});
+
+test("every connection state resolves to at most one alert object", () => {
+  for (const connectionIssue of [null, "invalid_credentials", "upstream_unavailable", "unknown"]) {
+    for (const reconnectRequired of [false, true]) {
+      for (const hasStoredConnection of [false, true]) {
+        const alert = getConnectionAlert({ connectionIssue, reconnectRequired, hasStoredConnection });
+        assert.ok(alert === null || (typeof alert.message === "string" && alert.kind === "error"));
+      }
+    }
+  }
 });
 
 test("only accepts exact approved OAuth callback origins", () => {

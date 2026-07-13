@@ -4,14 +4,15 @@ import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import { accountSelectionPath } from "@/lib/chatgpt-return";
 import { afterCredentialsSaved } from "@/lib/onboarding-transaction";
+import { getConnectionAlert, type ConnectionAlert } from "@/lib/connection-alert";
 
-export default function ConnectTradeLockerForm({ returnTo, onboarding = false }: { returnTo: string | null; onboarding?: boolean }) {
+export default function ConnectTradeLockerForm({ returnTo, onboarding = false, initialAlert = null }: { returnTo: string | null; onboarding?: boolean; initialAlert?: ConnectionAlert }) {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [alert, setAlert] = useState<ConnectionAlert>(initialAlert);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setLoading(true); setError("");
+    event.preventDefault(); setLoading(true); setAlert(null);
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const environment = String(form.get("environment"));
@@ -24,14 +25,26 @@ export default function ConnectTradeLockerForm({ returnTo, onboarding = false }:
     }).catch(() => null);
     if (!response?.ok) {
       const body = await response?.json().catch(() => ({}));
-      setError(body?.message ?? "Unable to save TradeLocker credentials."); setLoading(false); return;
+      const issue = body?.error === "tradelocker_credentials_rejected"
+        ? "invalid_credentials"
+        : response?.status && response.status >= 500
+          ? "upstream_unavailable"
+          : null;
+      setAlert(getConnectionAlert({
+        connectionIssue: issue,
+        reconnectRequired: false,
+        hasStoredConnection: false,
+      }) ?? { kind: "error", message: body?.message ?? "Unable to save TradeLocker credentials." });
+      const password = formElement.elements.namedItem("password");
+      if (password instanceof HTMLInputElement) password.value = "";
+      setLoading(false); return;
     }
     formElement.reset();
     router.push(afterCredentialsSaved(onboarding, accountSelectionPath(returnTo))); router.refresh();
   }
 
   return <form className="form" onSubmit={submit} autoComplete="off">
-    {error && <div className="error">{error}</div>}
+    {alert && <div className="error" role="alert">{alert.message}</div>}
     <div className="field"><label htmlFor="username">TradeLocker username or email</label><input id="username" name="username" type="email" required autoComplete="username" /></div>
     <div className="field"><label htmlFor="password">TradeLocker password</label><input id="password" name="password" type="password" required autoComplete="current-password" /></div>
     <div className="field"><label htmlFor="server">TradeLocker server</label><input id="server" name="server" required placeholder="Your TradeLocker server name" /><small>Use the TradeLocker server name provided by your broker or prop firm.</small></div>
