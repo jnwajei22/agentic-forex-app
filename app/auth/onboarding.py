@@ -7,6 +7,7 @@ from fastapi import Header, HTTPException
 
 from app.config.settings import settings
 from app.storage.oauth import OAuthRepository, OAuthStorageError
+from app.auth.identity import normalize_auth0_subject
 
 
 ASSERTION_ALGORITHM = "HS256"
@@ -55,6 +56,10 @@ async def current_onboarding_claims(
     if (claims.get("typ") != "onboarding" or not isinstance(claims.get("sub"), str)
             or claims.get("iss", "").rstrip("/") not in allowed_issuers):
         raise HTTPException(status_code=401, detail={"error": "invalid_onboarding_assertion"})
+    try:
+        claims["sub"] = normalize_auth0_subject(claims["sub"])
+    except ValueError:
+        raise HTTPException(status_code=401, detail={"error": "invalid_onboarding_identity"}) from None
     try:
         expires_at = datetime.fromtimestamp(float(claims["exp"]), timezone.utc)
         consumed = OAuthRepository().consume_onboarding_assertion_nonce(str(claims["jti"]), expires_at)

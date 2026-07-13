@@ -1,10 +1,10 @@
 export const ONBOARDING_COOKIE = "afd_oauth_transaction";
 export const ONBOARDING_MAX_AGE_SECONDS = 10 * 60;
 
-export function onboardingCookieOptions() {
+export function onboardingCookieOptions(production = process.env.NODE_ENV === "production") {
   return {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: production,
     sameSite: "lax" as const,
     path: "/",
     maxAge: ONBOARDING_MAX_AGE_SECONDS,

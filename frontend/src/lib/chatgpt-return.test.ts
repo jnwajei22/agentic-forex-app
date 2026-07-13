@@ -12,7 +12,8 @@ import {
   isAllowedOAuthCallback,
 } from "./onboarding-transaction.ts";
 import { onboardingDestination, parseTradeLockerStatus } from "./tradelocker-status.ts";
-import { onboardingHttpDisposition } from "./onboarding-http.ts";
+import { onboardingBindDisposition, onboardingHttpDisposition } from "./onboarding-http.ts";
+import { onboardingCookieOptions } from "./onboarding-transaction.ts";
 import { signOnboardingAssertion } from "./onboarding-assertion.ts";
 
 test("preserves an allowed returnTo through account selection and completion", () => {
@@ -110,6 +111,23 @@ test("Vercel server assertion binds Auth0 identity, transaction, audience, and e
   assert.equal(payload.jti, "single-use-nonce");
   assert.equal(typeof payload.tx_hash, "string");
   assert.equal(token.includes("opaque-reference"), false);
+});
+
+test("only a real owner error maps bind failure to onboardingError owner", () => {
+  assert.equal(onboardingBindDisposition(403, "onboarding_owner_mismatch"), "owner");
+  assert.equal(onboardingBindDisposition(403, "onboarding_transaction_mismatch"), "owner");
+  assert.equal(onboardingBindDisposition(403, "some_other_error"), "unavailable");
+  assert.equal(onboardingBindDisposition(401), "expired");
+  assert.equal(onboardingBindDisposition(410), "expired");
+});
+
+test("production transaction cookie survives across every onboarding route", () => {
+  const options = onboardingCookieOptions(true);
+  assert.equal(options.secure, true);
+  assert.equal(options.httpOnly, true);
+  assert.equal(options.sameSite, "lax");
+  assert.equal(options.path, "/");
+  assert.equal(options.maxAge, 600);
 });
 
 test("only accepts exact approved OAuth callback origins", () => {

@@ -160,9 +160,12 @@ class OAuthRepository:
         transaction = self.get_transaction(reference)
         if transaction is None or (transaction.user_sub and transaction.user_sub != user_sub):
             return None
+        if transaction.user_sub == user_sub:
+            return transaction
         with self._connect() as connection:
             connection.execute(
-                "UPDATE oauth_transactions SET user_sub = ?, status = 'AUTH0_COMPLETE' WHERE reference_hash = ?",
+                """UPDATE oauth_transactions SET user_sub = ?, status = 'AUTH0_COMPLETE'
+                   WHERE reference_hash = ? AND user_sub IS NULL""",
                 (user_sub, transaction.reference_hash),
             )
         return self.get_transaction(reference)

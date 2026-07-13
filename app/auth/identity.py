@@ -23,3 +23,9 @@ def get_current_user_sub() -> str | None:
     claims = get_current_claims()
     subject = claims.get("sub") if claims else None
     return subject if isinstance(subject, str) and subject else None
+
+
+def normalize_auth0_subject(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Auth0 subject is required.")
+    return value.strip()

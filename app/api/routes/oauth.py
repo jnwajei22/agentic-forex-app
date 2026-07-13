@@ -1,4 +1,6 @@
 from urllib.parse import parse_qs, urlencode, urlparse
+import hashlib
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -12,6 +14,7 @@ from app.auth.onboarding import current_onboarding_claims, transaction_digest
 
 
 router = APIRouter(tags=["oauth"])
+logger = logging.getLogger(__name__)
 ALLOWED_CALLBACK_ORIGINS = {"https://chatgpt.com", "https://chat.openai.com"}
 ALLOWED_SCOPES = {"openid", "profile", "email", "forex:read", "forex:preview"}
 
@@ -83,7 +86,11 @@ async def bind_transaction(payload: TransactionRequest, claims: dict = Depends(c
     if existing is None:
         raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
     if existing.user_sub and existing.user_sub != claims["sub"]:
-        raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
+        _log_owner_mismatch("bind", reference, claims["sub"], existing.user_sub)
+        raise HTTPException(status_code=403, detail={
+            "error": "onboarding_owner_mismatch",
+            "message": "This onboarding transaction belongs to another authenticated user.",
+        })
     transaction = oauth_repository().bind_user(reference, claims["sub"])
     if transaction is None:
         raise HTTPException(status_code=409, detail="The onboarding transaction could not be bound.")
@@ -98,7 +105,11 @@ async def oauth_onboarding_status(payload: TransactionRequest, claims: dict = De
     if transaction is None:
         raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
     if transaction.user_sub != claims["sub"]:
-        raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
+        _log_owner_mismatch("status", reference, claims["sub"], transaction.user_sub)
+        raise HTTPException(status_code=403, detail={
+            "error": "onboarding_owner_mismatch",
+            "message": "This onboarding transaction belongs to another authenticated user.",
+        })
     if transaction.status != "AUTH0_COMPLETE":
         raise HTTPException(status_code=409, detail="The onboarding transaction is not ready for status checks.")
     status = await validated_onboarding_status(claims["sub"])
@@ -115,7 +126,11 @@ async def complete_authorization(payload: CompletionRequest, claims: dict = Depe
     if transaction is None:
         raise HTTPException(status_code=410, detail="The ChatGPT sign-in request expired. Restart sign-in from ChatGPT.")
     if transaction.user_sub != claims["sub"]:
-        raise HTTPException(status_code=403, detail="This onboarding transaction belongs to another user.")
+        _log_owner_mismatch("complete", reference, claims["sub"], transaction.user_sub)
+        raise HTTPException(status_code=403, detail={
+            "error": "onboarding_owner_mismatch",
+            "message": "This onboarding transaction belongs to another authenticated user.",
+        })
     if payload.csrf_token != transaction.csrf_token:
         raise HTTPException(status_code=403, detail="Invalid onboarding request.")
     status = await validated_onboarding_status(claims["sub"])
@@ -145,6 +160,17 @@ def _require_transaction(reference: str | None) -> str:
             detail={"error": "onboarding_transaction_required", "message": "The onboarding transaction is missing."},
         )
     return reference
+
+
+def _safe_fingerprint(value: str | None) -> str:
+    return hashlib.sha256((value or "<none>").encode()).hexdigest()[:12]
+
+
+def _log_owner_mismatch(route: str, reference: str, caller: str, owner: str | None) -> None:
+    logger.warning(
+        "OAuth onboarding owner mismatch route=%s transaction_fp=%s caller_fp=%s owner_fp=%s",
+        route, _safe_fingerprint(reference), _safe_fingerprint(caller), _safe_fingerprint(owner),
+    )
 
 
 @router.post("/oauth/token")

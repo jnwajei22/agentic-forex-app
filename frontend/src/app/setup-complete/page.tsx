@@ -2,8 +2,8 @@ import { cookies } from "next/headers";
 import Link from "next/link";
 
 import { auth0 } from "@/lib/auth0";
-import { BackendError } from "@/lib/backend";
-import { onboardingBackendFetch } from "@/lib/onboarding-backend";
+import { BackendError, type BackendResponse } from "@/lib/backend";
+import { onboardingBackendFetchWithMetadata } from "@/lib/onboarding-backend";
 import { safeChatGptReturnTo } from "@/lib/chatgpt-return";
 import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 import { requireSession } from "@/lib/session";
@@ -16,36 +16,73 @@ export default async function SetupCompletePage({ searchParams }: { searchParams
   await requireSession("/setup-complete");
   const session = await auth0.getSession();
   const transaction = (await cookies()).get(ONBOARDING_COOKIE)?.value;
-  let rawStatus: unknown;
-  let statusUnavailable = false;
-  let transactionExpired = false;
-  if (transaction && session) {
-    try {
-      rawStatus = await onboardingBackendFetch<unknown>("/api/oauth/onboarding/status", transaction, {
-        method: "POST", body: JSON.stringify({ transaction }),
-      });
-    } catch (error) {
-      transactionExpired = error instanceof BackendError && error.status === 410;
-      statusUnavailable = !transactionExpired;
-    }
+  if (query.onboardingError === "owner") {
+    return <OnboardingShell eyebrow="ChatGPT sign-in" title="Sign-in session belongs to another account">
+      <p>This onboarding session is bound to a different authenticated account. Restart sign-in from ChatGPT with the intended account.</p>
+    </OnboardingShell>;
   }
-  const status = parseTradeLockerStatus(rawStatus);
-  const transactionReady = Boolean(transaction && session && status.csrf_token);
-  const setupReady = status.status === "ready" && status.selected_account;
-
-  if (transaction && session && (statusUnavailable || (status.malformed && !transactionExpired))) {
-    if (status.malformed) {
-      console.error("[setup-complete] Malformed TradeLocker status", { status: status.safeRawStatus });
-    }
+  if (["expired", "invalid"].includes(query.onboardingError ?? "") || !transaction) {
+    return <OnboardingShell eyebrow="ChatGPT sign-in" title="Restart sign-in from ChatGPT">
+      <p>This sign-in session is missing or has expired. Restart sign-in from ChatGPT.</p>
+    </OnboardingShell>;
+  }
+  if (query.onboardingError === "configuration") {
+    return <OnboardingShell eyebrow="Configuration error" title="Onboarding endpoint unavailable">
+      <p>The backend onboarding endpoint is not configured correctly.</p>
+    </OnboardingShell>;
+  }
+  if (query.onboardingError === "unavailable") {
     return <OnboardingShell eyebrow="Connection status" title="Unable to check TradeLocker">
-      <p>The connection status service is temporarily unavailable. Try again shortly.</p>
+      <p>The onboarding service is temporarily unavailable. Try again shortly.</p>
       <div className="actions"><Link className="button" href="/setup-complete">Try again</Link></div>
     </OnboardingShell>;
   }
 
-  if (query.onboardingError || transactionExpired || !transactionReady) {
+  let response: BackendResponse<unknown>;
+  try {
+    response = await onboardingBackendFetchWithMetadata<unknown>(
+      "/api/oauth/onboarding/status", transaction,
+      { method: "POST", body: JSON.stringify({ transaction }) },
+    );
+  } catch (error) {
+    if (error instanceof BackendError) {
+      const backendCode = typeof error.payload?.error === "string" ? error.payload.error : undefined;
+      if (error.status === 403 && backendCode === "onboarding_owner_mismatch") {
+        return <OnboardingShell eyebrow="ChatGPT sign-in" title="Sign-in session belongs to another account">
+          <p>This onboarding session is bound to a different authenticated account. Restart sign-in from ChatGPT with the intended account.</p>
+        </OnboardingShell>;
+      }
+      if (error.status === 401 || error.status === 410) {
+        return <OnboardingShell eyebrow="ChatGPT sign-in" title="Restart sign-in from ChatGPT">
+          <p>This sign-in session is missing or has expired. Restart sign-in from ChatGPT.</p>
+        </OnboardingShell>;
+      }
+    }
+    return <OnboardingShell eyebrow="Connection status" title="Unable to check TradeLocker">
+      <p>The onboarding service is temporarily unavailable. Try again shortly.</p>
+      <div className="actions"><Link className="button" href="/setup-complete">Try again</Link></div>
+    </OnboardingShell>;
+  }
+  const status = parseTradeLockerStatus(response.data);
+  if (status.malformed) {
+    console.error("[setup-complete] Malformed successful TradeLocker status", {
+      endpoint: response.endpoint,
+      httpStatus: response.status,
+      contentType: response.contentType,
+      payloadKeys: response.data && typeof response.data === "object" ? Object.keys(response.data) : [],
+      normalizedStatus: status.status,
+      requestId: response.requestId,
+    });
+    return <OnboardingShell eyebrow="Connection status" title="Unable to check TradeLocker">
+      <p>The onboarding service returned an unexpected response. Try again shortly.</p>
+    </OnboardingShell>;
+  }
+  const transactionReady = Boolean(session && status.csrf_token);
+  const setupReady = status.status === "ready" && status.selected_account;
+
+  if (!transactionReady) {
     return <OnboardingShell eyebrow="ChatGPT sign-in" title="Restart sign-in from ChatGPT">
-      <p>The ChatGPT authorization request is missing, expired, or does not belong to this account.</p>
+      <p>This sign-in session is missing or has expired. Restart sign-in from ChatGPT.</p>
       {returnTo && <div className="actions"><Link className="button" href={returnTo}>Return to ChatGPT</Link></div>}
     </OnboardingShell>;
   }

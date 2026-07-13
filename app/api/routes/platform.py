@@ -16,6 +16,7 @@ from app.models.onboarding import (
     TradeLockerConnectionStatus,
     TradeLockerOnboardingStatus,
 )
+from app.auth.identity import normalize_auth0_subject
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -51,7 +52,9 @@ async def current_claims(authorization: str | None = Header(default=None)) -> di
         raise HTTPException(status_code=503, detail=str(exc)) from None
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid OAuth access token.") from None
-    if not isinstance(claims.get("sub"), str) or not claims["sub"]:
+    try:
+        claims["sub"] = normalize_auth0_subject(claims.get("sub"))
+    except ValueError:
         raise HTTPException(status_code=401, detail="OAuth subject claim is required.")
     return claims
 

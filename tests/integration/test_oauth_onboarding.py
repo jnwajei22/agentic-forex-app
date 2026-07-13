@@ -294,6 +294,7 @@ def test_oauth_rejects_incomplete_setup_and_wrong_user(oauth_storage):
             {"csrf_token": status["csrf_token"]}, subject="auth0|user-b",
         )
         assert wrong_user.status_code == 403
+        assert wrong_user.json()["detail"]["error"] == "onboarding_owner_mismatch"
 
 
 def test_oauth_rejects_expired_transaction(oauth_storage):
@@ -339,3 +340,26 @@ def test_onboarding_assertion_nonce_cannot_be_replayed(oauth_storage):
     assert first.status_code == 200
     assert replay.status_code == 401
     assert replay.json()["detail"]["error"] == "onboarding_assertion_replayed"
+
+
+def test_transaction_owner_uses_exact_auth0_sub_and_is_not_overwritten(oauth_storage):
+    subject = "auth0|CaseSensitiveSubject"
+    authenticate(subject)
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(client)
+        first = onboarding_post(
+            client, "/api/oauth/onboarding/bind", transaction, subject=subject,
+        )
+        second = onboarding_post(
+            client, "/api/oauth/onboarding/bind", transaction, subject=subject,
+        )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        stored = connection.execute(
+            "SELECT user_sub, status FROM oauth_transactions"
+        ).fetchone()
+        count = connection.execute("SELECT COUNT(*) FROM oauth_transactions").fetchone()[0]
+    assert stored == (subject, "AUTH0_COMPLETE")
+    assert stored[0] != f"{subject.replace('|', '-')}@example.test"
+    assert count == 1
