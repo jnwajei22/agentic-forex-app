@@ -1,13 +1,21 @@
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import jwt
 
+from app.services.market_data.history import (
+    MAX_CANDLES,
+    TIMEFRAME_DURATION_MS,
+    PaginatedCandleResult,
+    get_candles_paginated,
+    normalize_timeframe,
+)
 
-SUPPORTED_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W", "1M"}
+
+SUPPORTED_TIMEFRAMES = set(TIMEFRAME_DURATION_MS)
 
 
 class TradeLockerError(RuntimeError):
@@ -326,30 +334,80 @@ class TradeLockerClient:
             params={"tradableInstrumentId": instrument_id, "routeId": route_id},
         )
 
-    async def get_candles(self, symbol: str, timeframe: str, lookback: int) -> Any:
-        resolution = timeframe if timeframe in SUPPORTED_TIMEFRAMES else timeframe.upper()
-        if resolution not in SUPPORTED_TIMEFRAMES:
+    async def _history_page(
+        self,
+        *,
+        instrument_id: Any,
+        route_id: Any,
+        resolution: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> Any:
+        """Fetch one bounded page, retrying only transient provider failures."""
+        for attempt in range(3):
+            try:
+                return await self._optional_get(
+                    "/trade/history",
+                    operation="get_candles",
+                    headers=self._account_headers(),
+                    params={
+                        "tradableInstrumentId": instrument_id,
+                        "routeId": route_id,
+                        "resolution": resolution,
+                        "from": start_time_ms,
+                        "to": end_time_ms,
+                    },
+                )
+            except TradeLockerError as exc:
+                transient = exc.code in {"timeout", "request_failed"} or exc.status_code in {
+                    429, 500, 502, 503, 504
+                }
+                if not transient or attempt == 2:
+                    raise
+                await asyncio.sleep(0.1 * (2**attempt))
+        raise AssertionError("unreachable")
+
+    async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        lookback: int | None = 300,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> PaginatedCandleResult:
+        try:
+            resolution = normalize_timeframe(timeframe)
+        except ValueError:
             raise TradeLockerError(
                 "get_candles", "Unsupported TradeLocker timeframe.", code="invalid_timeframe"
-            )
-        if lookback < 1 or lookback > 20_000:
+            ) from None
+        if lookback is not None and not 1 <= lookback <= MAX_CANDLES:
             raise TradeLockerError(
-                "get_candles", "Lookback must be between 1 and 20000.", code="invalid_lookback"
+                "get_candles", f"Lookback must be between 1 and {MAX_CANDLES}.", code="invalid_lookback"
             )
         instrument_id, route_id = await self._resolve_instrument(symbol)
-        minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "4H": 240,
-                   "1D": 1440, "1W": 10080, "1M": 43200}[resolution]
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(minutes=minutes * lookback)
-        return await self._optional_get(
-            "/trade/history",
-            operation="get_candles",
-            headers=self._account_headers(),
-            params={
-                "tradableInstrumentId": instrument_id,
-                "routeId": route_id,
-                "resolution": resolution,
-                "from": int(start.timestamp() * 1000),
-                "to": int(end.timestamp() * 1000),
-            },
-        )
+        end_ms = end_time_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+        effective_count = lookback if start_time_ms is None else None
+        if start_time_ms is None:
+            effective_count = lookback or 300
+            start_time_ms = end_ms - TIMEFRAME_DURATION_MS[resolution] * effective_count
+        if start_time_ms >= end_ms:
+            raise TradeLockerError(
+                "get_candles", "start_time must be earlier than end_time.", code="invalid_time_range"
+            )
+
+        async def fetch_page(page_start: int, page_end: int) -> Any:
+            return await self._history_page(
+                instrument_id=instrument_id, route_id=route_id, resolution=resolution,
+                start_time_ms=page_start, end_time_ms=page_end,
+            )
+
+        try:
+            return await get_candles_paginated(
+                instrument_id=str(instrument_id), timeframe=resolution,
+                start_time_ms=start_time_ms, end_time_ms=end_ms,
+                requested_count=effective_count, fetch_page=fetch_page,
+            )
+        except ValueError as exc:
+            raise TradeLockerError("get_candles", str(exc), code="invalid_candle_request") from None

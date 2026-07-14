@@ -166,6 +166,8 @@ async def test_discovery_does_not_log_password_or_token(caplog):
 
 @pytest.mark.asyncio
 async def test_quote_and_candles_resolve_documented_info_route():
+    candle_timestamp = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1000)
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/auth/jwt/token"):
             return httpx.Response(201, json={"accessToken": _token()})
@@ -187,13 +189,15 @@ async def test_quote_and_candles_resolve_documented_info_route():
         if request.url.path.endswith("/history"):
             assert request.url.params["resolution"] == "1H"
             return httpx.Response(
-                200, json={"t": [1], "o": [1.0], "h": [1.1], "l": [0.9], "c": [1.05]}
+                200, json={"t": [candle_timestamp], "o": [1.0], "h": [1.1], "l": [0.9], "c": [1.05]}
             )
         raise AssertionError(f"Unexpected request: {request.url.path}")
 
     async with _client(handler) as client:
         assert (await client.get_quote("EUR/USD"))["ask"] == 1.101
-        assert (await client.get_candles("EUR/USD", "1h", 100))["c"] == [1.05]
+        result = await client.get_candles("EUR/USD", "1h", 100)
+        assert result.candles[0].close == 1.05
+        assert result.batches_requested == 2
 
 
 @pytest.mark.asyncio

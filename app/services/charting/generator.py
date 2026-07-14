@@ -26,7 +26,7 @@ def _candle_frame(candles: list[Candle]) -> pd.DataFrame:
     frame = pd.DataFrame(
         [
             {
-                "Date": candle.timestamp,
+                "Date": pd.to_datetime(candle.timestamp, unit="ms", utc=True),
                 "Open": candle.open,
                 "High": candle.high,
                 "Low": candle.low,

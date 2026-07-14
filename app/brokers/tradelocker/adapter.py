@@ -4,6 +4,7 @@ from app.config.settings import settings
 from app.auth.identity import get_current_user_sub
 from app.storage.brokers import BrokerRepository, BrokerStorageError
 from app.models.orders import OrderPreview
+from app.services.market_data.history import PaginatedCandleResult
 
 
 class TradeLockerAdapter(BrokerAdapter):
@@ -26,8 +27,13 @@ class TradeLockerAdapter(BrokerAdapter):
     async def get_quote(self, pair: str) -> dict:
         return await self.client.get_quote(pair)
 
-    async def get_candles(self, pair: str, timeframe: str, lookback: int) -> list[dict] | dict:
-        return await self.client.get_candles(pair, timeframe, lookback)
+    async def get_candles(
+        self, pair: str, timeframe: str, lookback: int | None = 300, *,
+        start_time_ms: int | None = None, end_time_ms: int | None = None,
+    ) -> PaginatedCandleResult:
+        return await self.client.get_candles(
+            pair, timeframe, lookback, start_time_ms=start_time_ms, end_time_ms=end_time_ms
+        )
 
     async def submit_order(self, preview: OrderPreview) -> dict:
         raise NotImplementedError("Live TradeLocker execution is intentionally disabled.")

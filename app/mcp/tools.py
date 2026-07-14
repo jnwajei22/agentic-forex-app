@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -8,6 +9,7 @@ from app.config.settings import settings
 from app.models.orders import OrderRequest
 from app.services.charting.generator import generate_forex_chart
 from app.services.market_data.service import get_candles, get_spread
+from app.services.market_data.history import PaginatedCandleResult
 from app.services.multi_timeframe import analyze_multi_timeframe_report
 from app.services.scanner import scan_forex_watchlist as scan_watchlist
 from app.services.technical_analysis.analyzer import analyze_pair_from_candles
@@ -293,16 +295,68 @@ async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
         return _tradelocker_error_response(exc)
 
 
+def _utc_timestamp_ms(value: str, name: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} must be a valid ISO-8601 UTC timestamp.") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"{name} must include the UTC timezone.")
+    return int(parsed.timestamp() * 1000)
+
+
+def _iso_utc(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _candle_result(symbol: str, result: PaginatedCandleResult) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "timeframe": result.timeframe,
+        "requested_start": _iso_utc(result.requested_start_ms),
+        "requested_end": _iso_utc(result.requested_end_ms),
+        "estimated_candles": result.estimated_candles,
+        "candles_returned": len(result.candles),
+        "batches_requested": result.batches_requested,
+        "complete": result.complete,
+        "warning": result.warning,
+        "stop_reason": result.stop_reason,
+        "malformed_candles_discarded": result.malformed_discarded,
+        "correlation_id": result.correlation_id,
+        "candles": [candle.model_dump() for candle in result.candles],
+    }
+
+
 async def get_tradelocker_candles(
-    symbol: str, timeframe: str, lookback: int = 300
+    symbol: str,
+    timeframe: str,
+    lookback: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any] | list[Any]:
-    """Return raw read-only TradeLocker historical bars for a symbol."""
+    """Return canonical paginated candles; an explicit start_time overrides lookback."""
     missing = _missing_user_connection()
     if missing:
         return missing
     try:
-        return await get_tradelocker_adapter().get_candles(symbol, timeframe, lookback)
-    except TradeLockerError as exc:
+        start_ms = _utc_timestamp_ms(start_time, "start_time") if start_time else None
+        end_ms = _utc_timestamp_ms(end_time, "end_time") if end_time else None
+        if start_ms is not None and end_ms is not None and start_ms >= end_ms:
+            raise ValueError("start_time must be earlier than end_time.")
+        result = await get_tradelocker_adapter().get_candles(
+            symbol,
+            timeframe,
+            None if start_ms is not None else (lookback or 300),
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+        )
+        return _candle_result(symbol, result)
+    except (TradeLockerError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            return {
+                "status": "error", "error": "invalid_candle_request",
+                "operation": "get_candles", "status_code": None, "message": str(exc),
+            }
         return _tradelocker_error_response(exc)
 
 
@@ -329,9 +383,13 @@ async def get_my_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
 
 
 async def get_my_tradelocker_candles(
-    symbol: str, timeframe: str, lookback: int = 300
+    symbol: str,
+    timeframe: str,
+    lookback: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any] | list[Any]:
-    return await get_tradelocker_candles(symbol, timeframe, lookback)
+    return await get_tradelocker_candles(symbol, timeframe, lookback, start_time, end_time)
 
 
 def get_trade_log(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:

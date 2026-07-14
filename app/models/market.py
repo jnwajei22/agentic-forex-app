@@ -1,13 +1,39 @@
-from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any
+
+from pydantic import BaseModel, field_validator, model_validator
 
 class Candle(BaseModel):
-    timestamp: datetime
+    """Canonical candle. Timestamps are always Unix epoch milliseconds."""
+
+    timestamp: int
     open: float
     high: float
     low: float
     close: float
-    volume: float | None = None
+    volume: float = 0.0
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def canonical_timestamp(cls, value: Any) -> int:
+        if isinstance(value, datetime):
+            current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            return int(current.timestamp() * 1000)
+        if isinstance(value, str):
+            current = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            return int(current.timestamp() * 1000)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            return int(numeric * 1000 if abs(numeric) < 10_000_000_000 else numeric)
+        raise ValueError("Candle timestamp must be an ISO-8601 string or Unix timestamp.")
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "Candle":
+        if self.high < self.low:
+            raise ValueError("Candle high cannot be below its low.")
+        return self
 
 class ForexPairConfig(BaseModel):
     pair: str

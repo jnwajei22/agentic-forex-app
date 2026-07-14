@@ -3,6 +3,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from app.models.market import Candle
+from app.services.market_data.candles import normalize_candle
 
 DEFAULT_MOCK_CANDLE_PATH = (
     Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "mock_candles.json"
@@ -16,7 +17,7 @@ def parse_mock_candles(
     parsed: dict[str, list[Candle]] = {}
     for pair, values in payload.items():
         candles = [
-            value if isinstance(value, Candle) else Candle.model_validate(value)
+            value if isinstance(value, Candle) else normalize_candle(value)
             for value in values
         ]
         parsed[pair] = sorted(candles, key=lambda candle: candle.timestamp)

@@ -7,7 +7,7 @@ class BrokerAdapter:
     async def get_quote(self, pair: str) -> dict:
         raise NotImplementedError
 
-    async def get_candles(self, pair: str, timeframe: str, lookback: int) -> list[dict]:
+    async def get_candles(self, pair: str, timeframe: str, lookback: int | None = 300, **kwargs):
         raise NotImplementedError
 
     async def get_open_positions(self) -> list[dict]:

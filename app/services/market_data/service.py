@@ -5,45 +5,14 @@ from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.models.market import Candle
 from app.services.market_data.mock_provider import DEFAULT_MOCK_CANDLE_PATH, load_mock_candles
+from app.services.market_data.candles import normalize_history_payload
+from app.services.market_data.history import PaginatedCandleResult
 
 
 def _history_candles(payload: Any) -> list[Candle]:
-    if isinstance(payload, list):
-        return [Candle.model_validate(item) for item in payload if isinstance(item, dict)]
-    if not isinstance(payload, dict) or payload.get("status") == "not_implemented":
-        return []
-    source = payload.get("d", payload.get("data", payload))
-    if isinstance(source, dict) and "barDetails" in source:
-        return _history_candles(source["barDetails"])
-    if not isinstance(source, dict):
-        return []
-    columns = {
-        "timestamp": source.get("t", source.get("time", [])),
-        "open": source.get("o", source.get("open", [])),
-        "high": source.get("h", source.get("high", [])),
-        "low": source.get("l", source.get("low", [])),
-        "close": source.get("c", source.get("close", [])),
-        "volume": source.get("v", source.get("volume", [])),
-    }
-    required = [columns[name] for name in ("timestamp", "open", "high", "low", "close")]
-    if not all(isinstance(column, list) for column in required):
-        return []
-    candles = []
-    for index in range(min(len(column) for column in required)):
-        timestamp = columns["timestamp"][index]
-        if isinstance(timestamp, (int, float)):
-            timestamp = timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
-        volume = columns["volume"]
-        candles.append(
-            Candle(
-                timestamp=timestamp,
-                open=columns["open"][index],
-                high=columns["high"][index],
-                low=columns["low"][index],
-                close=columns["close"][index],
-                volume=volume[index] if isinstance(volume, list) and index < len(volume) else None,
-            )
-        )
+    if isinstance(payload, PaginatedCandleResult):
+        return payload.candles
+    candles, _ = normalize_history_payload(payload)
     return sorted(candles, key=lambda candle: candle.timestamp)
 
 
