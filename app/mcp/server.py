@@ -14,6 +14,8 @@ mcp = FastMCP(
 
 mcp.tool(tools.get_forex_watchlist)
 mcp.tool(tools.scan_forex_watchlist)
+mcp.tool(tools.get_forex_chart_data)
+mcp.tool(tools.generate_static_forex_chart)
 mcp.tool(tools.generate_chart)
 mcp.tool(tools.analyze_multi_timeframe)
 mcp.tool(tools.generate_multi_timeframe_report)

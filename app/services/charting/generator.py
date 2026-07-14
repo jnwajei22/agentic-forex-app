@@ -10,19 +10,17 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 
-from app.models.analysis import SetupAnalysis
-from app.models.market import Candle
 from app.config.settings import settings
-from app.services.technical_analysis.indicators import calculate_ema_series
+from app.models.chart import ChartData
 
 
 CHART_DIR = Path("storage/charts")
 DISCLAIMER = "Preview only. Not financial advice."
 
 
-def _candle_frame(candles: list[Candle]) -> pd.DataFrame:
-    if not candles:
-        raise ValueError("Candles are required to generate a chart.")
+def _candle_frame(chart_data: ChartData) -> pd.DataFrame:
+    if not chart_data.candles:
+        raise ValueError("ChartData must include candles for static rendering.")
     frame = pd.DataFrame(
         [
             {
@@ -31,56 +29,51 @@ def _candle_frame(candles: list[Candle]) -> pd.DataFrame:
                 "High": candle.high,
                 "Low": candle.low,
                 "Close": candle.close,
-                "Volume": candle.volume or 0,
+                "Volume": candle.volume,
             }
-            for candle in sorted(candles, key=lambda item: item.timestamp)
+            for candle in chart_data.candles
         ]
     )
     frame["Date"] = pd.to_datetime(frame["Date"], utc=True).dt.tz_localize(None)
     return frame.set_index("Date")
 
 
-def generate_forex_chart(
-    pair: str,
-    timeframe: str,
-    candles: list[Candle],
-    analysis: SetupAnalysis,
-    overlays: list[str] | None = None,
-    entry: float | None = None,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-) -> dict:
-    """Render a local static PNG from mocked candles and analyzer output."""
-    ordered_candles = sorted(candles, key=lambda item: item.timestamp)
-    frame = _candle_frame(ordered_candles)
+def render_static_forex_chart(chart_data: ChartData) -> dict:
+    """Render a static PNG from the shared structured ChartData object."""
+    frame = _candle_frame(chart_data)
     generated_at = datetime.now(timezone.utc)
     chart_id = f"chart_{uuid4().hex[:10]}"
     CHART_DIR.mkdir(parents=True, exist_ok=True)
     path = CHART_DIR / f"{chart_id}.png"
 
-    closes = [candle.close for candle in ordered_candles]
     ema_plots = []
-    for period, color in ((20, "#1f77b4"), (50, "#ff7f0e"), (200, "#9467bd")):
-        series = calculate_ema_series(closes, period)
+    for name, color in (
+        ("ema_20", "#1f77b4"),
+        ("ema_50", "#ff7f0e"),
+        ("ema_200", "#9467bd"),
+    ):
+        points = getattr(chart_data.indicators, name)
+        values = {point.timestamp: point.value for point in points}
+        series = [values.get(candle.timestamp) for candle in chart_data.candles]
         if any(value is not None for value in series):
             ema_plots.append(
                 mpf.make_addplot(
                     pd.Series(series, index=frame.index),
                     color=color,
                     width=1.0,
-                    label=f"EMA {period}",
+                    label=name.replace("_", " ").upper(),
                 )
             )
 
-    style = mpf.make_mpf_style(base_mpf_style="charles", gridstyle=":")
     plot_options = {
         "type": "candle",
-        "style": style,
+        "style": mpf.make_mpf_style(base_mpf_style="charles", gridstyle=":"),
         "volume": False,
         "returnfig": True,
         "figsize": (13, 8),
         "datetime_format": "%m-%d %H:%M",
         "xrotation": 15,
+        "warn_too_much_data": max(10_000, len(chart_data.candles) + 1),
     }
     if ema_plots:
         plot_options["addplot"] = ema_plots
@@ -101,42 +94,57 @@ def generate_forex_chart(
             transform=price_axis.get_yaxis_transform(),
         )
 
-    current_price = ordered_candles[-1].close
-    level(current_price, "black", "Current", "-")
-    level(analysis.swing_high, "darkorange", "Swing high")
-    level(analysis.swing_low, "darkorange", "Swing low")
-    for name, value in analysis.fib_levels.items():
+    level(chart_data.latest_price, "black", "Current", "-")
+    level(chart_data.fibonacci.swing_high, "darkorange", "Swing high")
+    level(chart_data.fibonacci.swing_low, "darkorange", "Swing low")
+    for name, value in chart_data.fibonacci.levels.items():
         level(value, "slateblue", f"Fib {name}", ":")
-    for value in analysis.support_zones:
-        level(value, "green", "Support", "-.")
-    for value in analysis.resistance_zones:
-        level(value, "firebrick", "Resistance", "-.")
-    level(entry, "dodgerblue", "Entry", "-")
-    level(stop_loss, "red", "Stop", "-")
-    level(take_profit, "green", "Target", "-")
+    for zone in chart_data.support_zones:
+        level(zone.price, "green", "Support", "-.")
+    for zone in chart_data.resistance_zones:
+        level(zone.price, "firebrick", "Resistance", "-.")
+    setup = chart_data.trade_setup
+    level(setup.entry if setup else None, "dodgerblue", "Entry", "-")
+    level(setup.stop_loss if setup else None, "red", "Stop", "-")
+    level(setup.take_profit if setup else None, "green", "Target", "-")
+    if setup:
+        for index, target in enumerate(setup.additional_targets, start=2):
+            level(target, "green", f"Target {index}", "-")
+    for swing in chart_data.swings:
+        moment = pd.to_datetime(swing.timestamp, unit="ms", utc=True).tz_localize(None)
+        marker = "^" if swing.type == "low" else "v"
+        price_axis.scatter(moment, swing.price, marker=marker, color="darkorange", zorder=5)
 
     if ema_plots:
         price_axis.legend(loc="upper left", fontsize=8)
-
     price_axis.set_title(
-        f"{pair} · {timeframe} · {analysis.trend.upper()} · Current {current_price:.5f}",
+        f"{chart_data.pair} · {chart_data.timeframe} · "
+        f"{chart_data.analysis.trend.upper()} · Current {chart_data.latest_price:.5f}",
         fontsize=13,
         pad=14,
     )
     price_axis.set_ylabel("Price")
     indicator_text = (
-        f"RSI 14: {analysis.rsi_14:.1f}" if analysis.rsi_14 is not None else "RSI 14: n/a"
+        f"RSI 14: {chart_data.analysis.rsi_14:.1f}"
+        if chart_data.analysis.rsi_14 is not None
+        else "RSI 14: n/a"
     )
     indicator_text += (
-        f" | ATR 14: {analysis.atr_14:.5f}" if analysis.atr_14 is not None else " | ATR 14: n/a"
+        f" | ATR 14: {chart_data.analysis.atr_14:.5f}"
+        if chart_data.analysis.atr_14 is not None
+        else " | ATR 14: n/a"
     )
-    indicator_text += f" | Range: {(analysis.candle_range or 0):.5f}"
-    if analysis.spread is not None:
-        indicator_text += f" | Spread: {analysis.spread:.5f}"
-    overlay_text = (
-        f"Overlays: candlesticks, EMA, Fibonacci, support/resistance, swings | {indicator_text}"
+    indicator_text += f" | Range: {(chart_data.analysis.candle_range or 0):.5f}"
+    if chart_data.analysis.spread is not None:
+        indicator_text += f" | Spread: {chart_data.analysis.spread:.5f}"
+    fig.text(
+        0.01,
+        0.025,
+        "Overlays: candlesticks, EMA, Fibonacci, support/resistance, swings | "
+        + indicator_text,
+        fontsize=8,
+        color="dimgray",
     )
-    fig.text(0.01, 0.025, overlay_text, fontsize=8, color="dimgray")
     fig.text(
         0.99,
         0.025,
@@ -151,20 +159,25 @@ def generate_forex_chart(
     finally:
         plt.close(fig)
 
-    public_chart_url = (
-        f"{settings.public_base_url.rstrip('/')}/charts/{chart_id}.png"
-    )
     return {
         "chart_id": chart_id,
-        "public_chart_url": public_chart_url,
+        "public_chart_url": f"{settings.public_base_url.rstrip('/')}/charts/{chart_id}.png",
         "local_path": str(path),
         "path": str(path),
         "summary": (
-            f"Static candlestick analysis chart for {pair} {timeframe}; "
-            f"trend {analysis.trend}, RSI {analysis.rsi_14}, ATR {analysis.atr_14}. {DISCLAIMER}"
+            f"Static candlestick analysis chart for {chart_data.pair} {chart_data.timeframe}; "
+            f"trend {chart_data.analysis.trend}, RSI {chart_data.analysis.rsi_14}, "
+            f"ATR {chart_data.analysis.atr_14}. {DISCLAIMER}"
         ),
-        "pair": pair,
-        "timeframe": timeframe,
-        "trend": analysis.trend,
+        "pair": chart_data.pair,
+        "timeframe": chart_data.timeframe,
+        "trend": chart_data.analysis.trend,
         "generated_at": generated_at,
+        "chart_data_summary": {
+            "candles_returned": chart_data.range.candles_returned,
+            "display_points": chart_data.display.returned_points,
+            "complete": chart_data.range.complete,
+            "score": chart_data.analysis.score,
+            "direction": chart_data.analysis.direction,
+        },
     }

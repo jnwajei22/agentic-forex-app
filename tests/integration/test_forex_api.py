@@ -60,7 +60,7 @@ def test_post_forex_chart_returns_valid_metadata(tmp_path, monkeypatch):
     assert Path(body["path"]).is_file()
     assert "Static candlestick analysis chart" in body["summary"]
     assert body["pair"] == "EUR/USD"
-    assert body["timeframe"] == "1h"
+    assert body["timeframe"] == "1H"
     assert body["trend"] in {"bullish", "bearish", "neutral", "choppy"}
     assert body["generated_at"]
 

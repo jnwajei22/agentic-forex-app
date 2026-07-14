@@ -21,6 +21,8 @@ class SetupAnalysis(BaseModel):
     trend: str
     swing_high: float | None = None
     swing_low: float | None = None
+    swing_high_timestamp: int | None = None
+    swing_low_timestamp: int | None = None
     fib_levels: dict[str, float] = Field(default_factory=dict)
     support_zones: list[float] = Field(default_factory=list)
     resistance_zones: list[float] = Field(default_factory=list)

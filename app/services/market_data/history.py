@@ -5,6 +5,7 @@ import math
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from app.models.market import Candle
@@ -44,6 +45,22 @@ def estimate_candles(start_time_ms: int, end_time_ms: int, timeframe: str) -> in
     if start_time_ms >= end_time_ms:
         raise ValueError("start_time must be earlier than end_time.")
     return max(1, math.ceil((end_time_ms - start_time_ms) / TIMEFRAME_DURATION_MS[timeframe]))
+
+
+def parse_utc_timestamp(value: str, name: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} must be a valid ISO-8601 UTC timestamp.") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"{name} must include the UTC timezone.")
+    return int(parsed.timestamp() * 1000)
+
+
+def iso_utc(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
 @dataclass

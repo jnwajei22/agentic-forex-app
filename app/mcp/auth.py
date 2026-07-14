@@ -21,6 +21,8 @@ OAUTH_CHALLENGE = f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'
 TOOL_SCOPES = {
     "get_forex_watchlist": "forex:read",
     "scan_forex_watchlist": "forex:read",
+    "get_forex_chart_data": "forex:read",
+    "generate_static_forex_chart": "forex:read",
     "generate_chart": "forex:read",
     "analyze_multi_timeframe": "forex:read",
     "generate_multi_timeframe_report": "forex:read",

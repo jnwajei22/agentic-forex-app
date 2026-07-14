@@ -79,7 +79,19 @@ async def test_three_month_hourly_paginates_backward_deduplicates_sorts_and_char
 
     monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
     analysis = analyze_pair_from_candles("EUR/USD", "1H", result.candles, "history-test")
-    chart = generator.generate_forex_chart("EUR/USD", "1H", result.candles, analysis)
+    from app.services.charting.data import build_chart_data
+    from app.services.charting import data as chart_data_service
+
+    async def history_source(**kwargs):
+        return result
+
+    async def no_spread(pair):
+        return None
+
+    monkeypatch.setattr(chart_data_service, "get_candle_history", history_source)
+    monkeypatch.setattr(chart_data_service, "get_spread", no_spread)
+    chart_data = await build_chart_data(pair="EUR/USD", timeframe="1H", max_points=3000)
+    chart = generator.render_static_forex_chart(chart_data)
     assert Path(chart["path"]).is_file()
 
 

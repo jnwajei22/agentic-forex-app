@@ -23,6 +23,9 @@ class ForexScanResponse(BaseModel):
 class ForexChartRequest(BaseModel):
     pair: str
     timeframe: str = "1h"
+    lookback: int | None = None
+    start_time: str | None = None
+    end_time: str | None = None
     overlays: list[str] = Field(default_factory=list)
     entry: float | None = None
     stop_loss: float | None = None
@@ -39,6 +42,7 @@ class ForexChartResponse(BaseModel):
     timeframe: str
     trend: str
     generated_at: datetime
+    chart_data_summary: dict
 
 
 class OrderPreviewRequest(OrderRequest):

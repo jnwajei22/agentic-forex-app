@@ -7,7 +7,8 @@ from app.brokers.tradelocker.client import TradeLockerError
 from app.auth.identity import get_current_user_sub
 from app.config.settings import settings
 from app.models.orders import OrderRequest
-from app.services.charting.generator import generate_forex_chart
+from app.services.charting.data import build_chart_data
+from app.services.charting.generator import render_static_forex_chart
 from app.services.market_data.service import get_candles, get_spread
 from app.services.market_data.history import PaginatedCandleResult
 from app.services.multi_timeframe import analyze_multi_timeframe_report
@@ -160,6 +161,72 @@ async def scan_forex_watchlist(
     }
 
 
+async def get_forex_chart_data(
+    pair: str,
+    timeframe: str,
+    lookback: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    overlays: list[str] | None = None,
+    entry: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    max_points: int | None = 2000,
+    include_candles: bool = True,
+    include_indicator_series: bool = True,
+) -> dict[str, Any]:
+    """Return structured market data for an interactive chart or trade setup, not an image. Explicit date ranges override lookback."""
+    if settings.market_data_provider.lower() == "tradelocker":
+        missing = _missing_user_connection()
+        if missing:
+            return missing
+    chart_data = await build_chart_data(
+        pair=pair,
+        timeframe=timeframe,
+        lookback=lookback,
+        start_time=start_time,
+        end_time=end_time,
+        overlays=overlays,
+        entry=entry,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        max_points=max_points,
+        include_candles=include_candles,
+        include_indicator_series=include_indicator_series,
+    )
+    return chart_data.model_dump(mode="json")
+
+
+async def generate_static_forex_chart(
+    pair: str,
+    timeframe: str,
+    lookback: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    overlays: list[str] | None = None,
+    entry: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    max_points: int | None = 2000,
+) -> dict[str, Any]:
+    """Generate a static PNG export/fallback from shared structured chart data."""
+    if settings.market_data_provider.lower() == "tradelocker":
+        missing = _missing_user_connection()
+        if missing:
+            return missing
+    chart_data = await build_chart_data(
+        pair=pair, timeframe=timeframe, lookback=lookback,
+        start_time=start_time, end_time=end_time, overlays=overlays,
+        entry=entry, stop_loss=stop_loss, take_profit=take_profit,
+        max_points=max_points, include_candles=True, include_indicator_series=True,
+    )
+    metadata = render_static_forex_chart(chart_data)
+    metadata["generated_at"] = metadata["generated_at"].isoformat()
+    metadata.pop("local_path", None)
+    metadata.pop("path", None)
+    return metadata
+
+
 async def generate_chart(
     pair: str,
     timeframe: str,
@@ -168,33 +235,11 @@ async def generate_chart(
     stop_loss: float | None = None,
     take_profit: float | None = None,
 ) -> dict[str, Any]:
-    """Generate a local PNG analysis chart from mocked candles."""
-    if settings.market_data_provider.lower() == "tradelocker":
-        missing = _missing_user_connection()
-        if missing:
-            return missing
-    normalized_pair = normalize_pair(pair)
-    if not is_allowed_pair(normalized_pair):
-        raise ValueError(f"Unknown forex pair: {pair}")
-    candles = await get_candles(normalized_pair, timeframe, 300)
-    if not candles:
-        raise ValueError(f"No mocked candles found for pair: {normalized_pair}")
-    spread = await get_spread(normalized_pair)
-    analysis = analyze_pair_from_candles(
-        normalized_pair, timeframe, candles, "chart", spread=spread
+    """Deprecated compatibility alias; use generate_static_forex_chart for PNG output."""
+    return await generate_static_forex_chart(
+        pair=pair, timeframe=timeframe, overlays=overlays,
+        entry=entry, stop_loss=stop_loss, take_profit=take_profit,
     )
-    metadata = generate_forex_chart(
-        normalized_pair,
-        timeframe,
-        candles,
-        analysis,
-        overlays,
-        entry,
-        stop_loss,
-        take_profit,
-    )
-    metadata["generated_at"] = metadata["generated_at"].isoformat()
-    return metadata
 
 
 async def analyze_multi_timeframe(

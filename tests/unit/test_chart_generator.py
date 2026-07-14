@@ -1,57 +1,40 @@
 from pathlib import Path
 
+import pytest
+
+from app.config.settings import settings
 from app.services.charting import generator
-from app.services.market_data.mock_provider import load_mock_candles
-from app.services.technical_analysis.analyzer import analyze_pair_from_candles
+from app.services.charting.data import build_chart_data
 
 
-FIXTURE = Path(__file__).parents[1] / "fixtures" / "mock_candles.json"
-
-
-def chart_inputs():
-    candles = load_mock_candles(FIXTURE)["EUR/USD"]
-    analysis = analyze_pair_from_candles("EUR/USD", "1h", candles, "chart")
-    return candles, analysis
-
-
-def test_chart_png_file_is_created_without_trade_overlay(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_static_chart_consumes_chart_data_and_creates_png(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "market_data_provider", "mock")
     monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
     monkeypatch.setattr(generator.settings, "public_base_url", "https://charts.example.test")
-    candles, analysis = chart_inputs()
+    chart_data = await build_chart_data(pair="EUR/USD", timeframe="1h")
 
-    metadata = generator.generate_forex_chart(
-        "EUR/USD", "1h", candles, analysis, overlays=["fib"]
-    )
+    metadata = generator.render_static_forex_chart(chart_data)
 
     path = Path(metadata["path"])
-    assert path.exists()
-    assert path.suffix == ".png"
-    assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-    assert metadata.keys() >= {
-        "chart_id", "public_chart_url", "local_path", "path", "summary"
-    }
+    assert path.exists() and path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert metadata["public_chart_url"] == (
         f"https://charts.example.test/charts/{metadata['chart_id']}.png"
     )
-    assert metadata["local_path"] == metadata["path"]
+    assert metadata["chart_data_summary"]["candles_returned"] == 3
+    assert "Ã" not in metadata["summary"]
 
 
-def test_chart_works_with_trade_overlay(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_static_chart_works_with_valid_trade_overlay(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "market_data_provider", "mock")
     monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
-    candles, analysis = chart_inputs()
-
-    metadata = generator.generate_forex_chart(
-        "EUR/USD",
-        "1h",
-        candles,
-        analysis,
-        entry=1.1040,
-        stop_loss=1.0990,
-        take_profit=1.1120,
+    chart_data = await build_chart_data(
+        pair="EUR/USD", timeframe="1h", entry=1.104, stop_loss=1.099, take_profit=1.112
     )
 
+    metadata = generator.render_static_forex_chart(chart_data)
+
     assert Path(metadata["path"]).is_file()
-    assert metadata["pair"] == "EUR/USD"
-    assert metadata["timeframe"] == "1h"
-    assert metadata["trend"] == analysis.trend
-    assert metadata["generated_at"]
+    assert chart_data.trade_setup is not None and chart_data.trade_setup.valid
+    assert metadata["trend"] == chart_data.analysis.trend

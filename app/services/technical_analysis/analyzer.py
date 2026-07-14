@@ -95,6 +95,8 @@ def analyze_pair_from_candles(
         trend=trend,
         swing_high=swing_high,
         swing_low=swing_low,
+        swing_high_timestamp=swing_high_candle.timestamp if swing_high_candle else None,
+        swing_low_timestamp=swing_low_candle.timestamp if swing_low_candle else None,
         fib_levels=fib_levels,
         support_zones=support_zones,
         resistance_zones=resistance_zones,
