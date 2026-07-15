@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,25 +11,28 @@ from app.brokers.tradelocker.adapter import TradeLockerAdapter
 from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.main import app
-from app.models.market import Candle
 from app.mcp import tools
 from app.mcp import auth
 from app.mcp.server import mcp
-from app.services.charting import generator
 
 
 EXPECTED_TOOLS = {
     "get_forex_watchlist",
-    "scan_forex_watchlist",
-    "get_forex_chart_data",
-    "generate_static_forex_chart",
-    "generate_chart",
-    "analyze_multi_timeframe",
-    "generate_multi_timeframe_report",
+    "get_market_candles",
+    "get_watchlist_market_data",
+    "get_economic_calendar",
+    "get_market_news",
+    "search_macro_series",
+    "get_macro_series",
+    "get_macro_release_calendar",
+    "get_forex_research_bundle",
+    "get_provider_capabilities",
     "review_forex_order",
+    "set_kill_switch",
     "get_account_status",
     "get_open_positions",
-    "get_trade_log",
+    "get_pending_orders",
+    "get_trade_history",
     "get_tradelocker_connection_status",
     "get_my_broker_connection_status",
     "get_my_tradelocker_accounts",
@@ -42,7 +44,6 @@ EXPECTED_TOOLS = {
     "get_tradelocker_config",
     "get_tradelocker_symbols",
     "get_tradelocker_quote",
-    "get_tradelocker_candles",
 }
 INITIALIZE_PAYLOAD = {
     "jsonrpc": "2.0",
@@ -265,16 +266,16 @@ async def test_mcp_server_registers_expected_tools():
 
 
 @pytest.mark.asyncio
-async def test_chart_data_tool_schema_and_scope_are_complete():
-    chart_tool = next(tool for tool in await mcp.list_tools() if tool.name == "get_forex_chart_data")
-    assert set(chart_tool.parameters["properties"]) == {
-        "pair", "timeframe", "lookback", "start_time", "end_time", "overlays",
-        "entry", "stop_loss", "take_profit", "max_points", "include_candles",
-        "include_indicator_series",
+async def test_market_candle_tool_schema_scope_and_client_rendering_instructions():
+    candle_tool = next(tool for tool in await mcp.list_tools() if tool.name == "get_market_candles")
+    assert set(candle_tool.parameters["properties"]) == {
+        "symbol", "timeframe", "source", "lookback", "start_time", "end_time", "max_candles"
     }
-    assert auth.TOOL_SCOPES["get_forex_chart_data"] == "forex:read"
-    assert "not an image" in chart_tool.description
-    assert "override lookback" in chart_tool.description
+    assert auth.TOOL_SCOPES["get_market_candles"] == "forex:read"
+    assert "client-side" in candle_tool.description
+    assert "does not render charts" in mcp.instructions
+    registered = {tool.name for tool in await mcp.list_tools()}
+    assert not registered & {"generate_chart", "generate_static_forex_chart", "get_forex_chart_data"}
 
 
 @pytest.mark.asyncio
@@ -316,107 +317,10 @@ async def test_mcp_account_discovery_tool_rejects_missing_login_config(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_mcp_watchlist_and_scan_are_usable_and_ranked(monkeypatch):
-    monkeypatch.setattr(settings, "market_data_provider", "mock")
+async def test_mcp_watchlist_is_configuration_only():
     watchlist = tools.get_forex_watchlist()
-    results = await tools.scan_forex_watchlist(["1h"], "default", 5)
-
     assert watchlist
     assert watchlist[0]["pair"] == "EUR/USD"
-    assert results["results"]
-    assert [result["score"] for result in results["results"]] == sorted(
-        [result["score"] for result in results["results"]], reverse=True
-    )
-    assert len(results["results"]) <= 5
-    assert results["strongest_pairs"]
-    assert "spread_warning" in results["results"][0]
-
-
-@pytest.mark.asyncio
-async def test_mcp_scan_reports_missing_timeframe_data(monkeypatch):
-    async def no_candles(pair, timeframe, lookback):
-        return []
-
-    monkeypatch.setattr(tools, "get_candles", no_candles)
-
-    report = await tools.scan_forex_watchlist(["15m"], max_results=5)
-
-    assert report["results"] == []
-    assert report["warnings"]
-    assert all("Missing data" in warning for warning in report["warnings"])
-    assert "No trade / no clean setup" in report["summary"]
-
-
-@pytest.mark.asyncio
-async def test_mcp_generate_chart_compatibility_returns_public_url_without_local_path(tmp_path, monkeypatch):
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    candles = [
-        Candle(
-            timestamp=start + timedelta(hours=index),
-            open=1.1 + index * 0.0001,
-            high=1.101 + index * 0.0001,
-            low=1.099 + index * 0.0001,
-            close=1.1005 + index * 0.0001,
-        )
-        for index in range(60)
-    ]
-
-    from app.services.charting import data as chart_data_service
-    from app.services.market_data.history import PaginatedCandleResult
-
-    async def history_source(**kwargs):
-        return PaginatedCandleResult(
-            instrument_id="77", timeframe="1H",
-            requested_start_ms=candles[0].timestamp,
-            requested_end_ms=candles[-1].timestamp,
-            estimated_candles=len(candles), candles=candles,
-            batches_requested=1, complete=True, stop_reason="range_covered",
-        )
-
-    async def spread_source(pair):
-        return 0.0001
-
-    monkeypatch.setattr(chart_data_service, "get_candle_history", history_source)
-    monkeypatch.setattr(chart_data_service, "get_spread", spread_source)
-    monkeypatch.setattr(settings, "market_data_provider", "mock")
-    monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
-    monkeypatch.setattr(settings, "public_base_url", "https://charts.example.test")
-
-    result = await tools.generate_chart("EUR/USD", "1h")
-
-    assert result.keys() >= {
-        "chart_id",
-        "public_chart_url",
-        "pair",
-        "timeframe",
-        "trend",
-        "generated_at",
-        "summary",
-    }
-    assert result["public_chart_url"] == (
-        f"https://charts.example.test/charts/{result['chart_id']}.png"
-    )
-    assert "local_path" not in result and "path" not in result
-
-
-@pytest.mark.asyncio
-async def test_mcp_chart_data_serializes_same_object_used_by_static_renderer(tmp_path, monkeypatch):
-    from app.services.charting.data import build_chart_data
-
-    monkeypatch.setattr(settings, "market_data_provider", "mock")
-    monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
-    chart_data = await build_chart_data(pair="EUR/USD", timeframe="1H")
-
-    async def chart_source(**kwargs):
-        return chart_data
-
-    monkeypatch.setattr(tools, "build_chart_data", chart_source)
-    structured = await tools.get_forex_chart_data("EUR/USD", "1H")
-    static = generator.render_static_forex_chart(chart_data)
-
-    assert structured == chart_data.model_dump(mode="json")
-    assert Path(static["path"]).is_file()
-    assert static["chart_data_summary"]["score"] == structured["analysis"]["score"]
 
 
 def test_mcp_order_review_is_rejected_without_live_submission(monkeypatch):

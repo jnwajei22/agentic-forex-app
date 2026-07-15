@@ -1,6 +1,6 @@
 # ChatGPT MCP OAuth Setup
 
-Agentic Forex Desk exposes a Streamable HTTP MCP server at `https://mcp.justinnwajei.com/mcp/`. It uses mocked market data and risk-checked order previews only. Live trading, TradeLocker execution, and the kill-switch mutation tool are not exposed to ChatGPT.
+Agentic Forex Desk exposes a Streamable HTTP MCP server at `https://mcp.justinnwajei.com/mcp/`. It retrieves normalized TradeLocker, Finnhub, and FRED data plus risk-checked order previews. It does not render charts, calculate indicators, rank trades, or submit live orders.
 
 ## Configure an OAuth provider
 
@@ -52,18 +52,19 @@ In ChatGPT, enable developer mode for connectors/apps if your plan and workspace
 https://mcp.justinnwajei.com/mcp/
 ```
 
-Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all connector tools are available. In addition to the forex analysis tools, the server exposes read-only TradeLocker config, symbol, quote, and candle tools under `forex:read` when TradeLocker credentials are configured.
+Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all connector tools are available. The server exposes canonical market candles, bounded watchlist data, optional Finnhub calendar/news, optional FRED macro data, and read-only TradeLocker account data.
 
 TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_URL`, `TRADELOCKER_USERNAME`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`, then run `get_tradelocker_accounts`. Copy the returned `accountId` and `accNum` into `TRADELOCKER_ACCOUNT_ID` and `TRADELOCKER_ACCOUNT_NUMBER` before using account-specific config, status, positions, symbols, quotes, or candles. Discovery never returns the configured password or TradeLocker tokens.
 
-- `get_forex_watchlist`, `scan_forex_watchlist`, `generate_chart`, `get_account_status`, `get_open_positions`, and `get_trade_log` with `forex:read`
+- `get_market_candles`, `get_watchlist_market_data`, provider research tools, account status, positions, pending orders, and quotes with `forex:read`
 - `review_forex_order` with `forex:preview`
+- `set_kill_switch` with `forex:preview`; remote callers cannot disable it
 
-`set_kill_switch` and TradeLocker execution tools are intentionally not registered with the MCP server.
+TradeLocker execution submission tools are intentionally not registered with the MCP server.
 
-TradeLocker market data is opt-in. Keep `MARKET_DATA_PROVIDER=mock` (the default) unless you explicitly want scans and charts to read TradeLocker candles. No setting enables TradeLocker order submission.
+TradeLocker is the default and authoritative source for `get_market_candles`. Finnhub forex candles must be selected explicitly and remain secondary context. No provider failure triggers an implicit fallback.
 
-Generated charts are written to `storage/charts` and returned with both a local path and a public URL. Set `PUBLIC_BASE_URL=https://mcp.justinnwajei.com`; a chart such as `chart_abc123def4` is then available at `https://mcp.justinnwajei.com/charts/chart_abc123def4.png`.
+For charts, ChatGPT calls `get_market_candles`, verifies completeness metadata, and renders client-side. The backend has no chart route or chart filesystem storage.
 
 ## Vercel frontend and multi-user broker storage
 
@@ -102,6 +103,6 @@ Send that secret as `Authorization: Bearer <strong-random-test-secret>`. Never u
 ## Safety reminders
 
 - Live trading remains disabled regardless of MCP requests.
-- No MCP tool calls TradeLocker or submits an order.
+- Read-only MCP tools call TradeLocker for the authenticated user's account; no MCP tool submits an order.
 - Do not put broker credentials, OAuth tokens, client secrets, webhook secrets, or shared secrets in ChatGPT instructions.
 - Keep `MCP_ALLOW_PUBLIC_NO_AUTH=false` for every public deployment.

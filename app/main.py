@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from app.api.routes.health import router as health_router
 from app.api.routes.forex import router as forex_router
-from app.api.routes.charts import router as charts_router
 from app.api.routes.platform import router as platform_router
 from app.api.routes.oauth import router as oauth_router
 from app.webhooks.tradingview import router as tradingview_router
@@ -14,7 +13,8 @@ from app.storage.brokers import BrokerStorageError
 
 app = FastAPI(
     title="Agentic Forex Desk",
-    version="0.1.0",
+    description="Focused forex research and execution-data backend for ChatGPT.",
+    version="0.2.0",
     lifespan=mcp_app.lifespan,
 )
 app.add_middleware(MCPAuthMiddleware)
@@ -72,7 +72,6 @@ async def oauth_authorization_server_metadata() -> dict[str, object]:
     }
 
 app.include_router(health_router)
-app.include_router(charts_router)
 app.include_router(forex_router)
 app.include_router(platform_router)
 app.include_router(oauth_router)

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
 from app.models.market import Candle
 from app.mcp import tools
-from app.services.charting import generator
 from app.services.market_data.candles import normalize_candle, normalize_history_payload
 from app.services.market_data.history import (
     MAX_CANDLES,
@@ -15,7 +13,6 @@ from app.services.market_data.history import (
     TIMEFRAME_DURATION_MS,
     get_candles_paginated,
 )
-from app.services.technical_analysis.analyzer import analyze_pair_from_candles
 
 
 HOUR = TIMEFRAME_DURATION_MS["1H"]
@@ -55,7 +52,7 @@ async def test_one_batch_and_exactly_300(count):
 
 
 @pytest.mark.asyncio
-async def test_three_month_hourly_paginates_backward_deduplicates_sorts_and_charts(tmp_path, monkeypatch):
+async def test_three_month_hourly_paginates_backward_deduplicates_and_sorts():
     count = 24 * 91
     start = END - HOUR * count
     timestamps = [start + HOUR * index for index in range(1, count + 1)]
@@ -77,22 +74,6 @@ async def test_three_month_hourly_paginates_backward_deduplicates_sorts_and_char
     assert [c.timestamp for c in result.candles] == sorted(set(timestamps))
     assert all(calls[index + 1][1] < calls[index][1] for index in range(len(calls) - 1))
 
-    monkeypatch.setattr(generator, "CHART_DIR", tmp_path)
-    analysis = analyze_pair_from_candles("EUR/USD", "1H", result.candles, "history-test")
-    from app.services.charting.data import build_chart_data
-    from app.services.charting import data as chart_data_service
-
-    async def history_source(**kwargs):
-        return result
-
-    async def no_spread(pair):
-        return None
-
-    monkeypatch.setattr(chart_data_service, "get_candle_history", history_source)
-    monkeypatch.setattr(chart_data_service, "get_spread", no_spread)
-    chart_data = await build_chart_data(pair="EUR/USD", timeframe="1H", max_points=3000)
-    chart = generator.render_static_forex_chart(chart_data)
-    assert Path(chart["path"]).is_file()
 
 
 @pytest.mark.asyncio
@@ -184,26 +165,23 @@ def test_malformed_history_rows_are_discarded_at_boundary():
 async def test_mcp_explicit_range_overrides_lookback_and_serializes_metadata(monkeypatch):
     captured = {}
 
-    class Adapter:
-        async def get_candles(self, symbol, timeframe, lookback, **kwargs):
-            captured.update(symbol=symbol, timeframe=timeframe, lookback=lookback, **kwargs)
-            return PaginatedCandleResult(
-                instrument_id="77", timeframe="1H", requested_start_ms=END - HOUR,
-                requested_end_ms=END, estimated_candles=1,
-                candles=[Candle(**raw(END, abbreviated=False))], batches_requested=1, complete=True,
-                stop_reason="range_covered",
-            )
+    class Result:
+        def model_dump(self, mode):
+            return {"source": "tradelocker", "complete": True}
+
+    async def market_source(**kwargs):
+        captured.update(kwargs)
+        return Result()
 
     monkeypatch.setattr(tools, "_missing_user_connection", lambda: None)
-    monkeypatch.setattr(tools, "get_tradelocker_adapter", lambda: Adapter())
+    monkeypatch.setattr(tools, "get_market_series", market_source)
     result = await tools.get_my_tradelocker_candles(
         "EUR/USD", "1H", lookback=5,
         start_time="2026-07-12T23:00:00Z", end_time="2026-07-13T00:00:00Z",
     )
-    assert captured["lookback"] is None
-    assert captured["start_time_ms"] == END - HOUR and captured["end_time_ms"] == END
-    assert result["candles_returned"] == 1 and result["candles"][0]["timestamp"] == END
-    assert result["complete"] and result["warning"] is None
+    assert captured["lookback"] == 5
+    assert captured["start_time"] and captured["end_time"]
+    assert result["complete"]
 
 
 @pytest.mark.asyncio
@@ -215,7 +193,7 @@ async def test_mcp_rejects_invalid_range_and_non_utc_time(monkeypatch):
     non_utc = await tools.get_my_tradelocker_candles(
         "EUR/USD", "1H", start_time="2026-07-12T23:00:00-05:00"
     )
-    assert invalid_range["error"] == "invalid_candle_request"
+    assert invalid_range["error"] == "invalid_request"
     assert "earlier" in invalid_range["message"]
-    assert non_utc["error"] == "invalid_candle_request"
+    assert non_utc["error"] == "invalid_request"
     assert "UTC" in non_utc["message"]

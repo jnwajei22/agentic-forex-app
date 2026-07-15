@@ -29,8 +29,10 @@ def normalize_candle(candle: Mapping[str, Any]) -> Candle:
         normalized = Candle.model_validate(values)
     except (ValidationError, TypeError, ValueError) as exc:
         raise ValueError("Malformed candle data.") from exc
-    if normalized.high < normalized.low:
-        raise ValueError("Candle high cannot be below its low.")
+    if normalized.high < max(normalized.open, normalized.close, normalized.low):
+        raise ValueError("Candle high cannot be below open, close, or low.")
+    if normalized.low > min(normalized.open, normalized.close, normalized.high):
+        raise ValueError("Candle low cannot be above open, close, or high.")
     return normalized
 
 

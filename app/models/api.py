@@ -1,48 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from app.models.analysis import SetupAnalysis
 from app.models.enums import Direction, OrderPreviewStatus
-from app.models.market import Candle
 from app.models.orders import OrderRequest
-
-
-class ForexScanRequest(BaseModel):
-    candle_data: dict[str, list[Candle]]
-    timeframe: str = "1h"
-
-
-class ForexScanResponse(BaseModel):
-    scan_id: str
-    results: list[SetupAnalysis]
-    timestamp: datetime
-    disclaimer: str
-
-
-class ForexChartRequest(BaseModel):
-    pair: str
-    timeframe: str = "1h"
-    lookback: int | None = None
-    start_time: str | None = None
-    end_time: str | None = None
-    overlays: list[str] = Field(default_factory=list)
-    entry: float | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-
-
-class ForexChartResponse(BaseModel):
-    chart_id: str
-    public_chart_url: str
-    local_path: str
-    path: str
-    summary: str
-    pair: str
-    timeframe: str
-    trend: str
-    generated_at: datetime
-    chart_data_summary: dict
 
 
 class OrderPreviewRequest(OrderRequest):

@@ -1,7 +1,7 @@
 [project]
 name = "agentic-forex-desk"
 version = "0.1.0"
-description = "Private MCP-powered forex scanner, charting, paper trading, and controlled execution backend."
+description = "Focused forex research and execution-data MCP backend for ChatGPT."
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

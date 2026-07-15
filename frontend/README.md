@@ -55,4 +55,4 @@ For Vercel preview URLs, register each callback URL in Auth0 or use a controlled
 - `/select-account` account discovery and selection
 - `/settings` update or remove the broker connection
 
-This frontend provides charting-platform onboarding only. It contains no payments or trade-execution functionality.
+This frontend provides Auth0 and TradeLocker onboarding for the ChatGPT data backend. It contains no chart rendering, payments, or trade-execution functionality.

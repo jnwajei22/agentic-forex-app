@@ -9,24 +9,19 @@ agentic-forex-desk/
     db/                      SQL schema and migrations
     models/                  Pydantic request/response/domain models
     services/
-      market_data/           broker/provider candle and quote retrieval
-      technical_analysis/    trend, swings, fibs, S/R, scoring
-      charting/              mplfinance/matplotlib chart generation
+      market_data/           canonical candle retrieval and response contracts
+      providers/             Finnhub/FRED clients, errors, and public-data cache
       risk/                  hard risk checks and position sizing
       trading/               previews, confirmation, trade flow
-      reports/               9:00, 11:00, 1:30 CT scheduled scans
       logging/               audit and risk logs
     brokers/
       base.py                adapter interface
       paper/                 paper trading adapter
-      tradelocker/           TradeLocker adapter, disabled until verified
-    webhooks/                TradingView webhook receiver
-    jobs/                    scheduled scan/report jobs
+      tradelocker/           per-user broker/account market-data adapter
+    webhooks/                optional untrusted TradingView alert receiver
   tests/
     unit/
     integration/
     fixtures/
-  storage/
-    charts/
-    logs/
+  storage/                   database and non-chart application state
 ```

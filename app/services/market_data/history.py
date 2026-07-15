@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.models.market import Candle
+from app.config.settings import settings
 from app.services.market_data.candles import normalize_history_payload
 
-MAX_CANDLES = 10_000
+MAX_CANDLES = settings.market_data_max_retrieval_candles
 MAX_BATCH_SIZE = 300
-MAX_PAGES = 50
+MAX_PAGES = settings.market_data_max_pages
 
 # TradeLocker uses this exact, case-sensitive resolution vocabulary.
 TIMEFRAME_DURATION_MS = {

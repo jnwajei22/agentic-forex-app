@@ -31,8 +31,10 @@ class Candle(BaseModel):
 
     @model_validator(mode="after")
     def validate_range(self) -> "Candle":
-        if self.high < self.low:
-            raise ValueError("Candle high cannot be below its low.")
+        if self.high < max(self.open, self.close, self.low):
+            raise ValueError("Candle high cannot be below open, close, or low.")
+        if self.low > min(self.open, self.close, self.high):
+            raise ValueError("Candle low cannot be above open, close, or high.")
         return self
 
 class ForexPairConfig(BaseModel):

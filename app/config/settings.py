@@ -42,6 +42,26 @@ class Settings(BaseSettings):
     tradelocker_account_id: str | None = None
     tradelocker_account_number: str | None = None
 
+    finnhub_enabled: bool = False
+    finnhub_api_key: str | None = None
+    finnhub_base_url: str = "https://finnhub.io/api/v1"
+    finnhub_timeout_seconds: float = 15
+    finnhub_max_retries: int = 2
+    finnhub_cache_ttl_seconds: int = 300
+
+    fred_enabled: bool = False
+    fred_api_key: str | None = None
+    fred_base_url: str = "https://api.stlouisfed.org/fred"
+    fred_timeout_seconds: float = 15
+    fred_max_retries: int = 2
+    fred_cache_ttl_seconds: int = 3600
+    macro_catalog_json: str = "{}"
+
+    market_data_default_candles: int = 300
+    market_data_max_response_candles: int = 2000
+    market_data_max_retrieval_candles: int = 10000
+    market_data_max_pages: int = 50
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()

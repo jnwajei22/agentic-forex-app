@@ -20,16 +20,21 @@ RESOURCE_METADATA_URL = f"{RESOURCE}/.well-known/oauth-protected-resource"
 OAUTH_CHALLENGE = f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'
 TOOL_SCOPES = {
     "get_forex_watchlist": "forex:read",
-    "scan_forex_watchlist": "forex:read",
-    "get_forex_chart_data": "forex:read",
-    "generate_static_forex_chart": "forex:read",
-    "generate_chart": "forex:read",
-    "analyze_multi_timeframe": "forex:read",
-    "generate_multi_timeframe_report": "forex:read",
+    "get_market_candles": "forex:read",
+    "get_watchlist_market_data": "forex:read",
+    "get_economic_calendar": "forex:read",
+    "get_market_news": "forex:read",
+    "search_macro_series": "forex:read",
+    "get_macro_series": "forex:read",
+    "get_macro_release_calendar": "forex:read",
+    "get_forex_research_bundle": "forex:read",
+    "get_provider_capabilities": "forex:read",
     "review_forex_order": "forex:preview",
     "get_account_status": "forex:read",
     "get_open_positions": "forex:read",
-    "get_trade_log": "forex:read",
+    "get_pending_orders": "forex:read",
+    "get_trade_history": "forex:read",
+    "set_kill_switch": "forex:preview",
     "get_tradelocker_connection_status": "forex:read",
     "get_my_broker_connection_status": "forex:read",
     "get_my_tradelocker_accounts": "forex:read",
@@ -41,7 +46,6 @@ TOOL_SCOPES = {
     "get_tradelocker_config": "forex:read",
     "get_tradelocker_symbols": "forex:read",
     "get_tradelocker_quote": "forex:read",
-    "get_tradelocker_candles": "forex:read",
 }
 
 _jwks_clients: dict[str, PyJWKClient] = {}

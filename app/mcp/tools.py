@@ -1,48 +1,44 @@
-from datetime import datetime, timezone
-from typing import Any
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Literal
 from urllib.parse import quote
 
+from app.auth.identity import get_current_user_sub
 from app.brokers.tradelocker.adapter import get_tradelocker_adapter
 from app.brokers.tradelocker.client import TradeLockerError
-from app.auth.identity import get_current_user_sub
 from app.config.settings import settings
 from app.models.orders import OrderRequest
-from app.services.charting.data import build_chart_data
-from app.services.charting.generator import render_static_forex_chart
-from app.services.market_data.service import get_candles, get_spread
-from app.services.market_data.history import PaginatedCandleResult
-from app.services.multi_timeframe import analyze_multi_timeframe_report
-from app.services.scanner import scan_forex_watchlist as scan_watchlist
-from app.services.technical_analysis.analyzer import analyze_pair_from_candles
+from app.services.market_data.librarian import (
+    get_macro_results,
+    get_market_series,
+    macro_catalog,
+    watchlist_market_data,
+)
+from app.services.providers.errors import ProviderError
+from app.services.providers.finnhub import FinnhubClient, capability_status
+from app.services.providers.fred import FredClient
 from app.services.trading.previews import create_order_preview
-from app.services.watchlist import get_default_watchlist, is_allowed_pair, normalize_pair
+from app.services.watchlist import get_default_watchlist
 from app.storage.brokers import BrokerRepository, BrokerStorageError
 
 
 def _setup_url() -> str:
-    origin = settings.frontend_origin.rstrip("/")
     return (
-        f"{origin}/connect-tradelocker?source=chatgpt&returnTo="
+        f"{settings.frontend_origin.rstrip('/')}/connect-tradelocker?source=chatgpt&returnTo="
         f"{quote(settings.chatgpt_return_url, safe='')}"
     )
 
 
 def _setup_required() -> dict[str, Any]:
     return {
-        "status": "setup_required",
-        "message": "TradeLocker setup required.",
+        "status": "setup_required", "message": "TradeLocker setup required.",
         "setup_url": _setup_url(),
         "instruction": (
             "Open the setup URL, connect TradeLocker using the same login account, "
             "then return to ChatGPT and run this again."
         ),
     }
-
-
-def _tradelocker_error_response(exc: TradeLockerError) -> dict[str, Any]:
-    if exc.code == "setup_required" or exc.status_code in {401, 403}:
-        return _setup_required()
-    return exc.as_dict()
 
 
 def _missing_user_connection() -> dict[str, Any] | None:
@@ -56,15 +52,26 @@ def _missing_user_connection() -> dict[str, Any] | None:
     return _setup_required() if status["status"] == "not_connected" else None
 
 
+def _tradelocker_error(exc: TradeLockerError) -> dict[str, Any]:
+    if exc.code == "setup_required" or exc.status_code in {401, 403}:
+        return _setup_required()
+    return exc.as_dict()
+
+
+def _date(value: str | None, name: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{name} must use YYYY-MM-DD format.") from None
+
+
 def get_tradelocker_connection_status() -> dict[str, Any]:
-    """Return the current user's sanitized TradeLocker connection status."""
+    """Return the current user's sanitized, isolated TradeLocker connection status."""
     user_sub = get_current_user_sub()
     if not user_sub:
-        return {
-            "connected": False,
-            "selected_account": False,
-            **_setup_required(),
-        }
+        return {"connected": False, "selected_account": False, **_setup_required()}
     try:
         status = BrokerRepository().status(user_sub)
     except BrokerStorageError as exc:
@@ -72,393 +79,337 @@ def get_tradelocker_connection_status() -> dict[str, Any]:
     if status["status"] == "not_connected":
         return {"connected": False, "selected_account": False, **_setup_required()}
     selected = status["status"] == "ready"
-    result: dict[str, Any] = {
-        "connected": True,
-        "selected_account": selected,
-        "status": status["status"],
-    }
+    result: dict[str, Any] = {"connected": True, "selected_account": selected, "status": status["status"]}
     if selected:
         result["selected_account_summary"] = status["selected_account"]
     return result
 
 
 def get_my_broker_connection_status() -> dict[str, Any]:
-    """Backward-compatible alias for TradeLocker connection status."""
+    """Deprecated compatibility alias for get_tradelocker_connection_status."""
     return get_tradelocker_connection_status()
 
 
-def _tradelocker_configured() -> bool:
-    return bool(get_current_user_sub()) or settings.allow_env_broker_fallback and all(
-        (
-            settings.tradelocker_username,
-            settings.tradelocker_password,
-            settings.tradelocker_server,
-            settings.tradelocker_account_id,
-            settings.tradelocker_account_number,
-        )
-    )
-
-
 def get_forex_watchlist() -> list[dict[str, Any]]:
-    """Return the configured forex pairs available to mocked analysis."""
+    """Return configured forex symbols without analysis or ranking."""
     return [item.model_dump(mode="json") for item in get_default_watchlist()]
 
 
-async def scan_forex_watchlist(
-    timeframes: list[str],
-    strategy_profile: str = "default",
-    max_results: int = 10,
+async def get_market_candles(
+    symbol: str,
+    timeframe: str,
+    source: Literal["tradelocker", "finnhub"] = "tradelocker",
+    lookback: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    max_candles: int | None = None,
 ) -> dict[str, Any]:
-    """Rank trend clarity and report missing data, spread availability, and weak setups."""
-    if settings.market_data_provider.lower() == "tradelocker":
+    """Return canonical provider-identified OHLCV for client-side charting and analysis; explicit dates override lookback."""
+    if source == "tradelocker":
         missing = _missing_user_connection()
         if missing:
             return missing
-    if not timeframes:
-        raise ValueError("At least one timeframe is required.")
-    if max_results < 1:
-        raise ValueError("max_results must be at least 1.")
-
-    results = []
-    warnings = []
-    for timeframe in timeframes:
-        candle_data = {}
-        spreads = {}
-        for item in get_default_watchlist():
-            try:
-                candles = await get_candles(item.pair, timeframe, 300)
-            except (TradeLockerError, OSError, ValueError) as exc:
-                candles = []
-                warnings.append(f"Missing data for {item.pair} {timeframe}: {exc}")
-            if len(candles) < 2:
-                warnings.append(f"Missing data for {item.pair} {timeframe}.")
-                continue
-            candle_data[item.pair] = candles
-            spreads[item.pair] = await get_spread(item.pair)
-        results.extend(
-            scan_watchlist(candle_data, timeframe, strategy_profile, spreads=spreads)
+    try:
+        result = await get_market_series(
+            symbol=symbol, timeframe=timeframe, source=source, lookback=lookback,
+            start_time=start_time, end_time=end_time, max_candles=max_candles,
         )
-    ranked = sorted(results, key=lambda setup: setup.score, reverse=True)[:max_results]
-    strongest = sorted(results, key=lambda setup: setup.trend_clarity, reverse=True)[:5]
-    serialized = [setup.model_dump(mode="json") for setup in ranked]
+        return result.model_dump(mode="json")
+    except ProviderError as exc:
+        return exc.as_dict()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+    except ValueError as exc:
+        return ProviderError(source, "invalid_request", str(exc)).as_dict()
+
+
+async def get_watchlist_market_data(
+    symbols: list[str], timeframe: str, lookback: int = 100,
+    fields: list[str] | None = None, max_symbols: int = 10,
+) -> dict[str, Any]:
+    """Return bounded TradeLocker series for client-side screening without ranking or recommendations."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    return await watchlist_market_data(symbols, timeframe, lookback, fields, max_symbols)
+
+
+async def get_economic_calendar(
+    start_date: str, end_date: str, countries: list[str] | None = None,
+    currencies: list[str] | None = None, limit: int = 100,
+) -> dict[str, Any]:
+    """Return normalized Finnhub economic events when the configured plan permits access."""
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be between 1 and 500.")
+    client = FinnhubClient()
+    try:
+        events = await client.economic_calendar(_date(start_date, "start_date"), _date(end_date, "end_date"), limit)
+        country_set = {value.upper() for value in countries or []}
+        currency_set = {value.upper() for value in currencies or []}
+        events = [event for event in events if (not country_set or (event.country or "").upper() in country_set) and (not currency_set or (event.currency or "").upper() in currency_set)]
+        return {"source": "finnhub", "capability": "economic_calendar", "events": [event.model_dump(mode="json") for event in events[:limit]]}
+    except ProviderError as exc:
+        return exc.as_dict()
+    finally:
+        await client.aclose()
+
+
+async def get_market_news(
+    symbols: list[str] | None = None, currencies: list[str] | None = None,
+    category: str = "forex", start_date: str | None = None,
+    end_date: str | None = None, limit: int = 50,
+) -> dict[str, Any]:
+    """Return bounded Finnhub headlines and concise summaries, never full articles."""
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100.")
+    start = _date(start_date, "start_date")
+    end = _date(end_date, "end_date")
+    client = FinnhubClient()
+    try:
+        items = await client.market_news(category, limit=100)
+        wanted = {value.upper() for value in (symbols or []) + (currencies or [])}
+        filtered = []
+        for item in items:
+            published = item.published_at.date()
+            if start and published < start or end and published > end:
+                continue
+            searchable = {value.upper() for value in item.related_symbols}
+            searchable.update(item.headline.upper().split())
+            if wanted and not any(value in searchable or value in item.headline.upper() for value in wanted):
+                continue
+            filtered.append(item)
+        return {"source": "finnhub", "capability": "market_news", "items": [item.model_dump(mode="json") for item in filtered[:limit]]}
+    except ProviderError as exc:
+        return exc.as_dict()
+    finally:
+        await client.aclose()
+
+
+async def search_macro_series(query: str, limit: int = 25) -> dict[str, Any]:
+    """Search official FRED series metadata; no series identifiers are fabricated."""
+    client = FredClient()
+    try:
+        results = await client.search_series(query, limit)
+        return {"source": "fred", "results": [item.model_dump(mode="json") for item in results]}
+    except ProviderError as exc:
+        return exc.as_dict()
+    finally:
+        await client.aclose()
+
+
+async def get_macro_series(
+    series_ids: list[str], observation_start: str | None = None,
+    observation_end: str | None = None, realtime_start: str | None = None,
+    realtime_end: str | None = None, limit: int = 1000,
+) -> dict[str, Any]:
+    """Return official FRED metadata and observations with real-time periods preserved."""
+    if not 1 <= limit <= 5000 or not 1 <= len(series_ids) <= 10:
+        raise ValueError("Request up to 10 series and 1 to 5000 observations per series.")
+    try:
+        results = await get_macro_results(
+            series_ids, _date(observation_start, "observation_start"),
+            _date(observation_end, "observation_end"), _date(realtime_start, "realtime_start"),
+            _date(realtime_end, "realtime_end"), limit,
+        )
+        return {"source": "fred", "series": [item.model_dump(mode="json") for item in results]}
+    except ProviderError as exc:
+        return exc.as_dict()
+
+
+async def get_macro_release_calendar(
+    start_date: str | None = None, end_date: str | None = None, limit: int = 100,
+) -> dict[str, Any]:
+    """Return official FRED release dates."""
+    client = FredClient()
+    try:
+        dates = await client.release_dates(_date(start_date, "start_date"), _date(end_date, "end_date"), limit)
+        return {"source": "fred", "release_dates": [item.model_dump(mode="json") for item in dates]}
+    except ProviderError as exc:
+        return exc.as_dict()
+    finally:
+        await client.aclose()
+
+
+async def get_forex_research_bundle(
+    symbol: str, timeframe: str, lookback: int | None = None,
+    start_time: str | None = None, end_time: str | None = None,
+    include_quote: bool = True, include_account_exposure: bool = True,
+    include_calendar: bool = True, include_news: bool = True, include_macro: bool = True,
+    news_limit: int = 10, event_limit: int = 20,
+    macro_series_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Retrieve bounded, separate forex research inputs without analysis, prediction, or recommendations."""
+    market = await get_market_candles(symbol, timeframe, "tradelocker", lookback, start_time, end_time, settings.market_data_max_response_candles)
+    if market.get("status") in {"error", "setup_required"}:
+        return market
+    warnings: list[str] = []
+    quote_data: Any = None
+    exposure: Any = None
+    if include_quote:
+        quote_data = await get_tradelocker_quote(symbol)
+    if include_account_exposure:
+        exposure = await get_open_positions()
+    calendar: Any = None
+    news: Any = None
+    macro: Any = None
+    today = date.today().isoformat()
+    if include_calendar:
+        calendar = await get_economic_calendar(today, today, limit=event_limit)
+        if calendar.get("status") == "error":
+            warnings.append(calendar["message"])
+    if include_news:
+        news = await get_market_news(symbols=[symbol], limit=news_limit)
+        if news.get("status") == "error":
+            warnings.append(news["message"])
+    if include_macro:
+        ids = macro_series_ids or macro_catalog().currencies.get(symbol[:3].upper(), []) + macro_catalog().currencies.get(symbol[-3:].upper(), [])
+        macro = await get_macro_series(list(dict.fromkeys(ids))[:10], limit=500) if ids else {"source": "fred", "series": [], "warning": "No macro series IDs were requested or configured."}
+        if macro.get("status") == "error":
+            warnings.append(macro["message"])
     return {
-        "results": serialized,
-        "strongest_pairs": [
-            {
-                "pair": setup.pair,
-                "timeframe": setup.timeframe,
-                "trend": setup.trend,
-                "trend_clarity": setup.trend_clarity,
-            }
-            for setup in strongest
-        ],
-        "warnings": list(dict.fromkeys(warnings)),
-        "summary": (
-            "Ranked analysis candidates are available; review spread warnings and context."
-            if serialized
-            else "No trade / no clean setup: usable candle data is unavailable."
-        ),
+        "symbol": symbol, "market": market, "quote": quote_data,
+        "account_exposure": exposure, "economic_calendar": calendar,
+        "news": news, "macro": macro, "warnings": warnings,
+        "sources": {"execution": "tradelocker", "calendar": "finnhub", "news": "finnhub", "macro": "fred"},
     }
-
-
-async def get_forex_chart_data(
-    pair: str,
-    timeframe: str,
-    lookback: int | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    overlays: list[str] | None = None,
-    entry: float | None = None,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-    max_points: int | None = 2000,
-    include_candles: bool = True,
-    include_indicator_series: bool = True,
-) -> dict[str, Any]:
-    """Return structured market data for an interactive chart or trade setup, not an image. Explicit date ranges override lookback."""
-    if settings.market_data_provider.lower() == "tradelocker":
-        missing = _missing_user_connection()
-        if missing:
-            return missing
-    chart_data = await build_chart_data(
-        pair=pair,
-        timeframe=timeframe,
-        lookback=lookback,
-        start_time=start_time,
-        end_time=end_time,
-        overlays=overlays,
-        entry=entry,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        max_points=max_points,
-        include_candles=include_candles,
-        include_indicator_series=include_indicator_series,
-    )
-    return chart_data.model_dump(mode="json")
-
-
-async def generate_static_forex_chart(
-    pair: str,
-    timeframe: str,
-    lookback: int | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    overlays: list[str] | None = None,
-    entry: float | None = None,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-    max_points: int | None = 2000,
-) -> dict[str, Any]:
-    """Generate a static PNG export/fallback from shared structured chart data."""
-    if settings.market_data_provider.lower() == "tradelocker":
-        missing = _missing_user_connection()
-        if missing:
-            return missing
-    chart_data = await build_chart_data(
-        pair=pair, timeframe=timeframe, lookback=lookback,
-        start_time=start_time, end_time=end_time, overlays=overlays,
-        entry=entry, stop_loss=stop_loss, take_profit=take_profit,
-        max_points=max_points, include_candles=True, include_indicator_series=True,
-    )
-    metadata = render_static_forex_chart(chart_data)
-    metadata["generated_at"] = metadata["generated_at"].isoformat()
-    metadata.pop("local_path", None)
-    metadata.pop("path", None)
-    return metadata
-
-
-async def generate_chart(
-    pair: str,
-    timeframe: str,
-    overlays: list[str] | None = None,
-    entry: float | None = None,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-) -> dict[str, Any]:
-    """Deprecated compatibility alias; use generate_static_forex_chart for PNG output."""
-    return await generate_static_forex_chart(
-        pair=pair, timeframe=timeframe, overlays=overlays,
-        entry=entry, stop_loss=stop_loss, take_profit=take_profit,
-    )
-
-
-async def analyze_multi_timeframe(
-    pair: str, timeframes: list[str] | None = None
-) -> dict[str, Any]:
-    """Analyze trend, levels, Fibonacci, RSI, ATR, and confluence across timeframes."""
-    return await analyze_multi_timeframe_report(
-        pair, timeframes or ["15m", "1h", "4h"]
-    )
-
-
-async def generate_multi_timeframe_report(pair: str) -> dict[str, Any]:
-    """Generate the standard 15m, 1h, and 4h read-only analysis report."""
-    return await analyze_multi_timeframe_report(pair, ["15m", "1h", "4h"])
-
-
-def review_forex_order(order_request: dict[str, Any]) -> dict[str, Any]:
-    """Create a risk-checked preview only; this never submits an order."""
-    order = OrderRequest(**order_request)
-    preview = create_order_preview(order)
-    return preview.model_dump(mode="json")
 
 
 async def get_account_status() -> dict[str, Any]:
-    """Return paper status or read-only TradeLocker account state."""
-    if _tradelocker_configured():
-        try:
-            return await get_tradelocker_adapter().get_account()
-        except TradeLockerError as exc:
-            return _tradelocker_error_response(exc)
-    return {
-        "environment": "paper",
-        "app_env": settings.app_env,
-        "live_trading_enabled": False,
-        "kill_switch_enabled": settings.kill_switch_enabled,
-        "broker_connected": False,
-        "message": "Paper/development status only. No live broker is connected.",
-    }
-
-
-async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
-    """Return paper positions or read-only TradeLocker positions."""
-    if _tradelocker_configured():
-        try:
-            return await get_tradelocker_adapter().get_open_positions()
-        except TradeLockerError as exc:
-            return _tradelocker_error_response(exc)
-    return []
-
-
-async def get_tradelocker_config() -> dict[str, Any] | list[Any]:
-    """Return account-specific TradeLocker config. Run get_tradelocker_accounts first."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().client.get_config()
-    except TradeLockerError as exc:
-        return _tradelocker_error_response(exc)
-
-
-async def get_tradelocker_accounts() -> dict[str, Any]:
-    """Discover TradeLocker accounts using login credentials only.
-
-    Run this first without an account ID or account number. Copy an accountId and
-    accNum from the sanitized result into TRADELOCKER_ACCOUNT_ID and
-    TRADELOCKER_ACCOUNT_NUMBER in .env, then restart the server before calling
-    account-specific TradeLocker tools.
-    """
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().client.get_accounts()
-    except TradeLockerError as exc:
-        return _tradelocker_error_response(exc)
-
-
-async def get_tradelocker_symbols() -> dict[str, Any] | list[Any]:
-    """Return instruments available to the configured TradeLocker account."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().client.get_symbols()
-    except TradeLockerError as exc:
-        return _tradelocker_error_response(exc)
-
-
-async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
-    """Return a current read-only TradeLocker quote for a symbol."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().get_quote(symbol)
-    except TradeLockerError as exc:
-        return _tradelocker_error_response(exc)
-
-
-def _utc_timestamp_ms(value: str, name: str) -> int:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"{name} must be a valid ISO-8601 UTC timestamp.") from None
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise ValueError(f"{name} must include the UTC timezone.")
-    return int(parsed.timestamp() * 1000)
-
-
-def _iso_utc(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _candle_result(symbol: str, result: PaginatedCandleResult) -> dict[str, Any]:
-    return {
-        "symbol": symbol,
-        "timeframe": result.timeframe,
-        "requested_start": _iso_utc(result.requested_start_ms),
-        "requested_end": _iso_utc(result.requested_end_ms),
-        "estimated_candles": result.estimated_candles,
-        "candles_returned": len(result.candles),
-        "batches_requested": result.batches_requested,
-        "complete": result.complete,
-        "warning": result.warning,
-        "stop_reason": result.stop_reason,
-        "malformed_candles_discarded": result.malformed_discarded,
-        "correlation_id": result.correlation_id,
-        "candles": [candle.model_dump() for candle in result.candles],
-    }
-
-
-async def get_tradelocker_candles(
-    symbol: str,
-    timeframe: str,
-    lookback: int | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-) -> dict[str, Any] | list[Any]:
-    """Return canonical paginated candles; an explicit start_time overrides lookback."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        start_ms = _utc_timestamp_ms(start_time, "start_time") if start_time else None
-        end_ms = _utc_timestamp_ms(end_time, "end_time") if end_time else None
-        if start_ms is not None and end_ms is not None and start_ms >= end_ms:
-            raise ValueError("start_time must be earlier than end_time.")
-        result = await get_tradelocker_adapter().get_candles(
-            symbol,
-            timeframe,
-            None if start_ms is not None else (lookback or 300),
-            start_time_ms=start_ms,
-            end_time_ms=end_ms,
-        )
-        return _candle_result(symbol, result)
-    except (TradeLockerError, ValueError) as exc:
-        if isinstance(exc, ValueError):
-            return {
-                "status": "error", "error": "invalid_candle_request",
-                "operation": "get_candles", "status_code": None, "message": str(exc),
-            }
-        return _tradelocker_error_response(exc)
-
-
-async def get_my_tradelocker_accounts() -> dict[str, Any]:
-    return await get_tradelocker_accounts()
-
-
-async def get_my_tradelocker_account_status() -> dict[str, Any]:
+    """Return current TradeLocker account state without cross-user caching."""
     missing = _missing_user_connection()
     if missing:
         return missing
     try:
         return await get_tradelocker_adapter().get_account()
     except TradeLockerError as exc:
-        return _tradelocker_error_response(exc)
+        return _tradelocker_error(exc)
 
 
-async def get_my_tradelocker_symbols() -> dict[str, Any] | list[Any]:
-    return await get_tradelocker_symbols()
+async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
+    """Return current TradeLocker positions without shared caching."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().get_open_positions()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
 
 
-async def get_my_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
-    return await get_tradelocker_quote(symbol)
+async def get_pending_orders() -> dict[str, Any] | list[Any]:
+    """Return current TradeLocker pending orders when the endpoint is available."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().client.get_orders()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
 
 
-async def get_my_tradelocker_candles(
-    symbol: str,
-    timeframe: str,
-    lookback: int | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-) -> dict[str, Any] | list[Any]:
-    return await get_tradelocker_candles(symbol, timeframe, lookback, start_time, end_time)
+async def get_trade_history(limit: int = 100) -> dict[str, Any]:
+    """Report TradeLocker trade-history capability without inventing an undocumented route."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    return {
+        "status": "error", "provider": "tradelocker",
+        "error": "capability_unavailable",
+        "message": "Trade history is not exposed by the currently verified TradeLocker client routes.",
+        "capability": "trade_history", "retryable": False,
+        "requested_limit": limit,
+    }
 
 
-def get_trade_log(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Return the paper journal; persistence and filtering are not implemented yet."""
-    return []
+async def get_tradelocker_config() -> dict[str, Any] | list[Any]:
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().client.get_config()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+
+
+async def get_tradelocker_accounts() -> dict[str, Any]:
+    """Discover sanitized TradeLocker accounts before account selection."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().client.get_accounts()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+
+
+async def get_tradelocker_symbols() -> dict[str, Any] | list[Any]:
+    """Return symbols for the connected TradeLocker account."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().client.get_symbols()
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+
+
+async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
+    """Return the authoritative TradeLocker execution quote for a symbol."""
+    missing = _missing_user_connection()
+    if missing:
+        return missing
+    try:
+        return await get_tradelocker_adapter().get_quote(symbol)
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+
+
+def review_forex_order(order_request: dict[str, Any]) -> dict[str, Any]:
+    """Create a deterministic risk-reviewed preview; never submit an order."""
+    return create_order_preview(OrderRequest(**order_request)).model_dump(mode="json")
 
 
 def set_kill_switch(enabled: bool, reason: str) -> dict[str, Any]:
-    """Enable the kill switch. Remote MCP callers cannot disable it."""
+    """Enable the kill switch; remote callers cannot disable it."""
     if not reason.strip():
         raise ValueError("A reason is required to change the kill switch.")
     if not enabled:
         settings.kill_switch_enabled = True
-        return {
-            "changed": False,
-            "kill_switch_enabled": True,
-            "reason": reason,
-            "message": "Remote MCP callers cannot disable the kill switch.",
-        }
+        return {"changed": False, "kill_switch_enabled": True, "reason": reason, "message": "Remote MCP callers cannot disable the kill switch."}
     changed = not settings.kill_switch_enabled
     settings.kill_switch_enabled = True
-    return {
-        "changed": changed,
-        "kill_switch_enabled": True,
-        "reason": reason,
-        "message": "Kill switch enabled. Order previews will be rejected.",
-    }
+    return {"changed": changed, "kill_switch_enabled": True, "reason": reason, "message": "Kill switch enabled."}
+
+
+def get_provider_capabilities() -> dict[str, Any]:
+    """Return configured public-provider capability state without exposing secrets."""
+    return {"finnhub_enabled": settings.finnhub_enabled, "finnhub": capability_status(), "fred_enabled": settings.fred_enabled}
+
+
+# Temporary compatibility aliases used by the current ChatGPT onboarding integration.
+async def get_my_tradelocker_accounts() -> dict[str, Any]:
+    """Deprecated alias for get_tradelocker_accounts."""
+    return await get_tradelocker_accounts()
+
+
+async def get_my_tradelocker_account_status() -> dict[str, Any]:
+    """Deprecated alias for get_account_status."""
+    return await get_account_status()
+
+
+async def get_my_tradelocker_symbols() -> dict[str, Any] | list[Any]:
+    """Deprecated alias for get_tradelocker_symbols."""
+    return await get_tradelocker_symbols()
+
+
+async def get_my_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
+    """Deprecated alias for get_tradelocker_quote."""
+    return await get_tradelocker_quote(symbol)
+
+
+async def get_my_tradelocker_candles(
+    symbol: str, timeframe: str, lookback: int | None = None,
+    start_time: str | None = None, end_time: str | None = None,
+) -> dict[str, Any]:
+    """Deprecated alias for get_market_candles using TradeLocker."""
+    return await get_market_candles(symbol, timeframe, "tradelocker", lookback, start_time, end_time)

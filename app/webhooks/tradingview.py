@@ -25,5 +25,7 @@ async def receive_tradingview_signal(
         "pair": pair,
         "timeframe": payload.timeframe,
         "strategy": payload.strategy,
-        "message": "Signal stored as untrusted until backend analysis confirms it.",
+        "verified_market_data": False,
+        "can_place_trade": False,
+        "message": "Untrusted user-created alert accepted for optional inbound processing only.",
     }
