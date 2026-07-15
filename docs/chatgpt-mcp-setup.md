@@ -1,6 +1,6 @@
 # ChatGPT MCP OAuth Setup
 
-Agentic Forex Desk exposes a Streamable HTTP MCP server at `https://mcp.justinnwajei.com/mcp/`. It retrieves normalized TradeLocker, Finnhub, and FRED data plus risk-checked order previews. It does not render charts, calculate indicators, rank trades, or submit live orders.
+Agentic Forex Desk exposes a Streamable HTTP MCP server at `https://mcp.justinnwajei.com/mcp/`. It retrieves normalized TradeLocker, Finnhub, and FRED data plus risk-checked order previews. Its presentation-only MCP Apps component renders supplied chart data, but the backend does not generate images or calculate indicators, rank trades, or submit live orders.
 
 ## Configure an OAuth provider
 
@@ -64,7 +64,17 @@ TradeLocker execution submission tools are intentionally not registered with the
 
 TradeLocker is the default and authoritative source for `get_market_candles`. Finnhub forex candles must be selected explicitly and remain secondary context. No provider failure triggers an implicit fallback.
 
-For charts, ChatGPT calls `get_market_candles`, verifies completeness metadata, and renders client-side. The backend has no chart route or chart filesystem storage.
+For a visible chart, ChatGPT must call `get_market_candles`, verify completeness metadata, calculate requested overlays, and call `render_market_chart` with the returned `series_id`. `get_market_candles` alone does not display a chart. The result opens a locally bundled interactive snapshot in a ChatGPT iframe through `ui/notifications/tool-result`; it does not poll after the call. The backend has no chart route, image generation, or chart filesystem storage.
+
+Build the widget before deploying the backend:
+
+```powershell
+npm --prefix widget ci
+npm --prefix widget test
+npm --prefix widget run build
+```
+
+Include `widget/dist/index.html` in the backend deployment artifact. After deployment, refresh or reconnect the ChatGPT app so it reloads the tool schema and versioned UI resource. Automatic refresh and multi-pane indicators are later phases.
 
 ## Vercel frontend and multi-user broker storage
 

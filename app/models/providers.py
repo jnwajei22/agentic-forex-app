@@ -39,6 +39,7 @@ class ClientUsage(BaseModel):
     preferred_chart_type: str = "candlestick"
     timestamp_order: str = "oldest_to_newest"
     render_client_side: bool = True
+    render_tool: str = "render_market_chart"
 
 
 class MarketSeries(BaseModel):
@@ -63,6 +64,8 @@ class MarketSeries(BaseModel):
     retrieved_at: datetime
     candles: list[MarketCandle]
     client_usage: ClientUsage = Field(default_factory=ClientUsage)
+    series_id: str | None = None
+    series_expires_at: datetime | None = None
 
 
 class EconomicEvent(BaseModel):

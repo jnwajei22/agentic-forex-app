@@ -14,11 +14,15 @@ from app.main import app
 from app.mcp import tools
 from app.mcp import auth
 from app.mcp.server import mcp
+from app.auth.identity import reset_current_claims, set_current_claims
+from app.models.providers import MarketCandle, MarketSeries
+from app.services.market_data.series_cache import market_series_cache
 
 
 EXPECTED_TOOLS = {
     "get_forex_watchlist",
     "get_market_candles",
+    "render_market_chart",
     "get_watchlist_market_data",
     "get_economic_calendar",
     "get_market_news",
@@ -273,7 +277,37 @@ async def test_market_candle_tool_schema_scope_and_client_rendering_instructions
     }
     assert auth.TOOL_SCOPES["get_market_candles"] == "forex:read"
     assert "client-side" in candle_tool.description
-    assert "does not render charts" in mcp.instructions
+    assert "get_market_candles alone does not produce a visible chart" in mcp.instructions
+    chart_tool = next(tool for tool in await mcp.list_tools() if tool.name == "render_market_chart")
+    assert chart_tool.meta["ui"]["resourceUri"] == "ui://widget/market-chart-v1.html"
+    assert chart_tool.meta["openai/outputTemplate"] == "ui://widget/market-chart-v1.html"
+    assert chart_tool.annotations.readOnlyHint is True
+    assert chart_tool.annotations.destructiveHint is False
+    assert chart_tool.annotations.openWorldHint is False
+    resources = await mcp.list_resources()
+    resource = next(item for item in resources if str(item.uri) == "ui://widget/market-chart-v1.html")
+    assert resource.mime_type == "text/html;profile=mcp-app"
+
+
+@pytest.mark.asyncio
+async def test_render_result_reaches_fastmcp_wire_meta_without_model_duplication():
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    series = MarketSeries(
+        symbol="EURUSD", normalized_symbol="EURUSD", timeframe="1H", source="tradelocker",
+        actual_start=now, actual_end=now, candles_returned=1, complete=True,
+        retrieved_at=now,
+        candles=[MarketCandle(timestamp=now, open=1.1, high=1.2, low=1.0, close=1.15)],
+    )
+    entry = market_series_cache.put("wire-user", series)
+    token = set_current_claims({"sub": "wire-user"})
+    try:
+        result = await mcp.call_tool("render_market_chart", {"series_id": entry.series_id})
+    finally:
+        reset_current_claims(token)
+        market_series_cache.clear()
+    assert result.meta and len(result.meta["chart"]["candles"]) == 1
+    assert result.structured_content["status"] == "ready"
+    assert "candles" not in result.structured_content
     registered = {tool.name for tool in await mcp.list_tools()}
     assert not registered & {"generate_chart", "generate_static_forex_chart", "get_forex_chart_data"}
 

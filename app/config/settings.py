@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     market_data_max_response_candles: int = 2000
     market_data_max_retrieval_candles: int = 10000
     market_data_max_pages: int = 50
+    market_series_cache_ttl_seconds: int = 600
+    market_series_cache_max_items: int = 100
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

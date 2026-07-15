@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Literal
 from urllib.parse import quote
+
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
+from pydantic import ValidationError
 
 from app.auth.identity import get_current_user_sub
 from app.brokers.tradelocker.adapter import get_tradelocker_adapter
 from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.models.orders import OrderRequest
+from app.models.chart_widget import RenderMarketChartRequest
 from app.services.market_data.librarian import (
     get_macro_results,
     get_market_series,
@@ -18,6 +23,7 @@ from app.services.market_data.librarian import (
 from app.services.providers.errors import ProviderError
 from app.services.providers.finnhub import FinnhubClient, capability_status
 from app.services.providers.fred import FredClient
+from app.services.market_data.series_cache import market_series_cache
 from app.services.trading.previews import create_order_preview
 from app.services.watchlist import get_default_watchlist
 from app.storage.brokers import BrokerRepository, BrokerStorageError
@@ -105,6 +111,7 @@ async def get_market_candles(
     max_candles: int | None = None,
 ) -> dict[str, Any]:
     """Return canonical provider-identified OHLCV for client-side charting and analysis; explicit dates override lookback."""
+    owner_id = get_current_user_sub()
     if source == "tradelocker":
         missing = _missing_user_connection()
         if missing:
@@ -114,6 +121,9 @@ async def get_market_candles(
             symbol=symbol, timeframe=timeframe, source=source, lookback=lookback,
             start_time=start_time, end_time=end_time, max_candles=max_candles,
         )
+        if owner_id:
+            cached = market_series_cache.put(owner_id, result)
+            return cached.series.model_dump(mode="json")
         return result.model_dump(mode="json")
     except ProviderError as exc:
         return exc.as_dict()
@@ -121,6 +131,110 @@ async def get_market_candles(
         return _tradelocker_error(exc)
     except ValueError as exc:
         return ProviderError(source, "invalid_request", str(exc)).as_dict()
+
+
+def _chart_error(code: str, message: str, details: list[dict[str, Any]] | None = None) -> ToolResult:
+    structured: dict[str, Any] = {"status": "error", "error": code, "message": message}
+    if details:
+        structured["details"] = details
+    return ToolResult(
+        content=[TextContent(type="text", text=f"Chart unavailable: {message}")],
+        structured_content=structured,
+        is_error=True,
+    )
+
+
+def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
+    return [
+        {"field": ".".join(str(part) for part in error["loc"]), "message": error["msg"]}
+        for error in exc.errors(include_url=False, include_input=False)
+    ]
+
+
+def _timestamps_are_near_series(request: RenderMarketChartRequest, start: Any, end: Any) -> bool:
+    if start is None or end is None:
+        return not request.line_overlays and not request.markers
+    padding = max(timedelta(days=7), (end - start) / 10)
+    minimum, maximum = start - padding, end + padding
+    timestamps = [point.timestamp for overlay in request.line_overlays for point in overlay.points]
+    timestamps.extend(marker.timestamp for marker in request.markers)
+    return all(minimum <= timestamp <= maximum for timestamp in timestamps)
+
+
+async def render_market_chart(
+    series_id: str,
+    chart_type: Literal["candlestick", "line"] = "candlestick",
+    title: str | None = None,
+    show_volume: bool = True,
+    horizontal_overlays: list[dict[str, Any]] | None = None,
+    line_overlays: list[dict[str, Any]] | None = None,
+    markers: list[dict[str, Any]] | None = None,
+) -> ToolResult:
+    """Use this tool whenever the user asks to see, show, display, draw, plot, or render a forex chart. Call get_market_candles first, then pass its series_id here. This tool renders an inline interactive chart."""
+    owner_id = get_current_user_sub()
+    if not owner_id:
+        return _chart_error("series_access_denied", "An authenticated user is required.")
+    status, series = market_series_cache.get(owner_id, series_id)
+    if status != "found" or series is None:
+        messages = {
+            "expired": ("series_expired", "The market series expired; call get_market_candles again."),
+            "access_denied": ("series_access_denied", "This market series is not available to the current user."),
+            "not_found": ("series_not_found", "The market series was not found; call get_market_candles first."),
+        }
+        code, message = messages[status]
+        return _chart_error(code, message)
+    try:
+        request = RenderMarketChartRequest.model_validate({
+            "series_id": series_id,
+            "chart_type": chart_type,
+            "title": title,
+            "show_volume": show_volume,
+            "horizontal_overlays": horizontal_overlays or [],
+            "line_overlays": line_overlays or [],
+            "markers": markers or [],
+        })
+    except ValidationError as exc:
+        details = _validation_details(exc)
+        code = "invalid_marker" if any(item["field"].startswith("markers") for item in details) else "invalid_overlay"
+        return _chart_error(code, "Chart annotations failed validation.", details)
+    if not series.candles:
+        return _chart_error("chart_payload_empty", "The cached market series contains no candles.")
+    if not _timestamps_are_near_series(request, series.actual_start, series.actual_end):
+        return _chart_error(
+            "invalid_marker" if request.markers and not request.line_overlays else "invalid_overlay",
+            "Annotation timestamps are too far outside the cached market range.",
+        )
+
+    chart = {
+        "title": request.title,
+        "symbol": series.normalized_symbol,
+        "timeframe": series.timeframe,
+        "source": series.source,
+        "actual_start": series.actual_start.isoformat().replace("+00:00", "Z") if series.actual_start else None,
+        "actual_end": series.actual_end.isoformat().replace("+00:00", "Z") if series.actual_end else None,
+        "complete": series.complete,
+        "warning": series.warning,
+        "chart_type": request.chart_type,
+        "show_volume": request.show_volume,
+        "candles": [candle.model_dump(mode="json") for candle in series.candles],
+        "horizontal_overlays": [item.model_dump(mode="json") for item in request.horizontal_overlays],
+        "line_overlays": [item.model_dump(mode="json") for item in request.line_overlays],
+        "markers": [item.model_dump(mode="json") for item in request.markers],
+    }
+    summary = {
+        "status": "ready", "series_id": series_id,
+        "symbol": series.normalized_symbol, "timeframe": series.timeframe,
+        "source": series.source, "chart_type": request.chart_type,
+        "candles_rendered": len(series.candles),
+        "horizontal_overlays": len(request.horizontal_overlays),
+        "line_overlays": len(request.line_overlays), "markers": len(request.markers),
+        "complete": series.complete,
+    }
+    return ToolResult(
+        content=[TextContent(type="text", text=f"Interactive {series.normalized_symbol} chart is ready.")],
+        structured_content=summary,
+        meta={"chart": chart},
+    )
 
 
 async def get_watchlist_market_data(

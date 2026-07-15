@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from app.mcp import tools
 
@@ -6,20 +9,48 @@ from app.mcp import tools
 mcp = FastMCP(
     "Agentic Forex Desk",
     instructions=(
-        "This server retrieves financial data; it does not render charts or provide "
-        "technical analysis, forecasts, or trade recommendations. When the user asks "
-        "for a chart: call get_market_candles for the requested symbol, timeframe, and "
-        "range; verify complete, actual_start, actual_end, and candles_returned; then "
-        "render the chart and calculate requested indicators client-side. Never say a "
-        "chart was generated unless it is visibly rendered in the conversation. If the "
-        "client cannot render it, state that limitation. Never use Finnhub or FRED as a "
-        "TradeLocker execution price. For setup_required responses, give the setup_url "
+        "This server retrieves market data and provides a presentation-only chart component. "
+        "When a user requests a visible chart, first call get_market_candles, then calculate "
+        "any requested overlays, then call render_market_chart using the returned series_id. "
+        "Never claim that a chart is visible unless render_market_chart completed successfully. "
+        "get_market_candles alone does not produce a visible chart, and render_market_chart does "
+        "not retrieve data or calculate indicators. TradeLocker remains authoritative for "
+        "execution prices; Finnhub and FRED are context sources. This server does not provide "
+        "technical analysis, forecasts, or trade recommendations. For setup_required responses, give the setup_url "
         "to the user and ask them to connect with the same Auth0 account before retrying."
     ),
 )
 
 mcp.tool(tools.get_forex_watchlist)
 mcp.tool(tools.get_market_candles)
+mcp.tool(
+    tools.render_market_chart,
+    output_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string"}, "series_id": {"type": "string"},
+            "symbol": {"type": "string"}, "timeframe": {"type": "string"},
+            "source": {"type": "string"}, "chart_type": {"type": "string"},
+            "candles_rendered": {"type": "integer"},
+            "horizontal_overlays": {"type": "integer"},
+            "line_overlays": {"type": "integer"}, "markers": {"type": "integer"},
+            "complete": {"type": "boolean"},
+        },
+        "required": ["status"],
+    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta={
+        "ui": {"resourceUri": "ui://widget/market-chart-v1.html"},
+        "openai/outputTemplate": "ui://widget/market-chart-v1.html",
+        "openai/toolInvocation/invoking": "Rendering market chart…",
+        "openai/toolInvocation/invoked": "Market chart rendered.",
+    },
+)
 mcp.tool(tools.get_watchlist_market_data)
 mcp.tool(tools.get_economic_calendar)
 mcp.tool(tools.get_market_news)
@@ -45,5 +76,25 @@ mcp.tool(tools.get_tradelocker_accounts)
 mcp.tool(tools.get_tradelocker_config)
 mcp.tool(tools.get_tradelocker_symbols)
 mcp.tool(tools.get_tradelocker_quote)
+
+CHART_RESOURCE_URI = "ui://widget/market-chart-v1.html"
+WIDGET_ASSET = Path(__file__).resolve().parents[2] / "widget" / "dist" / "index.html"
+if not WIDGET_ASSET.is_file():
+    raise RuntimeError(
+        f"Market chart widget is not built. Run 'npm --prefix widget ci' and "
+        f"'npm --prefix widget run build' before starting the backend."
+    )
+WIDGET_HTML = WIDGET_ASSET.read_text(encoding="utf-8")
+
+
+@mcp.resource(
+    CHART_RESOURCE_URI,
+    name="market-chart-v1",
+    description="Presentation-only interactive OHLC market chart.",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"connectDomains": [], "resourceDomains": []}}},
+)
+def market_chart_resource() -> str:
+    return WIDGET_HTML
 
 mcp_app = mcp.http_app(path="/", stateless_http=True)

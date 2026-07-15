@@ -21,6 +21,7 @@ OAUTH_CHALLENGE = f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'
 TOOL_SCOPES = {
     "get_forex_watchlist": "forex:read",
     "get_market_candles": "forex:read",
+    "render_market_chart": "forex:read",
     "get_watchlist_market_data": "forex:read",
     "get_economic_calendar": "forex:read",
     "get_market_news": "forex:read",
