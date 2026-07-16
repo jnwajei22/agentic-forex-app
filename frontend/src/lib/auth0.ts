@@ -13,6 +13,6 @@ export const auth0 = new Auth0Client({
   signInReturnToPath: "/dashboard",
   authorizationParameters: {
     audience: process.env.AUTH0_AUDIENCE,
-    scope: "openid profile email forex:read forex:preview",
+    scope: "openid profile email forex:read forex:preview forex:execute",
   },
 });

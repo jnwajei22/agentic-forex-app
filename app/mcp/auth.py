@@ -32,6 +32,7 @@ TOOL_SCOPES = {
     "get_provider_capabilities": "forex:read",
     "review_forex_order": "forex:preview",
     "get_account_status": "forex:read",
+    "get_paper_account_status": "forex:read",
     "get_open_positions": "forex:read",
     "get_pending_orders": "forex:read",
     "get_trade_history": "forex:read",
@@ -47,6 +48,12 @@ TOOL_SCOPES = {
     "get_tradelocker_config": "forex:read",
     "get_tradelocker_symbols": "forex:read",
     "get_tradelocker_quote": "forex:read",
+    "get_autonomous_demo_status": "forex:read",
+    "get_autonomous_demo_snapshot": "forex:read",
+    "review_autonomous_demo_order": "forex:preview",
+    "submit_autonomous_demo_order": "forex:execute",
+    "record_autonomous_no_trade": "forex:preview",
+    "get_autonomous_run_result": "forex:read",
 }
 
 _jwks_clients: dict[str, PyJWKClient] = {}

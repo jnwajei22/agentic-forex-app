@@ -11,8 +11,18 @@ from pydantic import ValidationError
 from app.auth.identity import get_current_user_sub
 from app.brokers.tradelocker.adapter import get_tradelocker_adapter
 from app.brokers.tradelocker.client import TradeLockerError
+from app.brokers.paper.adapter import PaperBrokerAdapter
 from app.config.settings import settings
 from app.models.orders import OrderRequest
+from app.models.autonomous import (
+    AutonomousNoTradeRequest,
+    AutonomousOrderProposal,
+    AutonomousSubmissionRequest,
+)
+from app.models.tradelocker import (
+    TradeLockerAccountStatus,
+    TradeLockerAccountStatusError,
+)
 from app.models.chart_widget import RenderMarketChartRequest
 from app.services.market_data.librarian import (
     get_macro_results,
@@ -25,6 +35,11 @@ from app.services.providers.finnhub import FinnhubClient, capability_status
 from app.services.providers.fred import FredClient
 from app.services.market_data.series_cache import market_series_cache
 from app.services.trading.previews import create_order_preview
+from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
+from app.services.tradelocker.account_status import (
+    AccountStatusUnavailable,
+    TradeLockerAccountStatusService,
+)
 from app.services.watchlist import get_default_watchlist
 from app.storage.brokers import BrokerRepository, BrokerStorageError
 
@@ -389,14 +404,46 @@ async def get_forex_research_bundle(
 
 
 async def get_account_status() -> dict[str, Any]:
-    """Return current TradeLocker account state without cross-user caching."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
+    """Return normalized, labeled state for the authenticated user's selected TradeLocker account. This read-only tool never returns paper data or an unlabeled broker array, and a zero balance is valid."""
+    user_sub = get_current_user_sub()
+    if not user_sub:
+        return TradeLockerAccountStatusError(
+            error="authentication_required",
+            message="Authenticate with Agentic Forex Desk before requesting TradeLocker account status.",
+        ).model_dump(mode="json")
     try:
-        return await get_tradelocker_adapter().get_account()
+        result = await TradeLockerAccountStatusService().retrieve(user_sub)
+        return result.model_dump(mode="json")
+    except AccountStatusUnavailable as exc:
+        return TradeLockerAccountStatusError(
+            error=exc.code,
+            message=str(exc),
+            setup_url=_setup_url() if exc.code == "setup_required" else None,
+        ).model_dump(mode="json")
     except TradeLockerError as exc:
-        return _tradelocker_error(exc)
+        if exc.operation == "get_config":
+            return TradeLockerAccountStatusError(
+                error="account_field_mapping_unavailable",
+                message=(
+                    "TradeLocker account values could not be labeled because their field "
+                    "configuration is unavailable."
+                ),
+            ).model_dump(mode="json")
+        if exc.operation == "get_account_state":
+            return TradeLockerAccountStatusError(
+                error="account_state_unavailable",
+                message="TradeLocker account state is temporarily unavailable.",
+            ).model_dump(mode="json")
+        return TradeLockerAccountStatusError(
+            error="tradelocker_authentication_unavailable",
+            message="TradeLocker authentication or account verification failed.",
+        ).model_dump(mode="json")
+
+
+async def get_paper_account_status() -> dict[str, Any]:
+    """Return the isolated internal paper-account status; never return TradeLocker data."""
+    result = await PaperBrokerAdapter().get_account()
+    return {"schema_version": "1.0", "status": "ok", "source": "paper", **result}
 
 
 async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
@@ -493,6 +540,81 @@ def set_kill_switch(enabled: bool, reason: str) -> dict[str, Any]:
     changed = not settings.kill_switch_enabled
     settings.kill_switch_enabled = True
     return {"changed": changed, "kill_switch_enabled": True, "reason": reason, "message": "Kill switch enabled."}
+
+
+def _authenticated_user() -> str:
+    user_sub = get_current_user_sub()
+    if not user_sub:
+        raise AutonomousExecutionError(
+            "no_authenticated_user", "Authenticate before using autonomous-demo tools."
+        )
+    return user_sub
+
+
+async def get_autonomous_demo_status() -> dict[str, Any]:
+    """Read whether the authenticated user's selected account is ready for verified demo execution."""
+    try:
+        return await AutonomousDemoService().status(_authenticated_user())
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
+
+
+async def get_autonomous_demo_snapshot() -> dict[str, Any]:
+    """Create an immutable five-minute account, provider, and TradeLocker market snapshot; this does not submit an order."""
+    try:
+        return await AutonomousDemoService().snapshot(_authenticated_user())
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
+
+
+async def review_autonomous_demo_order(
+    snapshot_id: str, pair: str, side: Literal["long", "short"],
+    order_type: Literal["market", "limit"], entry: float,
+    stop_loss: float, take_profit: float,
+    reason_codes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create an immutable server-sized preview for the authenticated user's verified TradeLocker demo account; this does not submit."""
+    try:
+        proposal = AutonomousOrderProposal(
+            snapshot_id=snapshot_id, pair=pair, side=side, order_type=order_type,
+            entry=entry, stop_loss=stop_loss, take_profit=take_profit,
+            reason_codes=reason_codes or [],
+        )
+        return await AutonomousDemoService().review(_authenticated_user(), proposal)
+    except ValidationError as exc:
+        return {"schema_version": "1.0", "status": "rejected", "error": "invalid_proposal", "message": "The order proposal schema is invalid.", "violations": [item["type"] for item in exc.errors()]}
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
+
+
+async def submit_autonomous_demo_order(preview_id: str, idempotency_key: str) -> dict[str, Any]:
+    """Submit one risk-approved order to the authenticated user's verified TradeLocker demo account. This consequential broker-side write cannot target a live account."""
+    try:
+        request = AutonomousSubmissionRequest(preview_id=preview_id, idempotency_key=idempotency_key)
+        return await AutonomousDemoService().submit(_authenticated_user(), request.preview_id, request.idempotency_key)
+    except ValidationError:
+        return {"schema_version": "1.0", "status": "rejected", "error": "invalid_submission", "message": "Only a valid preview ID and idempotency key are accepted."}
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
+
+
+async def record_autonomous_no_trade(snapshot_id: str, reason_codes: list[str], pairs_evaluated: list[str]) -> dict[str, Any]:
+    """Persist a deliberate no-trade decision for an owned fresh snapshot; this never contacts TradeLocker order endpoints."""
+    try:
+        request = AutonomousNoTradeRequest(snapshot_id=snapshot_id, reason_codes=reason_codes, pairs_evaluated=pairs_evaluated)
+        return await AutonomousDemoService().record_no_trade(_authenticated_user(), request.snapshot_id, request.reason_codes, request.pairs_evaluated)
+    except ValidationError:
+        return {"schema_version": "1.0", "status": "rejected", "error": "invalid_no_trade_record", "message": "The no-trade record schema is invalid."}
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
+
+
+def get_autonomous_run_result(run_id: str | None = None) -> dict[str, Any]:
+    """Read the latest or requested autonomous-demo audit result for the authenticated user."""
+    try:
+        return AutonomousDemoService().run_result(_authenticated_user(), run_id)
+    except AutonomousExecutionError as exc:
+        return exc.as_dict()
 
 
 def get_provider_capabilities() -> dict[str, Any]:

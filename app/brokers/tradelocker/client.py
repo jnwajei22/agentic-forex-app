@@ -53,7 +53,7 @@ def _not_implemented(operation: str) -> dict[str, str]:
 
 
 class TradeLockerClient:
-    """Async client containing only documented TradeLocker read operations."""
+    """Async client for documented TradeLocker account and order operations."""
 
     def __init__(
         self,
@@ -81,6 +81,7 @@ class TradeLockerClient:
         self._access_token: str | None = None
         self._token_expires_at = 0.0
         self._login_lock = asyncio.Lock()
+        self.token_refresh_count = 0
 
     async def __aenter__(self) -> "TradeLockerClient":
         return self
@@ -136,6 +137,7 @@ class TradeLockerClient:
         async with self._login_lock:
             if not force and self._access_token and time.time() < self._token_expires_at - 30:
                 return self._access_token
+            replacing_token = force and self._access_token is not None
             payload = await self._request(
                 "POST", "/auth/jwt/token", operation="login", auth=False, json=self._credentials()
             )
@@ -146,6 +148,8 @@ class TradeLockerClient:
                 )
             self._access_token = token
             self._token_expires_at = self._token_expiry(token, payload)
+            if replacing_token:
+                self.token_refresh_count += 1
             return token
 
     @staticmethod
@@ -196,6 +200,9 @@ class TradeLockerClient:
             headers["Authorization"] = f"Bearer {await self.login()}"
         try:
             response = await self._http.request(method, path, headers=headers, **kwargs)
+            if auth and response.status_code == 401:
+                headers["Authorization"] = f"Bearer {await self.login(force=True)}"
+                response = await self._http.request(method, path, headers=headers, **kwargs)
             response.raise_for_status()
             return response.json()
         except httpx.TimeoutException as exc:
@@ -258,10 +265,11 @@ class TradeLockerClient:
             safe_records.append(safe_record)
         return {"accounts": safe_records}
 
-    async def get_account_status(self) -> Any:
+    async def get_account_state_payload(self) -> Any:
+        """Fetch the internal positional state payload; callers must map it with /trade/config."""
         return await self._optional_get(
             self._account_path("state"),
-            operation="get_account_status",
+            operation="get_account_state",
             headers=self._account_headers(),
         )
 
@@ -298,7 +306,7 @@ class TradeLockerClient:
                     return rows
         return []
 
-    async def _resolve_instrument(self, symbol: str) -> tuple[Any, Any]:
+    async def resolve_instrument(self, symbol: str, *, route_type: str = "INFO") -> tuple[Any, Any, dict[str, Any]]:
         payload = await self.get_symbols()
         if isinstance(payload, dict) and payload.get("status") == "not_implemented":
             raise TradeLockerError(
@@ -311,18 +319,54 @@ class TradeLockerClient:
                 continue
             instrument_id = row.get("tradableInstrumentId", row.get("id"))
             routes = row.get("routes", [])
-            info_route = next(
+            route_id = next(
                 (
                     route.get("id", route.get("routeId"))
                     for route in routes
-                    if isinstance(route, dict) and str(route.get("type", "")).upper() == "INFO"
+                    if isinstance(route, dict) and str(route.get("type", "")).upper() == route_type.upper()
                 ),
                 row.get("routeId"),
             )
-            if instrument_id is not None and info_route is not None:
-                return instrument_id, info_route
+            if instrument_id is not None and route_id is not None:
+                return instrument_id, route_id, row
         raise TradeLockerError(
             "resolve_symbol", "The requested TradeLocker symbol was not found.", code="symbol_not_found"
+        )
+
+    async def _resolve_instrument(self, symbol: str) -> tuple[Any, Any]:
+        instrument_id, route_id, _ = await self.resolve_instrument(symbol)
+        return instrument_id, route_id
+
+    async def get_instrument_details(self, symbol: str) -> dict[str, Any]:
+        instrument_id, info_route, listing = await self.resolve_instrument(symbol, route_type="INFO")
+        payload = await self._optional_get(
+            f"/trade/instruments/{instrument_id}", operation="get_instrument_details",
+            headers=self._account_headers(), params={"routeId": info_route},
+        )
+        if not isinstance(payload, dict):
+            raise TradeLockerError("get_instrument_details", "TradeLocker instrument metadata is unusable.", code="invalid_response")
+        return {"instrument_id": instrument_id, "info_route_id": info_route, "listing": listing, "details": payload}
+
+    async def get_orders_history(self) -> Any:
+        return await self._optional_get(
+            self._account_path("ordersHistory"), operation="get_orders_history",
+            headers=self._account_headers(),
+        )
+
+    async def place_order(self, order: dict[str, Any]) -> Any:
+        """Place one order. Callers must provide a server-validated immutable payload."""
+        allowed = {
+            "qty", "routeId", "side", "validity", "type", "tradableInstrumentId",
+            "price", "stopLoss", "stopLossType", "takeProfit", "takeProfitType", "strategyId",
+        }
+        if set(order) - allowed:
+            raise TradeLockerError("place_order", "The TradeLocker order contains unsupported fields.", code="invalid_order")
+        required = {"qty", "routeId", "side", "validity", "type", "tradableInstrumentId", "stopLoss", "takeProfit"}
+        if not required.issubset(order):
+            raise TradeLockerError("place_order", "The TradeLocker order is incomplete.", code="invalid_order")
+        return await self._request(
+            "POST", self._account_path("orders"), operation="place_order",
+            headers=self._account_headers(), json=order,
         )
 
     async def get_quote(self, symbol: str) -> Any:

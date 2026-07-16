@@ -51,11 +51,34 @@ async def test_login_is_cached_and_account_reads_are_authenticated():
         raise AssertionError(f"Unexpected request: {request.url.path}")
 
     async with _client(handler) as client:
-        assert await client.get_account_status() == {"balance": 1000.0}
+        assert await client.get_account_state_payload() == {"balance": 1000.0}
         assert await client.get_open_positions() == {"d": [[1, "EURUSD"]]}
         assert await client.get_orders() == {"d": []}
 
     assert calls["login"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_account_read_refreshes_token_once_without_changing_account():
+    calls = {"login": 0, "state": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/jwt/token"):
+            calls["login"] += 1
+            return httpx.Response(201, json={"accessToken": _token()})
+        if request.url.path.endswith("/state"):
+            calls["state"] += 1
+            if calls["state"] == 1:
+                return httpx.Response(401, json={"error": "expired"})
+            assert request.headers["accnum"] == "2"
+            return httpx.Response(200, json={"d": {"accountDetailsData": []}})
+        raise AssertionError(f"Unexpected request: {request.url.path}")
+
+    async with _client(handler) as client:
+        assert await client.get_account_state_payload() == {"d": {"accountDetailsData": []}}
+        assert client.account_id == "12345" and client.account_number == "2"
+        assert client.token_refresh_count == 1
+    assert calls == {"login": 2, "state": 2}
 
 
 @pytest.mark.asyncio
@@ -77,6 +100,41 @@ async def test_config_accounts_and_symbols_use_documented_read_routes():
             "accounts": [{"accountId": 12345, "accNum": 2}]
         }
         assert await client.get_symbols() == {"instruments": []}
+
+
+@pytest.mark.asyncio
+async def test_place_order_uses_account_route_header_and_atomic_protections():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/jwt/token"):
+            return httpx.Response(201, json={"accessToken": _token()})
+        captured["path"] = request.url.path
+        captured["headers"] = dict(request.headers)
+        captured["body"] = __import__("json").loads(request.content)
+        return httpx.Response(200, json={"orderId": "order-1"})
+
+    order = {
+        "qty": 0.01, "routeId": "trade-route", "side": "buy", "validity": "IOC",
+        "type": "market", "tradableInstrumentId": 42, "price": 0,
+        "stopLoss": 1.09, "stopLossType": "absolute",
+        "takeProfit": 1.12, "takeProfitType": "absolute", "strategyId": "afd-test",
+    }
+    async with _client(handler) as client:
+        assert await client.place_order(order) == {"orderId": "order-1"}
+    assert captured["path"].endswith("/trade/accounts/12345/orders")
+    assert captured["headers"]["accnum"] == "2"
+    assert captured["body"]["stopLossType"] == "absolute"
+    assert captured["body"]["takeProfitType"] == "absolute"
+
+
+@pytest.mark.asyncio
+async def test_place_order_rejects_caller_account_override_before_network():
+    client = _client(lambda request: (_ for _ in ()).throw(AssertionError("network called")))
+    with pytest.raises(TradeLockerError) as error:
+        await client.place_order({"accountId": "other"})
+    await client.aclose()
+    assert error.value.code == "invalid_order"
 
 
 @pytest.mark.asyncio

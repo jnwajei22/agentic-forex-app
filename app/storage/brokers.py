@@ -16,12 +16,24 @@ class BrokerStorageError(RuntimeError):
 
 @dataclass(frozen=True)
 class BrokerConnection:
+    connection_id: str
     base_url: str
     username: str
     password: str = field(repr=False)
     server: str
     account_id: str | None
     account_number: str | None
+    environment: str
+
+
+def infer_tradelocker_environment(base_url: str) -> str:
+    lowered = base_url.lower()
+    if "live.tradelocker" in lowered:
+        return "live"
+    if "demo.tradelocker" in lowered:
+        return "demo"
+    configured = settings.tradelocker_environment.lower()
+    return configured if configured in {"demo", "live"} else "demo"
 
 
 class BrokerRepository:
@@ -58,12 +70,24 @@ class BrokerRepository:
                     server TEXT NOT NULL,
                     account_id TEXT,
                     account_number TEXT,
+                    environment TEXT NOT NULL DEFAULT 'demo' CHECK(environment IN ('demo', 'live')),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
                 """
             )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(broker_connections)")
+            }
+            if "environment" not in columns:
+                connection.execute(
+                    "ALTER TABLE broker_connections ADD COLUMN environment TEXT NOT NULL DEFAULT 'demo'"
+                )
+                connection.execute(
+                    """UPDATE broker_connections SET environment = 'live'
+                       WHERE lower(base_url) LIKE '%live.tradelocker%'"""
+                )
 
     def _fernet(self) -> Fernet:
         if not self.secret:
@@ -94,30 +118,38 @@ class BrokerRepository:
         username: str,
         password: str,
         server: str,
+        environment: str | None = None,
         email: str | None = None,
     ) -> None:
         user_id = self.ensure_user(auth0_sub, email)
+        resolved_environment = (environment or infer_tradelocker_environment(base_url)).lower()
+        if resolved_environment not in {"demo", "live"}:
+            raise BrokerStorageError("TradeLocker environment must be 'demo' or 'live'.")
         encrypted = self._fernet().encrypt(password.encode())
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO broker_connections(
                        user_id, provider, base_url, username, password_encrypted, server,
-                       created_at, updated_at
-                   ) VALUES (?, 'tradelocker', ?, ?, ?, ?, ?, ?)
+                       environment, created_at, updated_at
+                   ) VALUES (?, 'tradelocker', ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET
                        base_url = excluded.base_url, username = excluded.username,
                        password_encrypted = excluded.password_encrypted,
-                       server = excluded.server, account_id = NULL, account_number = NULL,
+                       server = excluded.server, environment = excluded.environment,
+                       account_id = NULL, account_number = NULL,
                        updated_at = excluded.updated_at""",
-                (user_id, base_url.rstrip("/"), username, encrypted, server, now, now),
+                (
+                    user_id, base_url.rstrip("/"), username, encrypted, server,
+                    resolved_environment, now, now,
+                ),
             )
 
     def get_connection(self, auth0_sub: str) -> BrokerConnection | None:
         with self._connect() as connection:
             row = connection.execute(
-                """SELECT b.base_url, b.username, b.password_encrypted, b.server,
-                          b.account_id, b.account_number
+                """SELECT b.id, b.base_url, b.username, b.password_encrypted, b.server,
+                          b.account_id, b.account_number, b.environment
                    FROM broker_connections b JOIN users u ON u.id = b.user_id
                    WHERE u.auth0_sub = ? AND b.provider = 'tradelocker'""",
                 (auth0_sub,),
@@ -129,9 +161,10 @@ class BrokerRepository:
         except InvalidToken as exc:
             raise BrokerStorageError("Stored broker credentials cannot be decrypted.") from None
         return BrokerConnection(
-            base_url=row["base_url"], username=row["username"], password=password,
+            connection_id=str(row["id"]), base_url=row["base_url"],
+            username=row["username"], password=password,
             server=row["server"], account_id=row["account_id"],
-            account_number=row["account_number"],
+            account_number=row["account_number"], environment=row["environment"],
         )
 
     def select_account(self, auth0_sub: str, account_id: str, account_number: str) -> bool:
@@ -156,7 +189,7 @@ class BrokerRepository:
     def status(self, auth0_sub: str) -> dict:
         with self._connect() as connection:
             row = connection.execute(
-                """SELECT b.username, b.server, b.account_id, b.account_number
+                """SELECT b.username, b.server, b.account_id, b.account_number, b.environment
                    FROM broker_connections b JOIN users u ON u.id = b.user_id
                    WHERE u.auth0_sub = ? AND b.provider = 'tradelocker'""",
                 (auth0_sub,),
@@ -169,6 +202,7 @@ class BrokerRepository:
             "connected": True,
             "selected_account": ({
                 "server": row["server"],
+                "environment": row["environment"],
                 "account_id": row["account_id"],
                 "account_number": row["account_number"],
             } if selected else None),

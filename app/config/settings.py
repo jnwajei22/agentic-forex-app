@@ -36,11 +36,20 @@ class Settings(BaseSettings):
 
     tradelocker_environment: str = "demo"
     tradelocker_base_url: str = "https://demo.tradelocker.com/backend-api"
+    tradelocker_demo_base_url: str = "https://demo.tradelocker.com/backend-api"
     tradelocker_username: str | None = None
     tradelocker_password: str | None = None
     tradelocker_server: str | None = None
     tradelocker_account_id: str | None = None
     tradelocker_account_number: str | None = None
+    tradelocker_config_cache_ttl_seconds: int = 900
+
+    autonomous_snapshot_ttl_seconds: int = 300
+    autonomous_preview_ttl_seconds: int = 180
+    autonomous_quote_max_age_seconds: int = 30
+    autonomous_price_tolerance_percent: float = 0.25
+    autonomous_max_spread_pips: float = 3.0
+    autonomous_news_blackout_minutes: int = 30
 
     finnhub_enabled: bool = False
     finnhub_api_key: str | None = None

@@ -5,6 +5,7 @@ from app.auth.identity import get_current_user_sub
 from app.storage.brokers import BrokerRepository, BrokerStorageError
 from app.models.orders import OrderPreview
 from app.services.market_data.history import PaginatedCandleResult
+from app.services.tradelocker.account_status import TradeLockerAccountStatusService
 
 
 class TradeLockerAdapter(BrokerAdapter):
@@ -19,7 +20,12 @@ class TradeLockerAdapter(BrokerAdapter):
         )
 
     async def get_account(self) -> dict:
-        return await self.client.get_account_status()
+        user_sub = get_current_user_sub()
+        if not user_sub:
+            raise TradeLockerError(
+                "get_account", "An authenticated user is required.", code="authentication_required"
+            )
+        return (await TradeLockerAccountStatusService().retrieve(user_sub)).model_dump(mode="json")
 
     async def get_open_positions(self) -> list[dict] | dict:
         return await self.client.get_open_positions()

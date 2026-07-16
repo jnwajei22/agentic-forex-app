@@ -11,7 +11,7 @@ If OAuth is required and `AUTH_ISSUER` is empty, the protected-resource metadata
 For Auth0:
 
 1. Create an API with the identifier (audience) `https://mcp.justinnwajei.com`, or use another audience and set `AUTH_AUDIENCE` to it.
-2. Add API permissions named `forex:read` and `forex:preview`.
+2. Add API permissions named `forex:read`, `forex:preview`, and `forex:execute`.
 3. Create or configure an application that ChatGPT can use with OAuth authorization code flow and PKCE. Add the callback URL shown by ChatGPT when creating the connector.
 4. Ensure issued access tokens are JWTs, include the granted permissions in the `scope` claim, and use an asymmetric signing algorithm such as RS256.
 5. Use the provider's exact issuer URL, including a trailing slash when the provider publishes one.
@@ -40,7 +40,7 @@ The public protected-resource metadata document is available at:
 https://mcp.justinnwajei.com/.well-known/oauth-protected-resource
 ```
 
-It identifies the Agentic Forex Desk authorization server and the supported `forex:read` and `forex:preview` scopes. The server stores ChatGPT's authorization request in SQLite while Auth0 establishes the portal identity and TradeLocker onboarding completes. Only the **Use with ChatGPT** action causes Agentic Forex Desk to issue a short-lived authorization code. ChatGPT exchanges that code at the Agentic Forex Desk token endpoint using the original PKCE verifier. An unauthenticated request to `/mcp/` receives a `401` response pointing ChatGPT to that metadata document through `WWW-Authenticate`.
+It identifies the Agentic Forex Desk authorization server and the supported `forex:read`, `forex:preview`, and `forex:execute` scopes. The server stores ChatGPT's authorization request in SQLite while Auth0 establishes the portal identity and TradeLocker onboarding completes. Only the **Use with ChatGPT** action causes Agentic Forex Desk to issue a short-lived authorization code. ChatGPT exchanges that code at the Agentic Forex Desk token endpoint using the original PKCE verifier. An unauthenticated request to `/mcp/` receives a `401` response pointing ChatGPT to that metadata document through `WWW-Authenticate`.
 
 The authorization-server metadata advertises Client ID Metadata Documents (CIMD) as the preferred client-identification mechanism. When ChatGPT supplies an HTTPS CIMD URL as `client_id`, the backend fetches it with a short timeout and response-size limit, rejects unsafe network destinations and redirects, validates the exact callback URI and public-client `none` method, and briefly caches the validated document. `OAUTH_ALLOWED_CLIENT_IDS` is only an optional compatibility allowlist for predefined static clients; arbitrary static IDs are rejected. No dynamic registration endpoint is advertised.
 
@@ -52,7 +52,7 @@ In ChatGPT, enable developer mode for connectors/apps if your plan and workspace
 https://mcp.justinnwajei.com/mcp/
 ```
 
-Choose OAuth and enter the client/provider values requested by ChatGPT. Request both `forex:read` and `forex:preview` so all connector tools are available. The server exposes canonical market candles, bounded watchlist data, optional Finnhub calendar/news, optional FRED macro data, and read-only TradeLocker account data.
+Choose OAuth and enter the client/provider values requested by ChatGPT. Request `forex:read`, `forex:preview`, and `forex:execute` so all connector tools are available. The execute scope is required only for the consequential TradeLocker demo submission tool.
 
 TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_URL`, `TRADELOCKER_USERNAME`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`, then run `get_tradelocker_accounts`. Copy the returned `accountId` and `accNum` into `TRADELOCKER_ACCOUNT_ID` and `TRADELOCKER_ACCOUNT_NUMBER` before using account-specific config, status, positions, symbols, quotes, or candles. Discovery never returns the configured password or TradeLocker tokens.
 
@@ -63,6 +63,8 @@ TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_UR
 TradeLocker execution submission tools are intentionally not registered with the MCP server.
 
 TradeLocker is the default and authoritative source for `get_market_candles`. Finnhub forex candles must be selected explicitly and remain secondary context. No provider failure triggers an implicit fallback.
+
+`get_account_status` is always the current authenticated user's selected TradeLocker account. It loads the matching account configuration, labels the positional account-state values, preserves legitimate zero balances, and fails closed if the field mapping cannot be verified. Internal paper state is available only through the separately named `get_paper_account_status` tool.
 
 For a visible chart, ChatGPT must call `get_market_candles`, verify completeness metadata, calculate requested overlays, and call `render_market_chart` with the returned `series_id`. `get_market_candles` alone does not display a chart. The result opens a locally bundled interactive snapshot in a ChatGPT iframe through `ui/notifications/tool-result`; it does not poll after the call. The backend has no chart route, image generation, or chart filesystem storage.
 
@@ -75,6 +77,8 @@ npm --prefix widget run build
 ```
 
 Include `widget/dist/index.html` in the backend deployment artifact. After deployment, refresh or reconnect the ChatGPT app so it reloads the tool schema and versioned UI resource. Automatic refresh and multi-pane indicators are later phases.
+
+The backend performs a small automatic SQLite migration that adds the stored TradeLocker environment for existing connections. Standard `live.tradelocker.com` connections are backfilled as live; other existing rows retain demo and should be reconnected if they use a custom live base URL. Redeploy the Vercel frontend so future onboarding requests send `environment` explicitly.
 
 ## Vercel frontend and multi-user broker storage
 

@@ -16,7 +16,7 @@ from app.auth.onboarding import current_onboarding_claims, transaction_digest
 router = APIRouter(tags=["oauth"])
 logger = logging.getLogger(__name__)
 ALLOWED_CALLBACK_ORIGINS = {"https://chatgpt.com", "https://chat.openai.com"}
-ALLOWED_SCOPES = {"openid", "profile", "email", "forex:read", "forex:preview"}
+ALLOWED_SCOPES = {"openid", "profile", "email", "forex:read", "forex:preview", "forex:execute"}
 
 
 def oauth_repository() -> OAuthRepository:

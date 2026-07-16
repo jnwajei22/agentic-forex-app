@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 import logging
 import uuid
 
@@ -16,7 +16,11 @@ from app.models.onboarding import (
     TradeLockerConnectionStatus,
     TradeLockerOnboardingStatus,
 )
+from app.models.autonomous import ExecutionMode, ExecutionSettingsUpdate
+from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
+from app.storage.execution import ExecutionRepository
 from app.auth.identity import normalize_auth0_subject
+from app.services.tradelocker.config_cache import tradelocker_config_cache
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -31,6 +35,7 @@ class TradeLockerCredentials(BaseModel):
     username: str
     password: str = Field(repr=False)
     server: str
+    environment: Literal["demo", "live"] | None = None
 
 
 class AccountSelection(BaseModel):
@@ -142,6 +147,7 @@ async def validated_onboarding_status(user_sub: str) -> TradeLockerOnboardingSta
             account_id=connection.account_id,
             account_number=connection.account_number,
             server=connection.server,
+            environment=connection.environment,
         ),
     )
 
@@ -162,8 +168,10 @@ async def save_credentials(
         return _discovery_error_response(exc, request_id, "save_credentials")
     repository().save_connection(
         claims["sub"], base_url=payload.base_url, username=payload.username,
-        password=payload.password, server=payload.server, email=claims.get("email"),
+        password=payload.password, server=payload.server, environment=payload.environment,
+        email=claims.get("email"),
     )
+    tradelocker_config_cache.invalidate_user(claims["sub"])
     return TradeLockerOnboardingStatus(
         status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
         connected=True,
@@ -232,6 +240,7 @@ async def select_account(
             status=TradeLockerConnectionStatus.NOT_CONNECTED,
             connected=False,
         ).model_dump(mode="json")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
     connection = repository().get_connection(claims["sub"])
     return TradeLockerOnboardingStatus(
         status=TradeLockerConnectionStatus.READY,
@@ -240,6 +249,7 @@ async def select_account(
             account_id=payload.account_id,
             account_number=payload.account_number,
             server=connection.server if connection else "TradeLocker",
+            environment=connection.environment if connection else None,
         ),
     ).model_dump(mode="json")
 
@@ -247,4 +257,40 @@ async def select_account(
 @router.delete("/broker/tradelocker")
 async def delete_broker(claims: dict = Depends(current_claims)) -> dict:
     repository().delete_connection(claims["sub"])
+    tradelocker_config_cache.invalidate_user(claims["sub"])
     return {"status": "deleted", "provider": "tradelocker"}
+
+
+@router.get("/broker/tradelocker/execution-settings")
+async def get_execution_settings(claims: dict = Depends(current_claims)) -> dict:
+    connection = repository().get_connection(claims["sub"])
+    if not connection or not connection.account_id or not connection.account_number:
+        raise HTTPException(status_code=409, detail="Select a TradeLocker account first.")
+    value = ExecutionRepository().get_or_create_settings(
+        claims["sub"], connection.connection_id, connection.account_id, connection.account_number
+    )
+    return {
+        "execution_mode": value["execution_mode"], "account_id": connection.account_id,
+        "acc_num": connection.account_number, "environment": connection.environment,
+        "strategy_name": value["strategy_name"], "strategy_version": value["strategy_version"],
+    }
+
+
+@router.put("/broker/tradelocker/execution-settings")
+async def update_execution_settings(
+    payload: ExecutionSettingsUpdate, claims: dict = Depends(current_claims)
+) -> dict:
+    try:
+        context = await AutonomousDemoService().context(claims["sub"], require_mode=False)
+    except AutonomousExecutionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    value = ExecutionRepository().set_mode(
+        claims["sub"], context.connection_id, context.account_id, context.acc_num,
+        payload.execution_mode,
+    )
+    logger.info(
+        "TradeLocker execution_mode_changed user_id=%s connection_id=%s account_id=%s acc_num=%s environment=demo mode=%s",
+        claims["sub"], context.connection_id, context.account_id, context.acc_num,
+        payload.execution_mode.value,
+    )
+    return {"status": "updated", "execution_mode": value["execution_mode"], "environment": "demo"}

@@ -27,11 +27,14 @@ When a user asks for a chart:
 
 - `get_market_candles`: canonical TradeLocker or explicitly selected Finnhub OHLCV.
 - `render_market_chart`: displays a cached series in the versioned interactive MCP Apps resource; it retrieves no data and calculates no indicators.
+- `get_account_status`: returns only the authenticated user's selected TradeLocker account as a stable, labeled schema. It maps positional state values using that account's `/trade/config`; zero balances remain valid.
+- `get_paper_account_status`: returns the explicitly separate internal paper-account state and never substitutes for TradeLocker.
 - `get_watchlist_market_data`: bounded close-only or selected-field TradeLocker series without ranking.
 - `get_economic_calendar`, `get_market_news`: optional Finnhub data.
 - `search_macro_series`, `get_macro_series`, `get_macro_release_calendar`: official FRED data.
 - `get_forex_research_bundle`: bounded sections kept separate by source.
 - TradeLocker connection, account, quote, symbols, positions, pending orders, preview, and kill-switch tools.
+- Verified TradeLocker demo execution tools with immutable snapshots/previews, server-side sizing, durable idempotency, and reconciliation. See [docs/tradelocker-demo-execution.md](docs/tradelocker-demo-execution.md).
 
 Example:
 
@@ -59,6 +62,8 @@ FRED keys are obtained from the St. Louis Fed API key page. Enable it with `FRED
 
 Both public providers use isolated in-process TTL caches. Successful market series are cached for ten minutes by authenticated user and cryptographic `series_id`, with a default global maximum of 100 entries. Credentials and authorization data are never cached. A persistent cache can replace the isolated interface later.
 
+TradeLocker account-field configuration is cached for 15 minutes by Auth0 user, environment, server, account ID, and account number. The cache is invalidated when credentials are replaced, an account is selected, or the connection is removed. Account status fails closed instead of returning an unlabeled positional array when the mapping cannot be verified.
+
 ## Deployment
 
 Build and test the locally bundled widget before starting or packaging the backend:
@@ -69,9 +74,9 @@ npm --prefix widget test
 npm --prefix widget run build
 ```
 
-Then install backend dependencies with `pip install -r requirements.txt` and restart the backend. Startup fails clearly if `widget/dist/index.html` is missing. No database migration is required. Disconnect and reconnect (or refresh) the ChatGPT app after deployment so it discovers the new tool metadata and `ui://widget/market-chart-v1.html` resource.
+Then install backend dependencies with `pip install -r requirements.txt` and restart the backend. Startup fails clearly if `widget/dist/index.html` is missing. On first startup, SQLite automatically adds the TradeLocker connection environment column and infers existing standard live URLs; no manual migration command is required. Disconnect and reconnect (or refresh) the ChatGPT app after deployment so it discovers the updated account-status schema and tools.
 
-The Vercel onboarding frontend is unchanged; only the backend artifact now includes the built widget HTML. For Raspberry Pi deployments, keep system time synchronized, protect `.env`, use persistent PostgreSQL as already supported, and expect in-process caches to clear on restart.
+Redeploy the Vercel onboarding frontend because it now sends the selected TradeLocker environment explicitly. For Raspberry Pi deployments, keep system time synchronized, protect `.env`, use persistent PostgreSQL as already supported, and expect in-process caches to clear on restart.
 
 Live trading remains disabled and the kill switch enabled:
 
@@ -80,4 +85,4 @@ LIVE_TRADING_ENABLED=false
 KILL_SWITCH_ENABLED=true
 ```
 
-The backend does not implement autonomous execution, a Pine interpreter, a strategy engine, or a backtester.
+The backend implements only the explicitly enabled, account-scoped TradeLocker **demo** execution workflow documented above. It does not implement live autonomous execution, scheduling, a Pine interpreter, strategy optimization, or a backtester.

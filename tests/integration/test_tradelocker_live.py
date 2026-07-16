@@ -30,6 +30,6 @@ async def test_real_tradelocker_read_only_account_status():
         account_id=settings.tradelocker_account_id,
         account_number=settings.tradelocker_account_number,
     ) as client:
-        result = await client.get_account_status()
+        result = await client.get_account_state_payload()
 
     assert result is not None

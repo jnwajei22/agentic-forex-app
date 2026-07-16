@@ -11,6 +11,10 @@ from app.config.settings import settings
 from app.main import app
 from app.mcp import tools
 from app.storage.brokers import BrokerRepository
+from app.services.tradelocker.config_cache import (
+    TradeLockerConfigCacheKey,
+    tradelocker_config_cache,
+)
 
 
 @pytest.fixture
@@ -83,6 +87,25 @@ def test_password_is_encrypted_at_rest(platform_storage):
 
     assert password.encode() not in encrypted
     assert platform_storage.get_connection("auth0|user-a").password == password
+
+
+def test_select_account_invalidates_user_scoped_config_cache(platform_storage):
+    platform_storage.save_connection(
+        "auth0|user-a", base_url="https://demo.tradelocker.com/backend-api",
+        username="user-a", password="secret", server="HEROFX",
+    )
+    key = TradeLockerConfigCacheKey("auth0|user-a", "demo", "HEROFX", "old", "1")
+    tradelocker_config_cache.put(key, {"d": {}})
+    try:
+        with _client_for("auth0|user-a") as client:
+            response = client.post(
+                "/api/broker/tradelocker/select-account",
+                json={"account_id": "new", "account_number": "2"},
+            )
+        assert response.status_code == 200
+        assert tradelocker_config_cache.get(key) is None
+    finally:
+        tradelocker_config_cache.clear()
 
 
 def test_saved_credentials_discover_accounts_without_returning_secrets(

@@ -20,6 +20,7 @@ export default function ConnectTradeLockerForm({ returnTo, onboarding = false, i
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         base_url: environment === "live" ? "https://live.tradelocker.com/backend-api" : "https://demo.tradelocker.com/backend-api",
+        environment,
         username: form.get("username"), password: form.get("password"), server: form.get("server"),
       }),
     }).catch(() => null);

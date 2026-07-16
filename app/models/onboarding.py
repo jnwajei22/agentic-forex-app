@@ -1,6 +1,7 @@
 from enum import StrEnum
 
 from pydantic import BaseModel
+from typing import Literal
 
 
 class TradeLockerConnectionStatus(StrEnum):
@@ -16,6 +17,7 @@ class SelectedTradeLockerAccount(BaseModel):
     account_id: str
     account_number: str
     server: str
+    environment: Literal["demo", "live"] | None = None
 
 
 class TradeLockerOnboardingStatus(BaseModel):

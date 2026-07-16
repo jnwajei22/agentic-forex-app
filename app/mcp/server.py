@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.mcp import tools
+from app.models.tradelocker import TRADELOCKER_ACCOUNT_STATUS_OUTPUT_SCHEMA
 
 
 mcp = FastMCP(
@@ -61,14 +62,56 @@ mcp.tool(tools.get_forex_research_bundle)
 mcp.tool(tools.get_provider_capabilities)
 mcp.tool(tools.review_forex_order)
 mcp.tool(tools.set_kill_switch)
-mcp.tool(tools.get_account_status)
+mcp.tool(
+    tools.get_autonomous_demo_status,
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+)
+mcp.tool(
+    tools.get_autonomous_demo_snapshot,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+)
+mcp.tool(
+    tools.review_autonomous_demo_order,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+)
+mcp.tool(
+    tools.submit_autonomous_demo_order,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True),
+)
+mcp.tool(
+    tools.record_autonomous_no_trade,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+mcp.tool(
+    tools.get_autonomous_run_result,
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+mcp.tool(
+    tools.get_account_status,
+    output_schema=TRADELOCKER_ACCOUNT_STATUS_OUTPUT_SCHEMA,
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=True
+    ),
+)
+mcp.tool(
+    tools.get_paper_account_status,
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    ),
+)
 mcp.tool(tools.get_open_positions)
 mcp.tool(tools.get_pending_orders)
 mcp.tool(tools.get_trade_history)
 mcp.tool(tools.get_tradelocker_connection_status)
 mcp.tool(tools.get_my_broker_connection_status)
 mcp.tool(tools.get_my_tradelocker_accounts)
-mcp.tool(tools.get_my_tradelocker_account_status)
+mcp.tool(
+    tools.get_my_tradelocker_account_status,
+    output_schema=TRADELOCKER_ACCOUNT_STATUS_OUTPUT_SCHEMA,
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=True
+    ),
+)
 mcp.tool(tools.get_my_tradelocker_symbols)
 mcp.tool(tools.get_my_tradelocker_quote)
 mcp.tool(tools.get_my_tradelocker_candles)

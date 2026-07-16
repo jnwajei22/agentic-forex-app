@@ -34,6 +34,7 @@ EXPECTED_TOOLS = {
     "review_forex_order",
     "set_kill_switch",
     "get_account_status",
+    "get_paper_account_status",
     "get_open_positions",
     "get_pending_orders",
     "get_trade_history",
@@ -48,6 +49,12 @@ EXPECTED_TOOLS = {
     "get_tradelocker_config",
     "get_tradelocker_symbols",
     "get_tradelocker_quote",
+    "get_autonomous_demo_status",
+    "get_autonomous_demo_snapshot",
+    "review_autonomous_demo_order",
+    "submit_autonomous_demo_order",
+    "record_autonomous_no_trade",
+    "get_autonomous_run_result",
 }
 INITIALIZE_PAYLOAD = {
     "jsonrpc": "2.0",
@@ -93,7 +100,7 @@ def test_protected_resource_metadata_contains_oauth_configuration(monkeypatch):
     assert response.json() == {
         "resource": "https://mcp.justinnwajei.com",
         "authorization_servers": ["https://mcp.justinnwajei.com"],
-        "scopes_supported": ["forex:read", "forex:preview"],
+        "scopes_supported": ["forex:read", "forex:preview", "forex:execute"],
     }
 
 
@@ -270,6 +277,22 @@ async def test_mcp_server_registers_expected_tools():
 
 
 @pytest.mark.asyncio
+async def test_demo_submission_schema_cannot_target_an_account_or_edit_order():
+    submit = next(tool for tool in await mcp.list_tools() if tool.name == "submit_autonomous_demo_order")
+    assert set(submit.parameters["properties"]) == {"preview_id", "idempotency_key"}
+    assert auth.TOOL_SCOPES["submit_autonomous_demo_order"] == "forex:execute"
+    assert submit.annotations.destructiveHint is True
+    review = next(tool for tool in await mcp.list_tools() if tool.name == "review_autonomous_demo_order")
+    assert set(review.parameters["properties"]) == {
+        "snapshot_id", "pair", "side", "order_type", "entry", "stop_loss",
+        "take_profit", "reason_codes",
+    }
+    for forbidden in ("accountId", "accNum", "environment", "base_url", "quantity"):
+        assert forbidden not in submit.parameters["properties"]
+        assert forbidden not in review.parameters["properties"]
+
+
+@pytest.mark.asyncio
 async def test_market_candle_tool_schema_scope_and_client_rendering_instructions():
     candle_tool = next(tool for tool in await mcp.list_tools() if tool.name == "get_market_candles")
     assert set(candle_tool.parameters["properties"]) == {
@@ -308,6 +331,61 @@ async def test_render_result_reaches_fastmcp_wire_meta_without_model_duplication
     assert result.meta and len(result.meta["chart"]["candles"]) == 1
     assert result.structured_content["status"] == "ready"
     assert "candles" not in result.structured_content
+
+
+@pytest.mark.asyncio
+async def test_account_status_tool_is_labeled_read_only_and_not_paper():
+    account_tool = next(tool for tool in await mcp.list_tools() if tool.name == "get_account_status")
+    assert "normalized, labeled" in account_tool.description
+    assert "never returns paper" in account_tool.description
+    assert account_tool.annotations.readOnlyHint is True
+    assert account_tool.annotations.destructiveHint is False
+    assert "additionalProperties" not in account_tool.output_schema or (
+        account_tool.output_schema["additionalProperties"] is not True
+    )
+    assert auth.TOOL_SCOPES["get_account_status"] == "forex:read"
+
+
+@pytest.mark.asyncio
+async def test_account_status_wire_response_is_canonical_top_level(monkeypatch):
+    class Result:
+        def model_dump(self, mode):
+            assert mode == "json"
+            return {
+                "schema_version": "1.0", "status": "ok", "source": "tradelocker",
+                "retrieved_at": "2026-07-15T22:00:00Z",
+                "account": {
+                    "account_id": "780896", "account_number": "2", "name": "HEROFX#2",
+                    "currency": "USD", "environment": "demo", "active": True,
+                },
+                "balance": 0.0, "projected_balance": 0.0, "available_funds": 0.0,
+                "blocked_balance": 0.0, "cash_balance": 0.0,
+                "withdrawal_available": 0.0, "open_gross_pnl": 0.0,
+                "open_net_pnl": 0.0, "positions_count": 0,
+                "pending_orders_count": 0,
+                "today": {"gross": 0.0, "net": 0.0, "fees": 0.0, "volume": 0.0, "trades_count": 0},
+                "margin": {
+                    "initial_requirement": 0.0, "maintenance_requirement": 0.0,
+                    "warning_level": 100.0, "stop_out_level": 166.67,
+                    "warning_requirement": 0.0, "margin_before_warning": 0.0,
+                },
+            }
+
+    class Service:
+        async def retrieve(self, user):
+            assert user == "auth0|wire-user"
+            return Result()
+
+    monkeypatch.setattr(tools, "TradeLockerAccountStatusService", Service)
+    token = set_current_claims({"sub": "auth0|wire-user"})
+    try:
+        result = await mcp.call_tool("get_account_status", {})
+    finally:
+        reset_current_claims(token)
+    assert result.structured_content["balance"] == 0.0
+    assert result.structured_content["margin"]["warning_level"] == 100.0
+    assert "result" not in result.structured_content
+    assert "accountDetailsData" not in str(result.structured_content)
     registered = {tool.name for tool in await mcp.list_tools()}
     assert not registered & {"generate_chart", "generate_static_forex_chart", "get_forex_chart_data"}
 

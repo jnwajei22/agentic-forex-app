@@ -22,7 +22,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -45,7 +45,7 @@ async def oauth_protected_resource_metadata() -> dict[str, object]:
     return {
         "resource": "https://mcp.justinnwajei.com",
         "authorization_servers": [settings.public_base_url.rstrip("/")],
-        "scopes_supported": ["forex:read", "forex:preview"],
+        "scopes_supported": ["forex:read", "forex:preview", "forex:execute"],
     }
 
 
@@ -67,7 +67,7 @@ async def oauth_authorization_server_metadata() -> dict[str, object]:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "profile", "email", "forex:read", "forex:preview"],
+        "scopes_supported": ["openid", "profile", "email", "forex:read", "forex:preview", "forex:execute"],
         "token_endpoint_auth_methods_supported": ["none"],
     }
 
