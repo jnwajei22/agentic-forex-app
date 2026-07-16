@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime, timezone
 from typing import Any
 
-from app.brokers.tradelocker.adapter import get_tradelocker_adapter
+from app.brokers.tradelocker.adapter import TradeLockerAdapter, get_tradelocker_adapter
 from app.config.settings import settings
 from app.models.providers import (
     MacroCatalog,
@@ -55,6 +55,7 @@ async def get_market_series(
     *, symbol: str, timeframe: str, source: str = "tradelocker",
     lookback: int | None = None, start_time: str | None = None,
     end_time: str | None = None, max_candles: int | None = None,
+    tradelocker_adapter: TradeLockerAdapter | None = None,
 ) -> MarketSeries:
     resolution = normalize_timeframe(timeframe)
     response_limit = _response_limit(max_candles)
@@ -79,7 +80,7 @@ async def get_market_series(
     if source == "tradelocker":
         start_ms = parse_utc_timestamp(start_time, "start_time") if start_time else None
         end_ms = parse_utc_timestamp(end_time, "end_time") if end_time else None
-        history = await get_tradelocker_adapter().get_candles(
+        history = await (tradelocker_adapter or get_tradelocker_adapter()).get_candles(
             normalized, resolution, None if start_ms is not None else count,
             start_time_ms=start_ms, end_time_ms=end_ms,
         )

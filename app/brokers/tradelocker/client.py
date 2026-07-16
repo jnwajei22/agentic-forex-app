@@ -357,7 +357,7 @@ class TradeLockerClient:
         """Place one order. Callers must provide a server-validated immutable payload."""
         allowed = {
             "qty", "routeId", "side", "validity", "type", "tradableInstrumentId",
-            "price", "stopLoss", "stopLossType", "takeProfit", "takeProfitType", "strategyId",
+            "price", "stopPrice", "stopLoss", "stopLossType", "takeProfit", "takeProfitType", "strategyId",
         }
         if set(order) - allowed:
             raise TradeLockerError("place_order", "The TradeLocker order contains unsupported fields.", code="invalid_order")
@@ -368,6 +368,19 @@ class TradeLockerClient:
             "POST", self._account_path("orders"), operation="place_order",
             headers=self._account_headers(), json=order,
         )
+
+    async def cancel_order(self, order_id: str) -> Any:
+        """Cancel one specific non-final order on the already-scoped account."""
+        if not str(order_id).strip():
+            raise TradeLockerError("cancel_order", "A broker order identifier is required.", code="invalid_order")
+        return await self._request("DELETE", f"/trade/orders/{order_id}", operation="cancel_order", headers=self._account_headers())
+
+    async def close_position(self, position_id: str, *, strategy_id: str) -> Any:
+        """Request a full close (qty=0) for one position on the scoped account."""
+        if not str(position_id).strip():
+            raise TradeLockerError("close_position", "A broker position identifier is required.", code="invalid_position")
+        return await self._request("DELETE", f"/trade/positions/{position_id}", operation="close_position",
+            headers=self._account_headers(), params={"strategyId": strategy_id}, json={"qty": 0})
 
     async def get_quote(self, symbol: str) -> Any:
         instrument_id, route_id = await self._resolve_instrument(symbol)

@@ -54,6 +54,15 @@ TOOL_SCOPES = {
     "submit_autonomous_demo_order": "forex:execute",
     "record_autonomous_no_trade": "forex:preview",
     "get_autonomous_run_result": "forex:read",
+    "get_demo_execution_status":"forex:read",
+    "get_demo_trading_snapshot":"forex:read",
+    "review_demo_order":"forex:preview",
+    "submit_demo_order":"forex:execute",
+    "get_demo_execution_result":"forex:read",
+    "review_cancel_demo_order":"forex:preview",
+    "submit_cancel_demo_order":"forex:execute",
+    "review_close_demo_position":"forex:preview",
+    "submit_close_demo_position":"forex:execute",
 }
 
 _jwks_clients: dict[str, PyJWKClient] = {}

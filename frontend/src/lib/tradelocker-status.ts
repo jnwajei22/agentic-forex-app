@@ -15,6 +15,7 @@ export type TradeLockerStatus = {
   selected_account: {
     account_id: string;
     account_number: string;
+    account_alias?: string;
     server: string;
     environment?: "demo" | "live" | null;
   } | null;

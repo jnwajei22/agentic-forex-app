@@ -8,5 +8,6 @@ sqlalchemy
 psycopg2-binary
 pytest
 pytest-asyncio
+openai>=2.38,<3
 fastmcp>=3.4.4,<4
 PyJWT[crypto]>=2.9,<3

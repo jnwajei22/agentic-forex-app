@@ -47,12 +47,29 @@ class Settings(BaseSettings):
     tradelocker_account_number: str | None = None
     tradelocker_config_cache_ttl_seconds: int = 900
 
-    autonomous_snapshot_ttl_seconds: int = 300
-    autonomous_preview_ttl_seconds: int = 180
+    autonomous_snapshot_ttl_seconds: int = 60
+    autonomous_preview_ttl_seconds: int = 60
     autonomous_quote_max_age_seconds: int = 30
     autonomous_price_tolerance_percent: float = 0.25
     autonomous_max_spread_pips: float = 3.0
     autonomous_news_blackout_minutes: int = 30
+    autonomous_decision_provider: str = "no_trade"
+    autonomous_decision_model: str = "gpt-5.6"
+    autonomous_decision_timeout_seconds: float = 30
+    autonomous_decision_max_retries: int = 1
+    autonomous_decision_max_input_chars: int = 80000
+    autonomous_default_minimum_confidence: float = 0.70
+    autonomous_max_arming_hours: int = 24
+    openai_api_key: str | None = Field(default=None, repr=False)
+    autonomous_scheduler_poll_seconds: float = Field(default=30,gt=0)
+    autonomous_scheduler_lease_seconds: int = Field(default=180,ge=30)
+    autonomous_scheduler_batch_size: int = Field(default=20,ge=1,le=100)
+    autonomous_scheduler_max_retries: int = Field(default=2,ge=0,le=5)
+    autonomous_scheduler_retry_base_seconds: int = Field(default=30,ge=1)
+    autonomous_scheduler_retry_cap_seconds: int = Field(default=300,ge=1)
+    autonomous_scheduler_heartbeat_stale_seconds: int = Field(default=120,ge=30)
+    autonomous_scheduler_required_for_readiness: bool = False
+    autonomous_scheduler_embedded: bool = False
 
     finnhub_enabled: bool = False
     finnhub_api_key: str | None = None

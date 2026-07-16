@@ -9,7 +9,7 @@ from mcp.types import TextContent
 from pydantic import ValidationError
 
 from app.auth.identity import get_current_user_sub
-from app.brokers.tradelocker.adapter import get_tradelocker_adapter
+from app.brokers.tradelocker.adapter import TradeLockerAdapter, get_tradelocker_adapter
 from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.brokers.tradelocker.mapping import TradeLockerMappingError, map_configured_rows
 from app.brokers.paper.adapter import PaperBrokerAdapter
@@ -36,7 +36,10 @@ from app.services.providers.finnhub import FinnhubClient, capability_status
 from app.services.providers.fred import FredClient
 from app.services.market_data.series_cache import market_series_cache
 from app.services.trading.previews import create_order_preview
-from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
+from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError, normalize_pair
+from app.services.autonomous.runner import AutonomousDecisionRunner
+from app.jobs.autonomous_scheduler import AutonomousScheduleService
+from app.storage.schedules import ScheduleStorageError
 from app.services.tradelocker.account_status import (
     AccountStatusUnavailable,
     TradeLockerAccountStatusService,
@@ -51,6 +54,31 @@ def _setup_url() -> str:
         f"{settings.frontend_origin.rstrip('/')}/connect-tradelocker?source=chatgpt&returnTo="
         f"{quote(settings.chatgpt_return_url, safe='')}"
     )
+
+
+def _display_broker(value: str | None) -> str:
+    normalized=(value or "TradeLocker").strip().lower()
+    return {"herofx":"HeroFX","tradelocker":"TradeLocker"}.get(normalized, (value or "TradeLocker").strip())
+
+
+def _display_value(value: str | None) -> str:
+    labels={"demo":"Demo","live":"Live","unknown":"Unknown","read_only":"Read Only",
+        "demo_manual":"Demo Manual","demo_autonomous":"Demo Autonomous","disabled":"Disabled"}
+    return labels.get((value or "unknown").lower(), (value or "Unknown").replace("_"," ").title())
+
+
+def _safe_account_output(item: dict[str,Any]) -> dict[str,Any]:
+    classification="Demo" if item.get("is_demo") == 1 else "Live" if item.get("is_demo") == 0 else "Unknown"
+    return {
+        "account_ref":item["public_id"], "alias":item["account_alias"], "name":item.get("account_name"),
+        "broker":_display_broker(item.get("broker_name") or item.get("server")),
+        "connection_label":item.get("connection_label"), "environment":_display_value(item.get("environment")),
+        "classification":classification, "currency":item.get("currency"),
+        "availability":"Active" if item.get("available") and item.get("locally_enabled") else "Unavailable",
+        "is_default":bool(item.get("is_default_analysis")),
+        "profiles":[{"profile_ref":p["public_id"],"name":p["name"],
+            "execution_mode":_display_value(p["execution_mode"]),"enabled":p["enabled"]} for p in item.get("profiles",[])],
+    }
 
 
 def _setup_required() -> dict[str, Any]:
@@ -126,6 +154,8 @@ async def get_market_candles(
     start_time: str | None = None,
     end_time: str | None = None,
     max_candles: int | None = None,
+    account_alias: str | None = None,
+    account_ref: str | None = None,
 ) -> dict[str, Any]:
     """Return canonical provider-identified OHLCV for client-side charting and analysis; explicit dates override lookback."""
     owner_id = get_current_user_sub()
@@ -134,9 +164,15 @@ async def get_market_candles(
         if missing:
             return missing
     try:
+        adapter = None
+        if source == "tradelocker" and owner_id:
+            context = BrokerAccountResolver().resolve(owner_id, account_alias=account_alias, account_ref=account_ref)
+            adapter = TradeLockerAdapter(TradeLockerClient(base_url=context.base_url,username=context.username,
+                password=context.password,server=context.server,account_id=context.account_id,account_number=context.account_number))
         result = await get_market_series(
             symbol=symbol, timeframe=timeframe, source=source, lookback=lookback,
             start_time=start_time, end_time=end_time, max_candles=max_candles,
+            tradelocker_adapter=adapter,
         )
         if owner_id:
             cached = market_series_cache.put(owner_id, result)
@@ -146,6 +182,8 @@ async def get_market_candles(
         return exc.as_dict()
     except TradeLockerError as exc:
         return _tradelocker_error(exc)
+    except AccountResolutionError as exc:
+        return _setup_required() if exc.code == "default_account_required" else {"status":"error","error":exc.code,"message":str(exc)}
     except ValueError as exc:
         return ProviderError(source, "invalid_request", str(exc)).as_dict()
 
@@ -519,24 +557,36 @@ async def get_tradelocker_accounts() -> dict[str, Any]:
         return _tradelocker_error(exc)
 
 
-async def get_tradelocker_symbols() -> dict[str, Any] | list[Any]:
+async def get_tradelocker_symbols(account_alias: str | None = None, account_ref: str | None = None) -> dict[str, Any] | list[Any]:
     """Return symbols for the connected TradeLocker account."""
     missing = _missing_user_connection()
     if missing:
         return missing
     try:
-        return await get_tradelocker_adapter().client.get_symbols()
+        user=get_current_user_sub()
+        context=BrokerAccountResolver().resolve(user,account_alias=account_alias,account_ref=account_ref) if user else None
+        if not context:return _setup_required()
+        async with TradeLockerClient(base_url=context.base_url,username=context.username,password=context.password,server=context.server,account_id=context.account_id,account_number=context.account_number) as client:
+            return await client.get_symbols()
+    except AccountResolutionError as exc:
+        return _setup_required() if exc.code == "default_account_required" else {"status":"error","error":exc.code,"message":str(exc)}
     except TradeLockerError as exc:
         return _tradelocker_error(exc)
 
 
-async def get_tradelocker_quote(symbol: str) -> dict[str, Any] | list[Any]:
+async def get_tradelocker_quote(symbol: str, account_alias: str | None = None, account_ref: str | None = None) -> dict[str, Any] | list[Any]:
     """Return the authoritative TradeLocker execution quote for a symbol."""
     missing = _missing_user_connection()
     if missing:
         return missing
     try:
-        return await get_tradelocker_adapter().get_quote(symbol)
+        user=get_current_user_sub()
+        context=BrokerAccountResolver().resolve(user,account_alias=account_alias,account_ref=account_ref) if user else None
+        if not context:return _setup_required()
+        async with TradeLockerClient(base_url=context.base_url,username=context.username,password=context.password,server=context.server,account_id=context.account_id,account_number=context.account_number) as client:
+            return await client.get_quote(symbol)
+    except AccountResolutionError as exc:
+        return {"status":"error","error":exc.code,"message":str(exc)}
     except TradeLockerError as exc:
         return _tradelocker_error(exc)
 
@@ -567,24 +617,24 @@ def _authenticated_user() -> str:
     return user_sub
 
 
-async def get_autonomous_demo_status() -> dict[str, Any]:
-    """Read whether the authenticated user's selected account is ready for verified demo execution."""
+async def get_autonomous_demo_status(profile_ref: str) -> dict[str, Any]:
+    """Read autonomous arming and blocker state for one owned verified-demo profile."""
     try:
-        return await AutonomousDemoService().status(_authenticated_user())
+        return await AutonomousDecisionRunner().status(_authenticated_user(), profile_ref)
     except AutonomousExecutionError as exc:
         return exc.as_dict()
 
 
-async def get_autonomous_demo_snapshot() -> dict[str, Any]:
-    """Create an immutable five-minute account, provider, and TradeLocker market snapshot; this does not submit an order."""
+async def get_autonomous_demo_snapshot(profile_ref: str) -> dict[str, Any]:
+    """Build a bounded multi-timeframe decision snapshot for one armed demo profile; never submits."""
     try:
-        return await AutonomousDemoService().snapshot(_authenticated_user())
+        return await AutonomousDecisionRunner().snapshot(_authenticated_user(), profile_ref)
     except AutonomousExecutionError as exc:
         return exc.as_dict()
 
 
 async def review_autonomous_demo_order(
-    snapshot_id: str, pair: str, side: Literal["long", "short"],
+    profile_ref: str, snapshot_id: str, pair: str, side: Literal["long", "short"],
     order_type: Literal["market", "limit"], entry: float,
     stop_loss: float, take_profit: float,
     reason_codes: list[str] | None = None,
@@ -596,7 +646,7 @@ async def review_autonomous_demo_order(
             entry=entry, stop_loss=stop_loss, take_profit=take_profit,
             reason_codes=reason_codes or [],
         )
-        return await AutonomousDemoService().review(_authenticated_user(), proposal)
+        return await AutonomousDemoService().review(_authenticated_user(), profile_ref, proposal)
     except ValidationError as exc:
         return {"schema_version": "1.0", "status": "rejected", "error": "invalid_proposal", "message": "The order proposal schema is invalid.", "violations": [item["type"] for item in exc.errors()]}
     except AutonomousExecutionError as exc:
@@ -614,23 +664,114 @@ async def submit_autonomous_demo_order(preview_id: str, idempotency_key: str) ->
         return exc.as_dict()
 
 
-async def record_autonomous_no_trade(snapshot_id: str, reason_codes: list[str], pairs_evaluated: list[str]) -> dict[str, Any]:
+async def record_autonomous_no_trade(profile_ref: str, snapshot_id: str, reason_codes: list[str], pairs_evaluated: list[str]) -> dict[str, Any]:
     """Persist a deliberate no-trade decision for an owned fresh snapshot; this never contacts TradeLocker order endpoints."""
     try:
         request = AutonomousNoTradeRequest(snapshot_id=snapshot_id, reason_codes=reason_codes, pairs_evaluated=pairs_evaluated)
-        return await AutonomousDemoService().record_no_trade(_authenticated_user(), request.snapshot_id, request.reason_codes, request.pairs_evaluated)
+        return await AutonomousDemoService().record_no_trade(_authenticated_user(), profile_ref, request.snapshot_id, request.reason_codes, request.pairs_evaluated)
     except ValidationError:
         return {"schema_version": "1.0", "status": "rejected", "error": "invalid_no_trade_record", "message": "The no-trade record schema is invalid."}
     except AutonomousExecutionError as exc:
         return exc.as_dict()
 
 
+async def run_autonomous_demo_profile(profile_ref:str,run_key:str,trigger_reason:str)->dict[str,Any]:
+    """Run one idempotent bounded decision cycle. It can submit only when dashboard-armed, demo-verified, and not in shadow mode."""
+    try:return await AutonomousDecisionRunner().run(_authenticated_user(),profile_ref,run_key,trigger_reason)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
 def get_autonomous_run_result(run_id: str | None = None) -> dict[str, Any]:
     """Read the latest or requested autonomous-demo audit result for the authenticated user."""
     try:
-        return AutonomousDemoService().run_result(_authenticated_user(), run_id)
+        if run_id:return AutonomousDecisionRunner().result(_authenticated_user(),run_id)
+        latest=AutonomousDecisionRunner().execution.get_decision_run(_authenticated_user())
+        return AutonomousDecisionRunner._public_run(latest) if latest else AutonomousDemoService().run_result(_authenticated_user(),None)
     except AutonomousExecutionError as exc:
         return exc.as_dict()
+
+
+def list_autonomous_schedules()->dict[str,Any]:
+    """List owned autonomous schedules and their local/UTC next-run times; this cannot mutate scheduling."""
+    return {"status":"ok","schedules":AutonomousScheduleService().list(_authenticated_user())}
+
+
+def get_autonomous_schedule_status(schedule_id:str)->dict[str,Any]:
+    """Read one owned schedule and its recent durable dispatch history."""
+    try:return AutonomousScheduleService().status(_authenticated_user(),schedule_id)
+    except ScheduleStorageError:return {"status":"not_found","error":"schedule_not_found"}
+
+
+def list_recent_autonomous_runs(profile_ref:str|None=None,limit:int=20)->dict[str,Any]:
+    """List recent owned autonomous decisions without credentials or broker routing identifiers."""
+    user=_authenticated_user();runner=AutonomousDecisionRunner()
+    records=runner.execution.recent_decision_runs(user,min(max(limit,1),50))
+    if profile_ref:records=[item for item in records if item.get("profile_ref")==profile_ref]
+    return {"status":"ok","runs":[runner._public_run(item) for item in records]}
+
+
+def get_autonomous_daily_summary(day:str|None=None)->dict[str,Any]:
+    """Return the authenticated user's concise UTC autonomous daily summary."""
+    try:target=date.fromisoformat(day) if day else None
+    except ValueError:return {"status":"error","error":"invalid_date","message":"day must be YYYY-MM-DD"}
+    return AutonomousScheduleService().daily_summary(_authenticated_user(),target)
+
+
+# Profile-bound demo execution API. These names intentionally expose only safe profile,
+# preview, execution, order, and position references; broker account routing is internal.
+async def get_demo_execution_status(profile_id: str) -> dict[str,Any]:
+    try:return await AutonomousDemoService().status(_authenticated_user(),profile_id)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def get_demo_trading_snapshot(profile_id: str,symbol: str)->dict[str,Any]:
+    try:return await AutonomousDemoService().snapshot(_authenticated_user(),profile_id,symbol)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short"],order_type:Literal["market","limit","stop"],
+                            stop_loss:float,take_profit:float,reason:str,entry:float|None=None)->dict[str,Any]:
+    try:
+        if not reason.strip() or len(reason)>500:raise AutonomousExecutionError("invalid_reason","A concise human-readable reason is required.",status="rejected")
+        service=AutonomousDemoService();snapshot=await service.snapshot(_authenticated_user(),profile_id,symbol)
+        if entry is None:
+            if order_type!="market":raise AutonomousExecutionError("entry_required","Limit and stop orders require an entry price.",status="rejected")
+            bid,ask=service._quote(snapshot["market"]["pairs"][normalize_pair(symbol)]["quote"]);entry=ask if side=="long" else bid
+        proposal=AutonomousOrderProposal(snapshot_id=snapshot["snapshot_id"],pair=symbol,side=side,order_type=order_type,
+            entry=entry,stop_loss=stop_loss,take_profit=take_profit,reason_codes=["user_reason"])
+        result=await service.review(_authenticated_user(),profile_id,proposal);result["reason"]=reason;result["submission_allowed"]=result.get("status")=="approved";return result
+    except ValidationError:return {"status":"rejected","error":"invalid_proposal","message":"The order proposal schema is invalid."}
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def submit_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().submit(_authenticated_user(),preview_id,idempotency_key)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+def get_demo_execution_result(execution_id:str)->dict[str,Any]:
+    try:return AutonomousDemoService().execution_result(_authenticated_user(),execution_id)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def review_cancel_demo_order(profile_id:str,order_id:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().review_action(_authenticated_user(),profile_id,"cancel_order",order_id)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def submit_cancel_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().submit_action(_authenticated_user(),preview_id,idempotency_key)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def review_close_demo_position(profile_id:str,position_id:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().review_action(_authenticated_user(),profile_id,"close_position",position_id)
+    except AutonomousExecutionError as exc:return exc.as_dict()
+
+
+async def submit_close_demo_position(preview_id:str,idempotency_key:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().submit_action(_authenticated_user(),preview_id,idempotency_key)
+    except AutonomousExecutionError as exc:return exc.as_dict()
 
 
 def get_provider_capabilities() -> dict[str, Any]:
@@ -653,14 +794,25 @@ async def list_my_tradelocker_connections() -> dict[str, Any]:
     """List the authenticated user's safe TradeLocker connection references."""
     user_sub = get_current_user_sub()
     if not user_sub: return {"status": "error", "error": "authentication_required"}
-    return {"status": "ok", "connections": BrokerRepository().list_connections(user_sub)}
+    connections=[]
+    for item in BrokerRepository().list_connection_tree(user_sub):
+        connections.append({
+            "connection_ref":item["public_id"], "label":item["label"] or item["broker_name"],
+            "broker":_display_broker(item["broker_name"] or item["server"]),
+            "environment":_display_value(item["environment"]),
+            "status":"Connected" if item["enabled"] else "Reauthentication Required",
+            "is_default":item["is_default"], "accounts_count":item["account_count"],
+            "last_verified_at":item["last_verified_at"],
+            "accounts":[_safe_account_output(account) for account in item["accounts"]],
+        })
+    return {"status": "ok", "connections": connections}
 
 
 async def list_my_tradelocker_accounts() -> dict[str, Any]:
     """List durable account aliases without exposing broker account identifiers."""
     user_sub = get_current_user_sub()
     if not user_sub: return {"status": "error", "error": "authentication_required"}
-    return {"status": "ok", "accounts": BrokerRepository().list_accounts(user_sub)}
+    return {"status": "ok", "accounts": [_safe_account_output(item) for item in BrokerRepository().list_accounts(user_sub)]}
 
 
 async def list_execution_profiles() -> dict[str, Any]:

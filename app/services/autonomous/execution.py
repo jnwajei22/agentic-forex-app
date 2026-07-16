@@ -19,6 +19,7 @@ from app.services.providers.errors import ProviderError
 from app.services.providers.finnhub import FinnhubClient
 from app.services.providers.fred import FredClient
 from app.services.tradelocker.account_status import AccountStatusUnavailable, TradeLockerAccountStatusService
+from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
 from app.storage.brokers import BrokerConnection, BrokerRepository, BrokerStorageError
 from app.storage.execution import ExecutionRepository, utcnow
 
@@ -50,6 +51,11 @@ class VerifiedDemoContext:
     execution_mode: ExecutionMode
     risk: dict[str, Any]
     connection: BrokerConnection
+    profile_ref: str
+    account_record_id: str
+    account_alias: str
+    connection_ref: str
+    demo_classification: str
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,7 @@ class InstrumentMetadata:
     quote_currency: str
     minimum_stop_distance: float
     commission_per_lot: float
+    leverage: float | None = None
 
 
 def normalize_pair(pair: str) -> str:
@@ -141,6 +148,7 @@ def parse_instrument_metadata(payload: dict[str, Any], pair: str) -> InstrumentM
             _find_value(combined, ("commissionPerLot", "roundTurnCommission")) or 0,
             "commission",
         ),
+        leverage=_positive(_find_value(combined,("leverage","effectiveLeverage")),"leverage") if _find_value(combined,("leverage","effectiveLeverage")) is not None else None,
     )
 
 
@@ -167,9 +175,15 @@ def calculate_broker_position_size(
     if lots < metadata.min_lots or (metadata.max_lots is not None and lots > metadata.max_lots):
         raise AutonomousExecutionError("position_size_unverifiable", "The calculated size violates broker quantity limits.", status="rejected")
     estimated = lots * risk_per_lot
+    if metadata.leverage is None:
+        raise AutonomousExecutionError("margin_unverifiable", "Broker leverage is unavailable, so margin cannot be verified.", status="rejected")
+    estimated_margin = lots * metadata.contract_size * entry * conversion / metadata.leverage
+    if estimated_margin > available_funds:
+        raise AutonomousExecutionError("insufficient_margin", "Estimated margin exceeds available funds.", status="rejected")
     return {
         "lot_size": lots, "quantity": lots * metadata.contract_size,
         "estimated_risk": estimated, "risk_percent": estimated / balance * 100,
+        "estimated_margin":estimated_margin,"available_funds_after_margin":available_funds-estimated_margin,
     }
 
 
@@ -188,17 +202,43 @@ class AutonomousDemoService:
         self.account_status_service = account_status_service or TradeLockerAccountStatusService(repository=self.brokers, client_factory=client_factory)
         self.finnhub_factory, self.fred_factory = finnhub_factory, fred_factory
 
-    async def context(self, user_sub: str, *, require_mode: bool = True) -> VerifiedDemoContext:
+    async def context(self, user_sub: str, profile_ref: str, *, require_mode: bool = True,
+                      allow_autonomous: bool = False) -> VerifiedDemoContext:
+        """Resolve execution exclusively through an owned profile; dashboard defaults are never read here."""
         try:
-            connection = self.brokers.get_connection(user_sub)
-        except BrokerStorageError:
-            raise AutonomousExecutionError("broker_storage_error", "The stored TradeLocker connection is unavailable.") from None
-        if not connection or not connection.account_id or not connection.account_number:
-            raise AutonomousExecutionError("no_selected_account", "Select a TradeLocker account before demo execution.")
-        risk = self.execution.get_or_create_settings(user_sub, connection.connection_id, connection.account_id, connection.account_number)
-        mode = ExecutionMode(risk["execution_mode"])
+            resolved = BrokerAccountResolver(self.brokers).resolve(user_sub, profile=profile_ref)
+        except AccountResolutionError as exc:
+            raise AutonomousExecutionError(exc.code, str(exc)) from exc
+        profile = next((item for item in self.brokers.list_profiles(user_sub) if item["public_id"] == resolved.profile_ref), None)
+        if profile is None:
+            raise AutonomousExecutionError("profile_not_found", "The execution profile is unavailable.")
+        profile_mode = profile["execution_mode"]
+        if profile_mode == "demo_autonomous" and not allow_autonomous:
+            raise AutonomousExecutionError("autonomous_profile_requires_runner", "Demo Autonomous profiles can execute only through the bounded autonomous runner.")
+        mode = (ExecutionMode.DEMO_AUTONOMOUS if profile_mode == "demo_autonomous" else
+                ExecutionMode.DEMO_MANUAL if profile_mode == "demo_manual" else ExecutionMode.READ_ONLY)
+        risk = self.execution.get_or_create_settings(user_sub, resolved.connection_id, resolved.account_id, resolved.account_number)
+        risk.update(profile.get("risk") or {})
+        if not 0 < float(risk["risk_per_trade_percent"]) <= 1.0:
+            raise AutonomousExecutionError("risk_policy_invalid", "Risk per trade must be greater than zero and no more than 1%.")
+        risk["risk_per_trade_percent"] = min(float(risk["risk_per_trade_percent"]), 1.0)
+        risk["daily_loss_limit_percent"] = min(float(risk.get("daily_loss_limit_percent", 3.0)), 3.0)
+        risk["drawdown_cutoff_percent"] = min(float(risk.get("drawdown_cutoff_percent", 10.0)), 10.0)
+        risk["maximum_open_positions"] = min(int(risk.get("maximum_open_positions", 1)), 1)
+        risk["maximum_pending_orders"] = min(int(risk.get("maximum_pending_orders", 1)), 1)
+        risk["maximum_new_entries_per_day"] = min(int(risk.get("maximum_new_entries_per_day", 2)), 2)
+        risk["minimum_reward_risk"] = max(float(risk.get("minimum_reward_risk", 1.5)), 1.5)
+        if profile.get("allowed_instruments"):
+            risk["allowed_pairs"] = [normalize_pair(pair) for pair in profile["allowed_instruments"]]
+        risk["strategy_name"] = profile.get("strategy_name",risk.get("strategy_name","ai_forex_confluence"))
+        risk["strategy_version"] = profile.get("strategy_version",risk.get("strategy_version","1"))
+        risk["execution_mode"] = mode.value
+        connection = BrokerConnection(connection_id=resolved.connection_id, connection_ref=resolved.connection_ref,
+            base_url=resolved.base_url, username=resolved.username, password=resolved.password,
+            server=resolved.server, account_id=resolved.account_id, account_number=resolved.account_number,
+            environment=resolved.environment, label=resolved.connection_label)
         base_matches = _normalized_url(connection.base_url) == _normalized_url(settings.tradelocker_demo_base_url)
-        if connection.environment != "demo" or not base_matches:
+        if connection.environment != "demo" or resolved.demo_classification != "demo" or not base_matches:
             raise AutonomousExecutionError("demo_environment_verification_failed", "Order execution is available only for a verified TradeLocker demo account.", reasons=["account_not_demo"])
         client = self._client(connection)
         try:
@@ -209,23 +249,25 @@ class AutonomousDemoService:
             await client.aclose()
         account = next((row for row in discovered.get("accounts", []) if isinstance(row, dict) and str(row.get("accountId")) == connection.account_id and str(row.get("accNum")) == connection.account_number), None) if isinstance(discovered, dict) else None
         if account is None:
-            raise AutonomousExecutionError("demo_environment_verification_failed", "The selected demo account could not be verified during account discovery.")
+            raise AutonomousExecutionError("demo_environment_verification_failed", "The profile-bound demo account could not be verified during account discovery.")
         if require_mode and mode == ExecutionMode.READ_ONLY:
-            raise AutonomousExecutionError("execution_mode_read_only", "The selected account is read-only.")
+            raise AutonomousExecutionError("execution_mode_read_only", "The execution profile is read-only.")
         return VerifiedDemoContext(
             user_sub, connection.connection_id, connection.account_id, connection.account_number,
             account.get("name"), account.get("currency"), connection.environment,
             connection.server, connection.base_url, mode, risk, connection,
+            resolved.profile_ref or profile_ref, resolved.account_record_id, resolved.account_alias,
+            resolved.connection_ref, resolved.demo_classification,
         )
 
     def _client(self, connection: BrokerConnection) -> TradeLockerClient:
         return self.client_factory(base_url=connection.base_url, username=connection.username, password=connection.password, server=connection.server, account_id=connection.account_id, account_number=connection.account_number)
 
-    async def status(self, user_sub: str) -> dict[str, Any]:
+    async def status(self, user_sub: str, profile_ref: str) -> dict[str, Any]:
         reasons = []
         context = None
         try:
-            context = await self.context(user_sub, require_mode=False)
+            context = await self.context(user_sub, profile_ref, require_mode=False)
             if context.execution_mode == ExecutionMode.READ_ONLY:
                 reasons.append("execution_mode_read_only")
         except AutonomousExecutionError as exc:
@@ -234,12 +276,33 @@ class AutonomousDemoService:
             reasons.append("kill_switch_enabled")
         if not settings.finnhub_enabled or not settings.finnhub_api_key:
             reasons.append("provider_unavailable")
+        account = None
+        if context:
+            try:
+                account = await self.account_status_service.retrieve(user_sub, context.account_alias)
+                if account.balance <= 0 or account.projected_balance <= 0 or account.available_funds <= 0:
+                    reasons.append("account_funds_unavailable")
+                if account.positions_count >= context.risk["maximum_open_positions"]:
+                    reasons.append("maximum_open_positions")
+                if account.pending_orders_count >= context.risk["maximum_pending_orders"]:
+                    reasons.append("maximum_pending_orders")
+            except (AccountStatusUnavailable,TradeLockerError,TradeLockerMappingError):
+                reasons.append("account_status_unavailable")
         return {
             "schema_version": "1.0", "status": "ready" if not reasons else "blocked",
             "account_environment": context.environment if context else None,
             "execution_mode": context.execution_mode.value if context else ExecutionMode.READ_ONLY.value,
             "kill_switch": settings.kill_switch_enabled, "strategy_enabled": True,
             "can_submit_demo_orders": not reasons, "blocking_reasons": list(dict.fromkeys(reasons)),
+            "profile_ref":context.profile_ref if context else profile_ref,
+            "account_alias":context.account_alias if context else None,
+            "broker":context.connection_label if context else None,
+            "confirmed_demo":bool(context and context.demo_classification == "demo"),
+            "balance":account.balance if account else None,"equity":account.projected_balance if account else None,
+            "available_funds":account.available_funds if account else None,
+            "positions_count":account.positions_count if account else None,"pending_orders_count":account.pending_orders_count if account else None,
+            "limits":context.risk if context else None,"allowed_pairs":context.risk["allowed_pairs"] if context else [],
+            "ready_for_preview":not reasons,"ready_for_submission":not reasons,
         }
 
     async def _provider_state(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -285,23 +348,24 @@ class AutonomousDemoService:
             await fred.aclose()
         return providers, blackouts, context
 
-    async def snapshot(self, user_sub: str) -> dict[str, Any]:
-        context = await self.context(user_sub)
+    async def snapshot(self, user_sub: str, profile_ref: str, symbol: str | None = None, *, autonomous: bool=False) -> dict[str, Any]:
+        context = await self.context(user_sub, profile_ref, allow_autonomous=autonomous)
         if settings.kill_switch_enabled:
             raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks new snapshots.")
         try:
-            account = await self.account_status_service.retrieve(user_sub)
+            account = await self.account_status_service.retrieve(user_sub, context.account_alias)
         except (AccountStatusUnavailable, TradeLockerError, TradeLockerMappingError):
             raise AutonomousExecutionError("account_mapping_unavailable", "Normalized TradeLocker account state is unavailable.") from None
         account_json = account.model_dump(mode="json")
-        if account.account.account_id != context.account_id or account.account.account_number != context.acc_num:
-            raise AutonomousExecutionError("selected_account_context_mismatch", "The selected account changed during snapshot retrieval.")
+        if account.account.account_alias != context.account_alias:
+            raise AutonomousExecutionError("profile_account_context_mismatch", "The profile-bound account changed during snapshot retrieval.")
         providers, blackouts, provider_context = await self._provider_state()
         client = self._client(context.connection)
         market: dict[str, Any] = {}
         try:
             config = await client.get_config()
             raw_positions, raw_orders = await client.get_open_positions(), await client.get_orders()
+            raw_history = await client.get_orders_history()
             positions = map_configured_rows(
                 config_response=config, data_response=raw_positions,
                 config_key="positionsConfig", data_key="positions",
@@ -310,11 +374,28 @@ class AutonomousDemoService:
                 config_response=config, data_response=raw_orders,
                 config_key="ordersConfig", data_key="orders",
             )
-            for pair in context.risk["allowed_pairs"]:
+            order_history = map_configured_rows(
+                config_response=config,data_response=raw_history,
+                config_key="ordersHistoryConfig",data_key="ordersHistory",
+            )
+            requested_pair=normalize_pair(symbol) if symbol else None
+            if requested_pair and requested_pair not in context.risk["allowed_pairs"]:
+                raise AutonomousExecutionError("pair_not_allowed","The symbol is not allowed by this execution profile.")
+            for pair in [requested_pair] if requested_pair else context.risk["allowed_pairs"]:
                 quote = await client.get_quote(pair)
-                h1 = await client.get_candles(pair, "1h", 100)
-                m15 = await client.get_candles(pair, "15m", 100)
-                market[pair] = {"quote": quote, "candles_1h": [c.model_dump(mode="json") for c in h1.candles], "candles_15m": [c.model_dump(mode="json") for c in m15.candles], "complete": h1.complete and m15.complete}
+                instrument=await client.get_instrument_details(pair)
+                d1 = await client.get_candles(pair, "1d", 190) if autonomous else None
+                h4 = await client.get_candles(pair, "4h", 250) if autonomous else None
+                h1 = await client.get_candles(pair, "1h", 200 if autonomous else 100)
+                m15 = await client.get_candles(pair, "15m", 200 if autonomous else 100)
+                bid,ask=self._quote(quote)
+                market[pair] = {"quote": quote,"bid":bid,"ask":ask,"spread":ask-bid,"quote_retrieved_at":utcnow().isoformat(),
+                    "instrument_metadata":instrument,
+                    "candles_1d": [c.model_dump(mode="json") for c in d1.candles] if d1 else [],
+                    "candles_4h": [c.model_dump(mode="json") for c in h4.candles] if h4 else [],
+                    "candles_1h": [c.model_dump(mode="json") for c in h1.candles],
+                    "candles_15m": [c.model_dump(mode="json") for c in m15.candles],
+                    "complete": h1.complete and m15.complete and (not autonomous or bool(d1 and h4 and d1.complete and h4.complete))}
         except (TradeLockerError, TradeLockerMappingError):
             raise AutonomousExecutionError("market_snapshot_unavailable", "A complete mapped TradeLocker snapshot is unavailable.") from None
         finally:
@@ -337,6 +418,9 @@ class AutonomousDemoService:
             "schema_version": "1.0", "status": "ok", "snapshot_id": snapshot_id,
             "retrieved_at": now.isoformat(), "expires_at": (now + timedelta(seconds=settings.autonomous_snapshot_ttl_seconds)).isoformat(),
             "account": account_json, "positions": positions, "pending_orders": orders,
+            "recent_order_history": order_history[-100:],
+            "profile_ref":context.profile_ref,"account_ref":context.account_record_id,"connection_ref":context.connection_ref,
+            "account_alias":context.account_alias,"confirmed_demo":context.demo_classification=="demo","kill_switch":settings.kill_switch_enabled,
             "risk_state": risk_state, "strategy": {"name": context.risk["strategy_name"], "version": context.risk["strategy_version"]},
             "providers": providers, "news_blackouts": blackouts,
             "provider_context": provider_context,
@@ -390,8 +474,8 @@ class AutonomousDemoService:
                     raise
         raise AutonomousExecutionError("position_size_unverifiable", "A fresh currency-conversion quote is unavailable.", status="rejected")
 
-    async def review(self, user_sub: str, proposal: AutonomousOrderProposal) -> dict[str, Any]:
-        context = await self.context(user_sub)
+    async def review(self, user_sub: str, profile_ref: str, proposal: AutonomousOrderProposal, *, autonomous: bool=False) -> dict[str, Any]:
+        context = await self.context(user_sub, profile_ref, allow_autonomous=autonomous)
         if settings.kill_switch_enabled:
             raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks new previews.")
         snapshot = self.execution.get_snapshot(proposal.snapshot_id)
@@ -456,6 +540,10 @@ class AutonomousDemoService:
         record = {
             "id": preview_id, "snapshot_id": proposal.snapshot_id, "user_sub": user_sub,
             "connection_id": context.connection_id, "account_id": context.account_id, "acc_num": context.acc_num,
+            "profile_ref": context.profile_ref, "account_record_id": context.account_record_id,
+            "connection_ref": context.connection_ref, "account_alias": context.account_alias,
+            "server": context.server, "base_url": context.base_url,
+            "demo_classification": context.demo_classification,
             "environment": "demo", "pair": pair, "instrument_id": metadata.instrument_id,
             "route_id": metadata.route_id, "side": proposal.side, "order_type": proposal.order_type,
             "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit,
@@ -463,6 +551,7 @@ class AutonomousDemoService:
             "risk_percent": size["risk_percent"], "estimated_reward": estimated_reward, "reward_risk": rr,
             "broker_metadata_json": json.dumps(metadata.__dict__, separators=(",", ":"), sort_keys=True),
             "status": "approved", "violations_json": "[]",
+            "execution_origin": "autonomous" if autonomous else "manual",
             "expires_at": (now + timedelta(seconds=settings.autonomous_preview_ttl_seconds)).isoformat(), "created_at": now.isoformat(),
         }
         self.execution.insert_preview(record)
@@ -475,12 +564,17 @@ class AutonomousDemoService:
         return {"schema_version": "1.0", "status": "approved", "preview_id": preview_id, "snapshot_id": proposal.snapshot_id, "pair": pair, "side": proposal.side, "order_type": proposal.order_type, "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit, **size, "estimated_reward": estimated_reward, "reward_risk": rr, "expires_at": record["expires_at"], "violations": []}
 
     async def submit(self, user_sub: str, preview_id: str, idempotency_key: str) -> dict[str, Any]:
-        context = await self.context(user_sub)
         preview = self.execution.get_preview(preview_id)
         if not preview or preview["user_sub"] != user_sub:
             raise AutonomousExecutionError("preview_not_found", "The approved preview is unavailable.", status="rejected")
-        if (preview["connection_id"], preview["account_id"], preview["acc_num"], preview["environment"]) != (context.connection_id, context.account_id, context.acc_num, "demo"):
-            raise AutonomousExecutionError("preview_account_mismatch", "The preview does not match the currently selected demo account.", status="rejected")
+        context = await self.context(user_sub, preview.get("profile_ref") or "",allow_autonomous=preview.get("execution_origin")=="autonomous")
+        routing_fields = ("connection_id","account_id","acc_num","environment","profile_ref","account_record_id","connection_ref","account_alias","server","base_url","demo_classification")
+        current = {"connection_id":context.connection_id,"account_id":context.account_id,"acc_num":context.acc_num,"environment":context.environment,
+            "profile_ref":context.profile_ref,"account_record_id":context.account_record_id,"connection_ref":context.connection_ref,
+            "account_alias":context.account_alias,"server":context.server,"base_url":context.base_url,"demo_classification":context.demo_classification}
+        if any(preview.get(key) != current[key] for key in routing_fields):
+            logger.warning("execution_routing_mismatch user_ref=%s profile_ref=%s account_ref=%s connection_ref=%s", user_sub, context.profile_ref, context.account_record_id, context.connection_ref)
+            raise AutonomousExecutionError("preview_account_mismatch", "The preview routing no longer matches its profile-bound account.", status="rejected")
         if preview["status"] != "approved" or datetime.fromisoformat(preview["expires_at"]) <= utcnow():
             raise AutonomousExecutionError("preview_expired_or_unapproved", "The preview is expired or not approved.", status="rejected")
         snapshot = self.execution.get_snapshot(preview["snapshot_id"])
@@ -503,7 +597,7 @@ class AutonomousDemoService:
         # Forced fresh status and broker state are retrieved after the durable claim.
         dispatched = False
         try:
-            account = await self.account_status_service.retrieve(user_sub)
+            account = await self.account_status_service.retrieve(user_sub, context.account_alias)
             if settings.kill_switch_enabled:
                 raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks order submission.", status="rejected")
             providers, blackouts, _ = await self._provider_state()
@@ -511,6 +605,9 @@ class AutonomousDemoService:
                 raise AutonomousExecutionError("news_validation_unavailable", "Required news-blackout validation failed closed.", status="rejected")
             if account.positions_count >= context.risk["maximum_open_positions"] or account.pending_orders_count >= context.risk["maximum_pending_orders"]:
                 raise AutonomousExecutionError("position_or_order_limit", "The account position or pending-order limit was reached.", status="rejected")
+            day_start=utcnow().replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
+            if self.execution.new_entries_since(user_sub,context.account_id,day_start)>=context.risk["maximum_new_entries_per_day"]:
+                raise AutonomousExecutionError("daily_entry_limit","The profile's maximum new entries per day was reached.",status="rejected")
             total_loss = account.today.net + account.open_net_pnl
             if account.balance <= 0 or total_loss <= -(account.balance * context.risk["daily_loss_limit_percent"] / 100):
                 raise AutonomousExecutionError("daily_loss_limit", "The account daily loss limit was reached.", status="rejected")
@@ -554,16 +651,29 @@ class AutonomousDemoService:
                     "takeProfit": preview["take_profit"], "takeProfitType": "absolute",
                     "strategyId": f"afd-{preview_id[-20:]}",
                 }
+                if preview["order_type"] == "stop":
+                    order_payload["stopPrice"] = preview["entry"]
+                    order_payload["price"] = 0
                 response = await client.place_order(order_payload)
                 dispatched = True
                 after_orders = await client.get_orders()
                 history = await client.get_orders_history()
                 after_positions = await client.get_open_positions()
                 reconciliation = self._reconcile(config, after_orders, history, after_positions, preview, response)
+                if reconciliation.get("position_found") and not (reconciliation.get("stop_loss_matches") and reconciliation.get("take_profit_matches")):
+                    position_id=reconciliation.get("broker_position_id")
+                    emergency={"attempted":False,"verified_flat":False}
+                    if position_id:
+                        emergency["attempted"]=True
+                        await client.close_position(position_id,strategy_id=f"afd-emergency-{preview_id[-10:]}")
+                        final_positions=map_configured_rows(config_response=config,data_response=await client.get_open_positions(),
+                            config_key="positionsConfig",data_key="positions")
+                        emergency["verified_flat"]=not any(str(_find_value(row,("positionId","id")))==str(position_id) for row in final_positions)
+                    reconciliation["protection_failure"]=True;reconciliation["emergency_close"]=emergency
             finally:
                 await client.aclose()
             broker_order_id = str(_find_value(response, ("orderId", "id")) or reconciliation.get("broker_order_id") or "") or None
-            state = "verified" if reconciliation["verified"] else "unknown"
+            state = "protection_failure" if reconciliation.get("protection_failure") else "verified" if reconciliation["verified"] else "unknown"
             self.execution.update_submission(
                 submission_id, submission_state=state, broker_order_id=broker_order_id,
                 broker_position_id=reconciliation.get("broker_position_id"),
@@ -573,14 +683,17 @@ class AutonomousDemoService:
             )
             self.execution.mark_preview_submitted(preview_id)
             result = self.execution.get_submission(preview_id=preview_id) or {}
-            self._record_run(context, preview, state, broker_order_id, self._submission_result(result))
+            execution_id=self._record_run(context, preview, state, broker_order_id, self._submission_result(result))
+            self.execution.update_submission(submission_id,execution_id=execution_id)
             logger.info(
                 "autonomous_demo submission_completed user_id=%s connection_id=%s account_id=%s acc_num=%s preview_id=%s idempotency_key_hash=%s broker_order_id=%s broker_position_id=%s reconciliation_verified=%s result=%s",
                 user_sub, context.connection_id, context.account_id, context.acc_num,
                 preview_id, key_hash, broker_order_id, reconciliation.get("broker_position_id"),
                 reconciliation["verified"], state,
             )
-            return self._submission_result(result)
+            return {**self._submission_result(result),"execution_id":execution_id,"account_alias":context.account_alias,"confirmed_demo":True,
+                "symbol":preview["pair"],"side":preview["side"],"order_type":preview["order_type"],"quantity":preview["lot_size"],
+                "entry":preview["entry"],"stop_loss":preview["stop_loss"],"take_profit":preview["take_profit"]}
         except AutonomousExecutionError as exc:
             self.execution.update_submission(submission_id, submission_state="rejected", reconciliation_json=exc.as_dict())
             logger.warning(
@@ -641,15 +754,101 @@ class AutonomousDemoService:
     @staticmethod
     def _submission_result(record: dict[str, Any]) -> dict[str, Any]:
         state = record.get("submission_state", "unknown")
-        return {"schema_version": "1.0", "status": "submitted" if state == "verified" else state, "broker_order_id": record.get("broker_order_id"), "broker_position_id": record.get("broker_position_id"), "reconciliation": record.get("reconciliation", {}), "manual_review_required": state == "unknown"}
+        return {"schema_version": "1.0", "status": "submitted" if state == "verified" else state, "execution_id":record.get("execution_id"),"broker_order_id": record.get("broker_order_id"), "broker_position_id": record.get("broker_position_id"), "reconciliation": record.get("reconciliation", {}), "manual_review_required": state == "unknown"}
 
     def _record_run(self, context: VerifiedDemoContext, preview: dict[str, Any], state: str, broker_order_id: str | None, result: dict[str, Any]) -> str:
         now, run_id = utcnow(), f"run_{uuid4().hex}"
         self.execution.insert_run({"id": run_id, "user_sub": context.user_sub, "connection_id": context.connection_id, "account_id": context.account_id, "acc_num": context.acc_num, "snapshot_id": preview["snapshot_id"], "preview_id": preview["id"], "strategy_name": context.risk["strategy_name"], "strategy_version": context.risk["strategy_version"], "decision": "submit", "selected_pair": preview["pair"], "selected_side": preview["side"], "result_status": state, "broker_order_id": broker_order_id, "result_json": result, "started_at": now.isoformat(), "completed_at": now.isoformat(), "created_at": now.isoformat()})
         return run_id
 
-    async def record_no_trade(self, user_sub: str, snapshot_id: str, reason_codes: list[str], pairs: list[str]) -> dict[str, Any]:
-        context = await self.context(user_sub, require_mode=False)
+    async def review_action(self,user_sub:str,profile_ref:str,action_type:str,target_id:str)->dict[str,Any]:
+        if action_type not in {"cancel_order","close_position"}:
+            raise AutonomousExecutionError("invalid_action","Unsupported demo risk-reduction action.",status="rejected")
+        context=await self.context(user_sub,profile_ref)
+        client=self._client(context.connection)
+        try:
+            config=await client.get_config()
+            payload=await (client.get_orders() if action_type=="cancel_order" else client.get_open_positions())
+            rows=map_configured_rows(config_response=config,data_response=payload,
+                config_key="ordersConfig" if action_type=="cancel_order" else "positionsConfig",
+                data_key="orders" if action_type=="cancel_order" else "positions")
+        except (TradeLockerError,TradeLockerMappingError):
+            raise AutonomousExecutionError("target_unavailable","The profile-bound broker target could not be verified.",status="rejected") from None
+        finally: await client.aclose()
+        aliases=("orderId","id") if action_type=="cancel_order" else ("positionId","id")
+        target=next((row for row in rows if str(_find_value(row,aliases))==str(target_id)),None)
+        if target is None: raise AutonomousExecutionError("target_not_found","The pending order or position was not found on the profile-bound account.",status="rejected")
+        now=utcnow();preview_id=f"{'cancel' if action_type=='cancel_order' else 'close'}_{uuid4().hex}"
+        record={"id":preview_id,"user_sub":user_sub,"action_type":action_type,"profile_ref":context.profile_ref,
+            "account_record_id":context.account_record_id,"connection_ref":context.connection_ref,"connection_id":context.connection_id,
+            "account_id":context.account_id,"acc_num":context.acc_num,"account_alias":context.account_alias,"environment":context.environment,
+            "server":context.server,"base_url":context.base_url,"demo_classification":context.demo_classification,
+            "target_id":str(target_id),"target_json":target,"status":"approved",
+            "expires_at":(now+timedelta(seconds=settings.autonomous_preview_ttl_seconds)).isoformat(),"created_at":now.isoformat()}
+        self.execution.insert_action_preview(record)
+        return {"schema_version":"1.0","status":"approved","preview_id":preview_id,"action":action_type,
+            "profile_ref":context.profile_ref,"account_alias":context.account_alias,"target":target,
+            "expires_at":record["expires_at"],"submission_allowed":True,"blocking_reasons":[]}
+
+    async def submit_action(self,user_sub:str,preview_id:str,idempotency_key:str)->dict[str,Any]:
+        preview=self.execution.get_action_preview(preview_id)
+        if not preview or preview["user_sub"]!=user_sub: raise AutonomousExecutionError("preview_not_found","The action preview is unavailable.",status="rejected")
+        if preview["status"]!="approved" or datetime.fromisoformat(preview["expires_at"])<=utcnow():
+            raise AutonomousExecutionError("preview_expired_or_unapproved","The action preview is expired or not approved.",status="rejected")
+        context=await self.context(user_sub,preview["profile_ref"])
+        current=(context.profile_ref,context.account_record_id,context.connection_ref,context.connection_id,context.account_id,context.acc_num,context.environment,context.server,context.base_url,context.demo_classification)
+        stored=tuple(preview[key] for key in ("profile_ref","account_record_id","connection_ref","connection_id","account_id","acc_num","environment","server","base_url","demo_classification"))
+        if current!=stored: raise AutonomousExecutionError("preview_account_mismatch","The action preview routing no longer matches its profile-bound demo account.",status="rejected")
+        execution_id=f"exec_{uuid4().hex}"
+        claimed,existing=self.execution.claim_action(execution_id,preview_id,user_sub,idempotency_key,preview["action_type"],preview["target_id"])
+        if not claimed:return self._action_result(existing)
+        client=self._client(context.connection);dispatched=False
+        try:
+            config=await client.get_config()
+            before=await (client.get_orders() if preview["action_type"]=="cancel_order" else client.get_open_positions())
+            rows=map_configured_rows(config_response=config,data_response=before,
+                config_key="ordersConfig" if preview["action_type"]=="cancel_order" else "positionsConfig",
+                data_key="orders" if preview["action_type"]=="cancel_order" else "positions")
+            aliases=("orderId","id") if preview["action_type"]=="cancel_order" else ("positionId","id")
+            if not any(str(_find_value(row,aliases))==preview["target_id"] for row in rows):
+                raise AutonomousExecutionError("target_not_found","The broker target no longer exists.",status="rejected")
+            response=await (client.cancel_order(preview["target_id"]) if preview["action_type"]=="cancel_order" else client.close_position(preview["target_id"],strategy_id=f"afd-{preview_id[-20:]}"));dispatched=True
+            after=await (client.get_orders() if preview["action_type"]=="cancel_order" else client.get_open_positions())
+            after_rows=map_configured_rows(config_response=config,data_response=after,
+                config_key="ordersConfig" if preview["action_type"]=="cancel_order" else "positionsConfig",
+                data_key="orders" if preview["action_type"]=="cancel_order" else "positions")
+            absent=not any(str(_find_value(row,aliases))==preview["target_id"] for row in after_rows)
+            reconciliation={"target_absent":absent,"verified":absent,"target_id":preview["target_id"]}
+            state="verified" if absent else "unknown"
+            self.execution.update_action_execution(execution_id,state=state,broker_response={"accepted":True},reconciliation=reconciliation)
+            return self._action_result(self.execution.get_action_execution(user_sub,execution_id) or {})
+        except AutonomousExecutionError as exc:
+            self.execution.update_action_execution(execution_id,state="rejected",error_category=exc.code,reconciliation=exc.as_dict());raise
+        except (TradeLockerError,TradeLockerMappingError) as exc:
+            code=getattr(exc,"code","mapping_unavailable");state="unknown" if dispatched or getattr(exc,"operation","") in {"cancel_order","close_position"} else "rejected"
+            self.execution.update_action_execution(execution_id,state=state,error_category=code,reconciliation={"manual_review_required":state=="unknown"})
+            if state=="unknown":return self._action_result(self.execution.get_action_execution(user_sub,execution_id) or {})
+            raise AutonomousExecutionError("broker_rejected","TradeLocker rejected the demo action.",status="rejected") from None
+        finally: await client.aclose()
+
+    @staticmethod
+    def _action_result(record:dict[str,Any])->dict[str,Any]:
+        return {"schema_version":"1.0","status":record.get("state","unknown"),"execution_id":record.get("id"),
+            "action":record.get("action_type"),"target_id":record.get("target_id"),"error_category":record.get("error_category"),
+            "reconciliation":record.get("reconciliation",{}),"created_at":record.get("created_at"),"completed_at":record.get("completed_at"),
+            "manual_review_required":record.get("state")=="unknown"}
+
+    def execution_result(self,user_sub:str,execution_id:str)->dict[str,Any]:
+        action=self.execution.get_action_execution(user_sub,execution_id)
+        if action:return self._action_result(action)
+        run=self.execution.get_run(user_sub,execution_id)
+        if not run:raise AutonomousExecutionError("execution_not_found","No owned demo execution was found.",status="not_found")
+        return {"schema_version":"1.0","status":run["result_status"],"execution_id":run["id"],"action":run["decision"],
+            "symbol":run.get("selected_pair"),"side":run.get("selected_side"),"broker_order_id":run.get("broker_order_id"),
+            "result":run.get("result"),"created_at":run.get("created_at"),"completed_at":run.get("completed_at")}
+
+    async def record_no_trade(self, user_sub: str, profile_ref: str, snapshot_id: str, reason_codes: list[str], pairs: list[str]) -> dict[str, Any]:
+        context = await self.context(user_sub, profile_ref, require_mode=False, allow_autonomous=True)
         snapshot = self.execution.get_snapshot(snapshot_id)
         if not snapshot or snapshot["user_sub"] != user_sub or snapshot["account_id"] != context.account_id:
             raise AutonomousExecutionError("snapshot_not_found", "The snapshot is unavailable.", status="rejected")

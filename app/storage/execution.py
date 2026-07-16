@@ -41,11 +41,12 @@ class ExecutionRepository:
                       CHECK(execution_mode IN ('read_only','demo_manual','demo_autonomous')),
                     strategy_name TEXT NOT NULL DEFAULT 'ai_competition_v1',
                     strategy_version TEXT NOT NULL DEFAULT '1.0',
-                    risk_per_trade_percent REAL NOT NULL DEFAULT 1.0,
+                    risk_per_trade_percent REAL NOT NULL DEFAULT 0.25,
                     daily_loss_limit_percent REAL NOT NULL DEFAULT 3.0,
                     drawdown_cutoff_percent REAL NOT NULL DEFAULT 10.0,
                     maximum_open_positions INTEGER NOT NULL DEFAULT 1,
                     maximum_pending_orders INTEGER NOT NULL DEFAULT 1,
+                    maximum_new_entries_per_day INTEGER NOT NULL DEFAULT 2,
                     minimum_reward_risk REAL NOT NULL DEFAULT 1.5,
                     equity_high_watermark REAL,
                     allowed_pairs_json TEXT NOT NULL,
@@ -62,6 +63,8 @@ class ExecutionRepository:
                 CREATE TABLE IF NOT EXISTS autonomous_order_previews (
                     id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, user_sub TEXT NOT NULL,
                     connection_id TEXT NOT NULL, account_id TEXT NOT NULL, acc_num TEXT NOT NULL,
+                    profile_ref TEXT, account_record_id TEXT, connection_ref TEXT, account_alias TEXT,
+                    server TEXT, base_url TEXT, demo_classification TEXT,
                     environment TEXT NOT NULL, pair TEXT NOT NULL, instrument_id TEXT NOT NULL,
                     route_id TEXT NOT NULL, side TEXT NOT NULL, order_type TEXT NOT NULL,
                     entry REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
@@ -83,6 +86,23 @@ class ExecutionRepository:
                     result_json TEXT NOT NULL, started_at TEXT NOT NULL,
                     completed_at TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS autonomous_decision_runs (
+                    id TEXT PRIMARY KEY, run_key TEXT NOT NULL, user_sub TEXT NOT NULL,
+                    profile_ref TEXT NOT NULL, account_record_id TEXT, connection_ref TEXT,
+                    strategy_ref TEXT NOT NULL, strategy_version TEXT NOT NULL,
+                    decision_provider TEXT NOT NULL, model_identifier TEXT,
+                    trigger_reason TEXT NOT NULL, state TEXT NOT NULL, shadow_mode INTEGER NOT NULL DEFAULT 1,
+                    snapshot_id TEXT, context_hash TEXT, context_json TEXT NOT NULL DEFAULT '{}',
+                    decision_json TEXT NOT NULL DEFAULT '{}', validation_json TEXT NOT NULL DEFAULT '{}',
+                    execution_json TEXT NOT NULL DEFAULT '{}',
+                    preview_id TEXT, execution_id TEXT, reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                    usage_json TEXT NOT NULL DEFAULT '{}', provider_latency_ms INTEGER,
+                    started_at TEXT NOT NULL, completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(user_sub,profile_ref,run_key)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_autonomous_decision_run
+                    ON autonomous_decision_runs(user_sub,profile_ref)
+                    WHERE state IN ('claimed','snapshotting','deciding','validating','previewing','submitting');
                 CREATE TABLE IF NOT EXISTS broker_submissions (
                     id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
                     idempotency_key TEXT NOT NULL UNIQUE, request_fingerprint TEXT NOT NULL,
@@ -92,11 +112,47 @@ class ExecutionRepository:
                     verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     FOREIGN KEY(preview_id) REFERENCES autonomous_order_previews(id)
                 );
+                CREATE TABLE IF NOT EXISTS demo_action_previews (
+                    id TEXT PRIMARY KEY, user_sub TEXT NOT NULL, action_type TEXT NOT NULL,
+                    profile_ref TEXT NOT NULL, account_record_id TEXT NOT NULL, connection_ref TEXT NOT NULL,
+                    connection_id TEXT NOT NULL, account_id TEXT NOT NULL, acc_num TEXT NOT NULL,
+                    account_alias TEXT NOT NULL, environment TEXT NOT NULL, server TEXT NOT NULL, base_url TEXT NOT NULL,
+                    demo_classification TEXT NOT NULL, target_id TEXT NOT NULL, target_json TEXT NOT NULL,
+                    status TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS demo_action_executions (
+                    id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE, user_sub TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL, action_type TEXT NOT NULL, target_id TEXT NOT NULL,
+                    state TEXT NOT NULL, broker_response_json TEXT NOT NULL DEFAULT '{}',
+                    reconciliation_json TEXT NOT NULL DEFAULT '{}', error_category TEXT,
+                    created_at TEXT NOT NULL, completed_at TEXT,
+                    UNIQUE(user_sub,idempotency_key),
+                    FOREIGN KEY(preview_id) REFERENCES demo_action_previews(id)
+                );
+                CREATE TABLE IF NOT EXISTS demo_reconciliation_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT NOT NULL,
+                    state TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    FOREIGN KEY(execution_id) REFERENCES demo_action_executions(id) ON DELETE CASCADE
+                );
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(execution_settings)")}
             if "equity_high_watermark" not in columns:
                 db.execute("ALTER TABLE execution_settings ADD COLUMN equity_high_watermark REAL")
+            if "maximum_new_entries_per_day" not in columns:
+                db.execute("ALTER TABLE execution_settings ADD COLUMN maximum_new_entries_per_day INTEGER NOT NULL DEFAULT 2")
+            preview_columns = {row["name"] for row in db.execute("PRAGMA table_info(autonomous_order_previews)")}
+            for name in ("profile_ref","account_record_id","connection_ref","account_alias","server","base_url","demo_classification"):
+                if name not in preview_columns:
+                    db.execute(f"ALTER TABLE autonomous_order_previews ADD COLUMN {name} TEXT")
+            submission_columns={row["name"] for row in db.execute("PRAGMA table_info(broker_submissions)")}
+            if "execution_id" not in submission_columns:
+                db.execute("ALTER TABLE broker_submissions ADD COLUMN execution_id TEXT")
+            if "execution_origin" not in preview_columns:
+                db.execute("ALTER TABLE autonomous_order_previews ADD COLUMN execution_origin TEXT NOT NULL DEFAULT 'manual'")
+            decision_columns={row["name"] for row in db.execute("PRAGMA table_info(autonomous_decision_runs)")}
+            if "execution_json" not in decision_columns:
+                db.execute("ALTER TABLE autonomous_decision_runs ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{}'")
 
     def get_or_create_settings(self, user_sub: str, connection_id: str, account_id: str, acc_num: str) -> dict[str, Any]:
         now = utcnow().isoformat()
@@ -147,7 +203,7 @@ class ExecutionRepository:
         if row is None:
             raise KeyError("record not found")
         result = dict(row)
-        for key in ("allowed_pairs_json", "normalized_snapshot_json", "violations_json", "broker_metadata_json", "result_json", "reconciliation_json", "broker_response_sanitized_json", "no_trade_reason_codes_json", "rejection_reason_codes_json"):
+        for key in ("allowed_pairs_json", "normalized_snapshot_json", "violations_json", "broker_metadata_json", "result_json", "reconciliation_json", "broker_response_sanitized_json", "no_trade_reason_codes_json", "rejection_reason_codes_json", "context_json", "decision_json", "validation_json", "execution_json", "reason_codes_json", "usage_json"):
             if key in result:
                 result[key.removesuffix("_json")] = json.loads(result.pop(key))
         return result
@@ -225,6 +281,48 @@ class ExecutionRepository:
         with self._connect() as db:
             db.execute(f"INSERT INTO autonomous_runs({columns}) VALUES ({values})", encoded)
 
+    def claim_decision_run(self, record: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        encoded={key:json.dumps(value,separators=(",",":"),sort_keys=True) if key.endswith("_json") else value for key,value in record.items()}
+        columns=",".join(encoded); values=",".join(f":{key}" for key in encoded)
+        try:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(f"INSERT INTO autonomous_decision_runs({columns}) VALUES ({values})",encoded)
+            return True,self.get_decision_run(record["user_sub"],record["id"]) or {}
+        except sqlite3.IntegrityError:
+            with self._connect() as db:
+                row=db.execute("""SELECT * FROM autonomous_decision_runs WHERE user_sub=? AND profile_ref=?
+                    AND (run_key=? OR state IN ('claimed','snapshotting','deciding','validating','previewing','submitting'))
+                    ORDER BY (run_key=?) DESC,created_at DESC LIMIT 1""",
+                    (record["user_sub"],record["profile_ref"],record["run_key"],record["run_key"])).fetchone()
+            return False,self._decode(row) if row else {}
+
+    def update_decision_run(self, run_id: str, **updates: Any) -> None:
+        updates["updated_at"]=utcnow().isoformat()
+        encoded={key:json.dumps(value,separators=(",",":"),sort_keys=True) if key.endswith("_json") else value for key,value in updates.items()}
+        assignments=",".join(f"{key}=:{key}" for key in encoded)
+        with self._connect() as db:
+            db.execute(f"UPDATE autonomous_decision_runs SET {assignments} WHERE id=:id",{**encoded,"id":run_id})
+
+    def get_decision_run(self,user_sub:str,run_id:str|None=None,*,profile_ref:str|None=None)->dict[str,Any]|None:
+        with self._connect() as db:
+            if run_id:
+                row=db.execute("SELECT * FROM autonomous_decision_runs WHERE id=? AND user_sub=?",(run_id,user_sub)).fetchone()
+            elif profile_ref:
+                row=db.execute("SELECT * FROM autonomous_decision_runs WHERE user_sub=? AND profile_ref=? ORDER BY created_at DESC LIMIT 1",(user_sub,profile_ref)).fetchone()
+            else:
+                row=db.execute("SELECT * FROM autonomous_decision_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT 1",(user_sub,)).fetchone()
+        return self._decode(row) if row else None
+
+    def get_decision_run_by_id(self,run_id:str)->dict[str,Any]|None:
+        with self._connect() as db:row=db.execute("SELECT * FROM autonomous_decision_runs WHERE id=?",(run_id,)).fetchone()
+        return self._decode(row) if row else None
+
+    def recent_decision_runs(self,user_sub:str,limit:int=20)->list[dict[str,Any]]:
+        with self._connect() as db:
+            rows=db.execute("SELECT * FROM autonomous_decision_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT ?",(user_sub,limit)).fetchall()
+        return [self._decode(row) for row in rows]
+
     def get_run(self, user_sub: str, run_id: str | None = None) -> dict[str, Any] | None:
         with self._connect() as db:
             if run_id:
@@ -232,3 +330,58 @@ class ExecutionRepository:
             else:
                 row = db.execute("SELECT * FROM autonomous_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT 1", (user_sub,)).fetchone()
         return self._decode(row) if row else None
+
+    def insert_action_preview(self, record: dict[str,Any]) -> None:
+        encoded={**record,"target_json":json.dumps(record["target_json"],separators=(",",":"),sort_keys=True)}
+        with self._connect() as db:
+            db.execute("""INSERT INTO demo_action_previews(id,user_sub,action_type,profile_ref,account_record_id,connection_ref,
+                connection_id,account_id,acc_num,account_alias,environment,server,base_url,demo_classification,target_id,
+                target_json,status,expires_at,created_at) VALUES(:id,:user_sub,:action_type,:profile_ref,:account_record_id,:connection_ref,
+                :connection_id,:account_id,:acc_num,:account_alias,:environment,:server,:base_url,:demo_classification,:target_id,
+                :target_json,:status,:expires_at,:created_at)""",encoded)
+
+    def get_action_preview(self, preview_id:str) -> dict[str,Any]|None:
+        with self._connect() as db: row=db.execute("SELECT * FROM demo_action_previews WHERE id=?",(preview_id,)).fetchone()
+        if not row:return None
+        result=dict(row);result["target"]=json.loads(result.pop("target_json"));return result
+
+    def claim_action(self, execution_id:str, preview_id:str, user_sub:str, idempotency_key:str, action_type:str, target_id:str) -> tuple[bool,dict[str,Any]]:
+        now=utcnow().isoformat()
+        try:
+            with self._connect() as db:
+                db.execute("""INSERT INTO demo_action_executions(id,preview_id,user_sub,idempotency_key,action_type,target_id,state,created_at)
+                    VALUES(?,?,?,?,?,?,'claimed',?)""",(execution_id,preview_id,user_sub,idempotency_key,action_type,target_id,now))
+            return True,self.get_action_execution(user_sub,execution_id) or {}
+        except sqlite3.IntegrityError:
+            with self._connect() as db:
+                row=db.execute("SELECT * FROM demo_action_executions WHERE preview_id=? OR (user_sub=? AND idempotency_key=?)",(preview_id,user_sub,idempotency_key)).fetchone()
+            return False,self._decode(row) if row else {}
+
+    def update_action_execution(self, execution_id:str, *, state:str, broker_response:dict|None=None,
+                                reconciliation:dict|None=None,error_category:str|None=None) -> None:
+        with self._connect() as db:
+            db.execute("""UPDATE demo_action_executions SET state=?,broker_response_json=?,reconciliation_json=?,error_category=?,completed_at=? WHERE id=?""",
+                (state,json.dumps(broker_response or {}),json.dumps(reconciliation or {}),error_category,utcnow().isoformat(),execution_id))
+            db.execute("INSERT INTO demo_reconciliation_events(execution_id,state,details_json,created_at) VALUES(?,?,?,?)",
+                (execution_id,state,json.dumps(reconciliation or {}),utcnow().isoformat()))
+
+    def get_action_execution(self,user_sub:str,execution_id:str) -> dict[str,Any]|None:
+        with self._connect() as db: row=db.execute("SELECT * FROM demo_action_executions WHERE id=? AND user_sub=?",(execution_id,user_sub)).fetchone()
+        if not row:return None
+        result=dict(row)
+        result["broker_response"]=json.loads(result.pop("broker_response_json"));result["reconciliation"]=json.loads(result.pop("reconciliation_json"))
+        return result
+
+    def recent_executions(self,user_sub:str,limit:int=20)->list[dict[str,Any]]:
+        with self._connect() as db:
+            actions=db.execute("SELECT id,action_type,state,target_id,error_category,created_at,completed_at FROM demo_action_executions WHERE user_sub=? ORDER BY created_at DESC LIMIT ?",(user_sub,limit)).fetchall()
+            runs=db.execute("SELECT id,decision action_type,result_status state,broker_order_id target_id,NULL error_category,created_at,completed_at FROM autonomous_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT ?",(user_sub,limit)).fetchall()
+            decisions=db.execute("""SELECT id,'autonomous_decision' action_type,state,profile_ref target_id,
+                CASE WHEN reason_codes_json='[]' THEN NULL ELSE reason_codes_json END error_category,created_at,completed_at
+                FROM autonomous_decision_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT ?""",(user_sub,limit)).fetchall()
+        return sorted([dict(row) for row in [*actions,*runs,*decisions]],key=lambda x:x["created_at"],reverse=True)[:limit]
+
+    def new_entries_since(self,user_sub:str,account_id:str,since_iso:str)->int:
+        with self._connect() as db:
+            return int(db.execute("""SELECT COUNT(*) count FROM autonomous_runs WHERE user_sub=? AND account_id=?
+                AND decision='submit' AND result_status IN ('verified','unknown') AND created_at>=?""",(user_sub,account_id,since_iso)).fetchone()["count"])

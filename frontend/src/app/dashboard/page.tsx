@@ -4,7 +4,7 @@ import { BackendError, backendFetch } from "@/lib/backend";
 import { backendErrorMessage } from "@/lib/backend-error-message";
 import { auth0 } from "@/lib/auth0";
 import { parseTradeLockerStatus, type TradeLockerStatus } from "@/lib/tradelocker-status";
-import AccountsPanel, { type AccountSummary, type ConnectionSummary, type ProfileSummary } from "./accounts-panel";
+import AccountsPanel, { type AccountSummary, type ConnectionSummary, type DailySummary, type ProfileSummary, type ScheduleSummary, type WorkerHealth } from "./accounts-panel";
 
 type DashboardProps = { searchParams: Promise<{ connected?: string }> };
 
@@ -15,11 +15,18 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
   let tradeLocker: TradeLockerStatus = parseTradeLockerStatus(null);
   let error = "";
   let connections: ConnectionSummary[] = [], accounts: AccountSummary[] = [], profiles: ProfileSummary[] = [];
+  let executions: Array<{id:string;action_type:string;state:string;created_at:string}> = [];
+  let schedules:ScheduleSummary[]=[];let workerHealth:WorkerHealth={status:"unavailable",workers:[]};
+  let dailySummary:DailySummary={date:"",outcomes:{TRADE:0,NO_TRADE:0,BLOCKED:0,ERROR:0},daily_entry_count:0,kill_switch:true,armed_profiles:0};
   try {
     tradeLocker = parseTradeLockerStatus(await backendFetch<unknown>("/api/broker/status"));
     connections = (await backendFetch<{ connections: ConnectionSummary[] }>("/api/broker/connections")).connections;
     accounts = (await backendFetch<{ accounts: AccountSummary[] }>("/api/broker/accounts")).accounts;
     profiles = (await backendFetch<{ profiles: ProfileSummary[] }>("/api/execution-profiles")).profiles;
+    executions = (await backendFetch<{ executions: typeof executions }>("/api/demo-executions")).executions;
+    schedules = (await backendFetch<{ schedules: ScheduleSummary[] }>("/api/autonomous-schedules")).schedules;
+    workerHealth = await backendFetch<WorkerHealth>("/api/autonomous-worker-health");
+    dailySummary = await backendFetch<DailySummary>("/api/autonomous-daily-summary");
   }
   catch (caught) { error = caught instanceof BackendError ? backendErrorMessage(caught) : "Unable to load TradeLocker connection status."; }
 
@@ -40,7 +47,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
       <section className="grid">
         <article className="card"><div className="label">Signed in as</div><div className="value">{session.user.email ?? session.user.name}</div></article>
         <article className="card"><div className="label">TradeLocker connection status</div><div className="value"><span className="status">{tradeLocker.status.replaceAll("_", " ")}</span></div></article>
-        <article className="card"><div className="label">Selected TradeLocker account</div><div className="value">{tradeLocker.selected_account ? `${tradeLocker.selected_account.server} · #${tradeLocker.selected_account.account_id} · accNum ${tradeLocker.selected_account.account_number}` : "Not selected"}</div></article>
+        <article className="card"><div className="label">Default TradeLocker Account</div><div className="value">{tradeLocker.selected_account ? (tradeLocker.selected_account.account_alias ?? "Configured") : "Not configured"}</div><p>Used for general account requests when no account alias or execution profile is specified.</p></article>
         <article className="card"><div className="label">Next action</div><div className="value">{nextAction}</div></article>
       </section>
       {setupComplete && <section className="completion card">
@@ -55,7 +62,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
         {tradeLocker.status === "connected_no_account" && <Link className="button secondary" href="/select-account">Select TradeLocker account</Link>}
         <Link className="button secondary" href="/settings">Settings</Link>
       </div>
-      <AccountsPanel connections={connections} accounts={accounts} profiles={profiles} />
+      <AccountsPanel connections={connections} accounts={accounts} profiles={profiles} executions={executions} schedules={schedules} workerHealth={workerHealth} dailySummary={dailySummary} />
     </main>
   );
 }

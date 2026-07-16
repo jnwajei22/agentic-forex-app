@@ -17,14 +17,24 @@ const allowed = new Set([
   "broker/connections",
   "broker/accounts",
   "execution-profiles",
+  "demo-executions",
+  "autonomous-schedules",
+  "autonomous-runs",
+  "autonomous-daily-summary",
+  "autonomous-worker-health",
+  "operations/kill-switch/enable",
 ]);
 
 async function forward(request: NextRequest, segments: string[], method: string) {
   const path = segments.join("/");
   const dynamicAllowed = /^broker\/(accounts|connections)\/[^/]+\/(alias|default|disable)$/.test(path)
     || /^execution-profiles\/[^/]+$/.test(path);
+  const profileStatusAllowed = /^execution-profiles\/[^/]+\/demo-status$/.test(path);
+  const autonomousAllowed = /^execution-profiles\/[^/]+\/autonomy\/(status|arm|disarm|schedule)$/.test(path)
+    || /^autonomous-schedules\/[^/]+(\/(pause|resume))?$/.test(path)
+    || /^autonomous-schedule-runs\/[^/]+\/retry$/.test(path);
   const discoveryWithQuery = path === "broker/tradelocker/discover-accounts";
-  if (!allowed.has(path) && !dynamicAllowed && !discoveryWithQuery) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (!allowed.has(path) && !dynamicAllowed && !profileStatusAllowed && !autonomousAllowed && !discoveryWithQuery) return NextResponse.json({ error: "Not found" }, { status: 404 });
   try {
     const body = method === "GET" || method === "DELETE" ? undefined : await request.text();
     let result;

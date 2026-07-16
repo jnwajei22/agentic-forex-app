@@ -91,6 +91,8 @@ async def test_get_market_candles_adds_user_owned_series_id(monkeypatch):
     expected = series()
     monkeypatch.setattr(tools, "get_market_series", lambda **kwargs: _async_value(expected))
     monkeypatch.setattr(tools, "_missing_user_connection", lambda: None)
+    context = type("Context", (), {"base_url":"https://demo.test","username":"u","password":"p","server":"s","account_id":"a","account_number":"1"})()
+    monkeypatch.setattr(tools, "BrokerAccountResolver", lambda: type("Resolver", (), {"resolve": lambda self, *args, **kwargs: context})())
     token = set_current_claims({"sub": "user-a"})
     try:
         result = await tools.get_market_candles("EURUSD", "1H")

@@ -87,6 +87,23 @@ mcp.tool(
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 mcp.tool(
+    tools.run_autonomous_demo_profile,
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True),
+)
+mcp.tool(tools.list_autonomous_schedules,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.get_autonomous_schedule_status,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.list_recent_autonomous_runs,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.get_autonomous_daily_summary,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.get_demo_execution_status,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=False,openWorldHint=True))
+mcp.tool(tools.get_demo_trading_snapshot,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=False,openWorldHint=True))
+mcp.tool(tools.review_demo_order,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True))
+mcp.tool(tools.submit_demo_order,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True))
+mcp.tool(tools.get_demo_execution_result,annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.review_cancel_demo_order,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True))
+mcp.tool(tools.submit_cancel_demo_order,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True))
+mcp.tool(tools.review_close_demo_position,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True))
+mcp.tool(tools.submit_close_demo_position,annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True))
+mcp.tool(
     tools.get_account_status,
     output_schema=TRADELOCKER_ACCOUNT_STATUS_OUTPUT_SCHEMA,
     annotations=ToolAnnotations(

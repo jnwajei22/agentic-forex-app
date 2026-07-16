@@ -61,6 +61,29 @@ small { color: var(--muted); line-height: 1.45; }
 .account-selector { width: 100%; }
 .account { display: flex; gap: 12px; align-items: flex-start; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); cursor: pointer; }
 .account:hover { border-color: #b8c0ca; }
+.management-section { margin-top: 34px; }
+.section-heading, .connection-header, .account-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+.section-heading { margin-bottom: 20px; }
+.section-heading p, .connection-header p, .account-header p { margin: 4px 0 0; }
+.connection-list, .account-stack, .profile-list { display: grid; gap: 16px; }
+.connection-card { padding: clamp(18px, 3vw, 28px); }
+.connection-header h3, .account-header h4 { margin: 0; font-size: 22px; }
+.account-stack { margin-top: 24px; }
+.account-card { border: 1px solid var(--line); border-radius: 10px; padding: 20px; background: #fbfcfd; min-width: 0; }
+.account-header h4 { font-size: 19px; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.metadata { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-top: 16px; color: var(--muted); font-size: 13px; }
+.actions.compact { margin-top: 16px; gap: 8px; }
+.actions.compact .button { padding: 8px 11px; font-size: 13px; }
+.profile-list { margin-top: 20px; }
+.profile-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.profile-row small { display: block; margin-top: 4px; }
+.technical { margin-top: 14px; color: var(--muted); font-size: 12px; }
+.technical summary { cursor: pointer; font-weight: 700; }
+.technical code { overflow-wrap: anywhere; }
+.helper { font-size: 13px; margin-bottom: 0; }
+.destructive-spacer { flex: 1; }
+.destructive-zone { border-top: 1px solid #f0d2cf; margin-top: 22px; padding-top: 16px; }
 .account:has(input:checked) { border-color: var(--accent); background: #f8fbff; box-shadow: 0 0 0 2px rgba(37, 99, 235, .1); }
 @media (max-width: 650px) {
   .shell { width: min(100% - 28px, 1060px); }
@@ -68,4 +91,7 @@ small { color: var(--muted); line-height: 1.45; }
   .nav-links a:not(.button) { display: none; }
   .page { padding-top: 34px; }
   .completion { align-items: flex-start; flex-direction: column; }
+  .section-heading, .connection-header, .account-header, .profile-row { flex-direction: column; }
+  .badges { justify-content: flex-start; }
+  .profile-row { align-items: stretch; }
 }

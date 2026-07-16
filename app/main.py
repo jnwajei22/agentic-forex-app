@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from app.api.routes.health import router as health_router
 from app.api.routes.forex import router as forex_router
@@ -10,12 +13,26 @@ from app.config.settings import settings
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.storage.brokers import BrokerStorageError
+from app.jobs.autonomous_scheduler import AutonomousSchedulerWorker
+
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    worker=AutonomousSchedulerWorker() if settings.autonomous_scheduler_embedded else None
+    task=None
+    async with mcp_app.lifespan(app_instance):
+        if worker:task=asyncio.create_task(worker.run_forever(),name="autonomous-scheduler")
+        try:yield
+        finally:
+            if worker:
+                worker.stop()
+                if task:await task
 
 app = FastAPI(
     title="Agentic Forex Desk",
     description="Focused forex research and execution-data backend for ChatGPT.",
     version="0.2.0",
-    lifespan=mcp_app.lifespan,
+    lifespan=lifespan,
 )
 app.add_middleware(MCPAuthMiddleware)
 app.add_middleware(

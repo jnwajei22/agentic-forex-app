@@ -1,3 +1,4 @@
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 import logging
 import uuid
@@ -6,7 +7,7 @@ import anyio
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.config.settings import settings
@@ -18,6 +19,9 @@ from app.models.onboarding import (
 )
 from app.models.autonomous import ExecutionMode, ExecutionSettingsUpdate
 from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
+from app.services.autonomous.runner import AutonomousDecisionRunner
+from app.jobs.autonomous_scheduler import AutonomousScheduleService
+from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
@@ -57,7 +61,7 @@ class ExecutionProfileCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     account_id: str = Field(validation_alias=AliasChoices("account_id", "accountId"))
     strategy_template_id: str = "strategy_hourly_forex_v1"
-    execution_mode: Literal["read_only", "demo_enabled", "disabled"] = "read_only"
+    execution_mode: Literal["read_only", "demo_manual", "demo_autonomous", "disabled"] = "read_only"
     risk: dict[str, Any] = Field(default_factory=dict)
     allowed_instruments: list[str] = Field(default_factory=list)
     session_rules: dict[str, Any] = Field(default_factory=dict)
@@ -66,8 +70,28 @@ class ExecutionProfileCreate(BaseModel):
 
 class ExecutionProfileUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=64)
-    execution_mode: Literal["read_only", "demo_enabled", "disabled"] | None = None
+    execution_mode: Literal["read_only", "demo_manual", "demo_autonomous", "disabled"] | None = None
     enabled: bool | None = None
+
+
+class AutonomousArmRequest(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    armed_until: str | None = Field(default=None,min_length=20,max_length=40)
+    arming_hours: int = Field(default=24,ge=1,le=24)
+    decision_provider: Literal["openai","no_trade"] = "no_trade"
+    model_identifier: str | None = Field(default=None,min_length=1,max_length=80)
+    minimum_confidence: float = Field(default=0.70,ge=0.5,le=1.0)
+    allowed_sessions: list[Literal["london","new_york","overlap"]] = Field(default_factory=lambda:["london","new_york","overlap"],min_length=1,max_length=3)
+    schedule_ref: str | None = Field(default=None,max_length=80)
+    shadow_mode: bool = True
+
+
+class AutonomousScheduleRequest(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    timezone: str = Field(default="America/Chicago",min_length=1,max_length=80)
+    local_times: list[str] = Field(default_factory=lambda:["05:00","07:00","09:00","11:00","13:15"],min_length=1,max_length=24)
+    enabled: bool = True
+    maximum_lateness_seconds: int = Field(default=600,ge=30,le=3600)
 
 
 async def current_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -116,10 +140,21 @@ async def validated_onboarding_status(user_sub: str) -> TradeLockerOnboardingSta
     repo = repository()
     connection = repo.get_connection(user_sub)
     if connection is None:
+        if repo.list_connections(user_sub):
+            return TradeLockerOnboardingStatus(status=TradeLockerConnectionStatus.EXPIRED,connected=False,
+                message="Reauthenticate TradeLocker to restore account access.")
         return TradeLockerOnboardingStatus(
             status=TradeLockerConnectionStatus.NOT_CONNECTED,
             connected=False,
         )
+    if not repo.connection_needs_discovery(user_sub, connection.connection_ref):
+        if not connection.account_id or not connection.account_number:
+            return TradeLockerOnboardingStatus(status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,connected=True)
+        stored=repo.status(user_sub)
+        selected=stored.get("selected_account")
+        return TradeLockerOnboardingStatus(status=TradeLockerConnectionStatus.READY if selected else TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
+            connected=True,selected_account=SelectedTradeLockerAccount(account_id=selected["account_id"],account_number=selected["account_number"],
+                server=selected["server"],environment=selected["environment"],account_alias=selected.get("account_alias")) if selected else None)
     try:
         async with TradeLockerClient(
             base_url=connection.base_url, username=connection.username,
@@ -133,6 +168,7 @@ async def validated_onboarding_status(user_sub: str) -> TradeLockerOnboardingSta
             "unauthorized", "invalid_credentials", "authentication_failed"
         }
         if expired or rejected:
+            repo.mark_reauthentication_required(user_sub,connection.connection_ref)
             return TradeLockerOnboardingStatus(
                 status=(TradeLockerConnectionStatus.EXPIRED if expired
                         else TradeLockerConnectionStatus.INVALID_CREDENTIALS),
@@ -228,6 +264,8 @@ async def discover_accounts(connection_id: str | None = None, claims: dict = Dep
             # Durable account listings use /api/broker/accounts and expose only safe IDs.
             return discovered
     except TradeLockerError as exc:
+        if exc.status_code in {400,401,403}:
+            repo.mark_reauthentication_required(claims["sub"],connection.connection_ref)
         return _discovery_error_response(
             exc, uuid.uuid4().hex, "discover_accounts"
         )
@@ -373,36 +411,136 @@ async def delete_execution_profile(profile_id: str, claims: dict = Depends(curre
     return {"status":"deleted","profile_id":profile_id}
 
 
+@router.post("/execution-profiles/{profile_id}/autonomy/arm")
+async def arm_autonomous_profile(profile_id:str,payload:AutonomousArmRequest,claims:dict=Depends(current_claims))->dict:
+    armed_until=payload.armed_until or (datetime.now(timezone.utc)+timedelta(hours=payload.arming_hours)).isoformat()
+    try:
+        # Re-verify the profile-bound account against TradeLocker before granting time-bounded authority.
+        await AutonomousDemoService().context(claims["sub"],profile_id,require_mode=False)
+        profile=repository().arm_autonomous_profile(claims["sub"],profile_id,armed_until=armed_until,
+            decision_provider=payload.decision_provider,model_identifier=payload.model_identifier,
+            minimum_confidence=payload.minimum_confidence,allowed_sessions=list(payload.allowed_sessions),
+            schedule_ref=payload.schedule_ref,shadow_mode=payload.shadow_mode)
+    except (BrokerStorageError,AutonomousExecutionError) as exc:
+        detail=exc.as_dict() if isinstance(exc,AutonomousExecutionError) else str(exc)
+        raise HTTPException(status_code=409,detail=detail) from None
+    logger.info("autonomous_profile_armed user_id=%s profile_ref=%s provider=%s shadow_mode=%s armed_until=%s",
+        claims["sub"],profile_id,payload.decision_provider,payload.shadow_mode,armed_until)
+    return {"status":"armed","profile":profile}
+
+
+@router.post("/execution-profiles/{profile_id}/autonomy/disarm")
+async def disarm_autonomous_profile(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().disarm_autonomous_profile(claims["sub"],profile_id):
+        raise HTTPException(status_code=404,detail="Profile not found.")
+    logger.info("autonomous_profile_disarmed user_id=%s profile_ref=%s",claims["sub"],profile_id)
+    return {"status":"disarmed","profile_id":profile_id}
+
+
+@router.get("/execution-profiles/{profile_id}/autonomy/status")
+async def autonomous_profile_status(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    try:return await AutonomousDecisionRunner().status(claims["sub"],profile_id)
+    except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
+
+
+@router.get("/autonomous-runs")
+async def recent_autonomous_runs(claims:dict=Depends(current_claims))->dict:
+    runner=AutonomousDecisionRunner()
+    return {"runs":[runner._public_run(item) for item in runner.execution.recent_decision_runs(claims["sub"],20)]}
+
+
+@router.get("/autonomous-schedules")
+async def list_autonomous_schedules_api(claims:dict=Depends(current_claims))->dict:
+    return {"schedules":AutonomousScheduleService().list(claims["sub"])}
+
+
+@router.post("/execution-profiles/{profile_id}/autonomy/schedule")
+async def save_autonomous_schedule(profile_id:str,payload:AutonomousScheduleRequest,claims:dict=Depends(current_claims))->dict:
+    try:return AutonomousScheduleService().save(claims["sub"],profile_id,timezone_name=payload.timezone,
+        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+    except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+
+
+@router.put("/autonomous-schedules/{schedule_id}")
+async def edit_autonomous_schedule(schedule_id:str,payload:AutonomousScheduleRequest,claims:dict=Depends(current_claims))->dict:
+    repo=ScheduleRepository();existing=repo.get_schedule(claims["sub"],schedule_id)
+    if not existing:raise HTTPException(status_code=404,detail="Schedule not found.")
+    try:return AutonomousScheduleService(schedules=repo).save(claims["sub"],existing["profile_ref"],timezone_name=payload.timezone,
+        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+    except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+
+
+@router.post("/autonomous-schedules/{schedule_id}/{action}")
+async def control_autonomous_schedule(schedule_id:str,action:Literal["pause","resume"],claims:dict=Depends(current_claims))->dict:
+    try:return AutonomousScheduleService().set_enabled(claims["sub"],schedule_id,action=="resume")
+    except ScheduleStorageError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+
+
+@router.delete("/autonomous-schedules/{schedule_id}")
+async def delete_autonomous_schedule(schedule_id:str,claims:dict=Depends(current_claims))->dict:
+    if not ScheduleRepository().delete_schedule(claims["sub"],schedule_id):raise HTTPException(status_code=404,detail="Schedule not found.")
+    return {"status":"deleted","schedule_id":schedule_id}
+
+
+@router.get("/autonomous-schedules/{schedule_id}")
+async def autonomous_schedule_status_api(schedule_id:str,claims:dict=Depends(current_claims))->dict:
+    try:return AutonomousScheduleService().status(claims["sub"],schedule_id)
+    except ScheduleStorageError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+
+
+@router.post("/autonomous-schedule-runs/{dispatch_id}/retry")
+async def retry_autonomous_schedule_run(dispatch_id:str,claims:dict=Depends(current_claims))->dict:
+    when=(datetime.now(timezone.utc)+timedelta(seconds=settings.autonomous_scheduler_retry_base_seconds)).isoformat()
+    if not ScheduleRepository().request_safe_retry(claims["sub"],dispatch_id,when):
+        raise HTTPException(status_code=409,detail="Only a failed pre-submit run categorized as safe can be retried.")
+    return {"status":"retry_scheduled","dispatch_id":dispatch_id,"next_retry_at":when}
+
+
+@router.get("/autonomous-daily-summary")
+async def autonomous_daily_summary_api(day:date|None=None,claims:dict=Depends(current_claims))->dict:
+    return AutonomousScheduleService().daily_summary(claims["sub"],day)
+
+
+@router.get("/autonomous-worker-health")
+async def autonomous_worker_health_api(claims:dict=Depends(current_claims))->dict:
+    return ScheduleRepository().worker_health()
+
+
+@router.post("/operations/kill-switch/enable")
+async def enable_kill_switch_api(claims:dict=Depends(current_claims))->dict:
+    settings.kill_switch_enabled=True
+    logger.warning("kill_switch_enabled user_id=%s source=dashboard",claims["sub"])
+    return {"status":"enabled","kill_switch":True}
+
+
+@router.get("/execution-profiles/{profile_id}/demo-status")
+async def demo_profile_status(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    try:return await AutonomousDemoService().status(claims["sub"],profile_id)
+    except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
+
+
+@router.get("/demo-executions")
+async def recent_demo_executions(claims:dict=Depends(current_claims))->dict:
+    return {"executions":ExecutionRepository().recent_executions(claims["sub"],20)}
+
+
 @router.get("/broker/tradelocker/execution-settings")
 async def get_execution_settings(claims: dict = Depends(current_claims)) -> dict:
-    connection = repository().get_connection(claims["sub"])
-    if not connection or not connection.account_id or not connection.account_number:
-        raise HTTPException(status_code=409, detail="Select a TradeLocker account first.")
-    value = ExecutionRepository().get_or_create_settings(
-        claims["sub"], connection.connection_id, connection.account_id, connection.account_number
-    )
-    return {
-        "execution_mode": value["execution_mode"], "account_id": connection.account_id,
-        "acc_num": connection.account_number, "environment": connection.environment,
-        "strategy_name": value["strategy_name"], "strategy_version": value["strategy_version"],
-    }
+    return {"profiles": repository().list_profiles(claims["sub"])}
 
 
 @router.put("/broker/tradelocker/execution-settings")
 async def update_execution_settings(
     payload: ExecutionSettingsUpdate, claims: dict = Depends(current_claims)
 ) -> dict:
-    try:
-        context = await AutonomousDemoService().context(claims["sub"], require_mode=False)
-    except AutonomousExecutionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from None
-    value = ExecutionRepository().set_mode(
-        claims["sub"], context.connection_id, context.account_id, context.acc_num,
-        payload.execution_mode,
-    )
+    if payload.execution_mode == ExecutionMode.DEMO_AUTONOMOUS:
+        raise HTTPException(status_code=409, detail="Demo Autonomous is not implemented.")
+    changed = repository().update_profile(claims["sub"], payload.profile_ref, execution_mode=payload.execution_mode.value)
+    if not changed:
+        raise HTTPException(status_code=404, detail="Execution profile not found.")
     logger.info(
         "TradeLocker execution_mode_changed user_id=%s connection_id=%s account_id=%s acc_num=%s environment=demo mode=%s",
-        claims["sub"], context.connection_id, context.account_id, context.acc_num,
+        claims["sub"], None, None, None,
         payload.execution_mode.value,
     )
-    return {"status": "updated", "execution_mode": value["execution_mode"], "environment": "demo"}
+    return {"status": "updated", "execution_mode": payload.execution_mode.value, "profile_ref": payload.profile_ref}

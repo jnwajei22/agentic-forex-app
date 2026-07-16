@@ -18,6 +18,7 @@ class SelectedTradeLockerAccount(BaseModel):
     account_number: str
     server: str
     environment: Literal["demo", "live"] | None = None
+    account_alias: str | None = None
 
 
 class TradeLockerOnboardingStatus(BaseModel):

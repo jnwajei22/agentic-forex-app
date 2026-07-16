@@ -55,11 +55,19 @@ EXPECTED_TOOLS = {
     "submit_autonomous_demo_order",
     "record_autonomous_no_trade",
     "get_autonomous_run_result",
+    "run_autonomous_demo_profile",
+    "list_autonomous_schedules",
+    "get_autonomous_schedule_status",
+    "list_recent_autonomous_runs",
+    "get_autonomous_daily_summary",
 }
 EXPECTED_TOOLS.update({
     "list_my_tradelocker_connections",
     "list_my_tradelocker_accounts",
     "list_execution_profiles",
+    "get_demo_execution_status","get_demo_trading_snapshot","review_demo_order","submit_demo_order",
+    "get_demo_execution_result","review_cancel_demo_order","submit_cancel_demo_order",
+    "review_close_demo_position","submit_close_demo_position",
 })
 INITIALIZE_PAYLOAD = {
     "jsonrpc": "2.0",
@@ -294,8 +302,12 @@ async def test_demo_submission_schema_cannot_target_an_account_or_edit_order():
     review = next(tool for tool in await mcp.list_tools() if tool.name == "review_autonomous_demo_order")
     assert set(review.parameters["properties"]) == {
         "snapshot_id", "pair", "side", "order_type", "entry", "stop_loss",
-        "take_profit", "reason_codes",
+        "take_profit", "reason_codes", "profile_ref",
     }
+    for name in ("submit_demo_order","submit_cancel_demo_order","submit_close_demo_position"):
+        tool=next(item for item in await mcp.list_tools() if item.name==name)
+        assert set(tool.parameters["properties"])=={"preview_id","idempotency_key"}
+        assert auth.TOOL_SCOPES[name]=="forex:execute"
     for forbidden in ("accountId", "accNum", "environment", "base_url", "quantity"):
         assert forbidden not in submit.parameters["properties"]
         assert forbidden not in review.parameters["properties"]
@@ -305,7 +317,8 @@ async def test_demo_submission_schema_cannot_target_an_account_or_edit_order():
 async def test_market_candle_tool_schema_scope_and_client_rendering_instructions():
     candle_tool = next(tool for tool in await mcp.list_tools() if tool.name == "get_market_candles")
     assert set(candle_tool.parameters["properties"]) == {
-        "symbol", "timeframe", "source", "lookback", "start_time", "end_time", "max_candles"
+        "symbol", "timeframe", "source", "lookback", "start_time", "end_time", "max_candles",
+        "account_alias", "account_ref",
     }
     assert auth.TOOL_SCOPES["get_market_candles"] == "forex:read"
     assert "client-side" in candle_tool.description

@@ -108,3 +108,35 @@ def test_disabled_account_and_connection_fail_closed(tmp_path):
     storage.set_account_enabled("u",account["public_id"],True); storage.disable_connection("u",connection.connection_ref)
     with pytest.raises(AccountResolutionError) as error: BrokerAccountResolver(storage).resolve("u")
     assert error.value.code == "account_disabled"
+
+
+def test_profile_resolution_ignores_live_dashboard_default(tmp_path):
+    storage=repo(tmp_path)
+    demo=add_connection(storage,"u",server="Demo",environment="demo")
+    live=add_connection(storage,"u",server="Live",environment="live",create_new=True)
+    accounts=storage.list_accounts("u")
+    demo_account=next(a for a in accounts if a["connection_id"]==demo.connection_ref)
+    live_account=next(a for a in accounts if a["connection_id"]==live.connection_ref)
+    storage.set_default_account("u",live_account["public_id"])
+    profile=storage.create_profile("u",name="Manual demo",account_ref=demo_account["public_id"],execution_mode="demo_manual")
+    context=BrokerAccountResolver(storage).resolve("u",profile=profile["public_id"])
+    assert context.account_record_id == demo_account["public_id"]
+    assert context.environment == "demo"
+    storage.set_default_account("u",demo_account["public_id"])
+    storage.set_default_account("u",live_account["public_id"])
+    assert BrokerAccountResolver(storage).resolve("u",profile=profile["public_id"]).account_record_id == demo_account["public_id"]
+
+
+def test_account_listing_attaches_profiles_and_empty_lists(tmp_path):
+    storage=repo(tmp_path); add_connection(storage,"u"); add_connection(storage,"u",server="Beta",create_new=True)
+    accounts=storage.list_accounts("u")
+    profile=storage.create_profile("u",name="One profile",account_ref=accounts[0]["public_id"])
+    listed={item["public_id"]:item for item in storage.list_accounts("u")}
+    assert listed[accounts[0]["public_id"]]["profiles"][0]["public_id"] == profile["public_id"]
+    assert listed[accounts[1]["public_id"]]["profiles"] == []
+
+
+def test_explicit_safe_reference_overrides_default(tmp_path):
+    storage=repo(tmp_path); add_connection(storage,"u"); add_connection(storage,"u",server="Beta",create_new=True)
+    target=next(a for a in storage.list_accounts("u") if not a["is_default_analysis"])
+    assert BrokerAccountResolver(storage).resolve("u",account_ref=target["public_id"]).account_alias == target["account_alias"]

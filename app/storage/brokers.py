@@ -7,7 +7,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +96,11 @@ class BrokerRepository:
                 db.execute("PRAGMA foreign_keys = ON")
             else:
                 self._create_connections(db)
+            connection_columns={row["name"] for row in db.execute("PRAGMA table_info(broker_connections)")}
+            if "needs_discovery_refresh" not in connection_columns:
+                db.execute("ALTER TABLE broker_connections ADD COLUMN needs_discovery_refresh INTEGER NOT NULL DEFAULT 1")
+            if "discovery_version" not in connection_columns:
+                db.execute("ALTER TABLE broker_connections ADD COLUMN discovery_version INTEGER NOT NULL DEFAULT 0")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS broker_accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +139,7 @@ class BrokerRepository:
                     user_id INTEGER NOT NULL, broker_account_id INTEGER NOT NULL,
                     strategy_template_id INTEGER NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
                     execution_mode TEXT NOT NULL DEFAULT 'read_only'
-                        CHECK(execution_mode IN ('read_only','demo_enabled','disabled')),
+                        CHECK(execution_mode IN ('read_only','demo_manual','demo_autonomous','disabled')),
                     risk_json TEXT NOT NULL DEFAULT '{}', allowed_instruments_json TEXT NOT NULL DEFAULT '[]',
                     session_rules_json TEXT NOT NULL DEFAULT '{}', news_filter_enabled INTEGER NOT NULL DEFAULT 1,
                     enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -143,10 +148,55 @@ class BrokerRepository:
                     FOREIGN KEY(broker_account_id) REFERENCES broker_accounts(id) ON DELETE RESTRICT,
                     FOREIGN KEY(strategy_template_id) REFERENCES strategy_templates(id) ON DELETE RESTRICT);
             """)
+            profile_sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_profiles'").fetchone()
+            if profile_sql and "demo_enabled" in (profile_sql["sql"] or ""):
+                db.execute("PRAGMA foreign_keys=OFF")
+                db.execute("ALTER TABLE execution_profiles RENAME TO execution_profiles_legacy_mode")
+                db.execute("""CREATE TABLE execution_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+                    user_id INTEGER NOT NULL, broker_account_id INTEGER NOT NULL,
+                    strategy_template_id INTEGER NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
+                    execution_mode TEXT NOT NULL DEFAULT 'read_only' CHECK(execution_mode IN ('read_only','demo_manual','demo_autonomous','disabled')),
+                    risk_json TEXT NOT NULL DEFAULT '{}', allowed_instruments_json TEXT NOT NULL DEFAULT '[]',
+                    session_rules_json TEXT NOT NULL DEFAULT '{}', news_filter_enabled INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(user_id,name), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(broker_account_id) REFERENCES broker_accounts(id) ON DELETE RESTRICT,
+                    FOREIGN KEY(strategy_template_id) REFERENCES strategy_templates(id) ON DELETE RESTRICT)""")
+                db.execute("""INSERT INTO execution_profiles SELECT id,public_id,user_id,broker_account_id,strategy_template_id,name,
+                    CASE execution_mode WHEN 'demo_enabled' THEN 'demo_manual' ELSE execution_mode END,risk_json,
+                    allowed_instruments_json,session_rules_json,news_filter_enabled,enabled,created_at,updated_at
+                    FROM execution_profiles_legacy_mode""")
+                db.execute("DROP TABLE execution_profiles_legacy_mode")
+                db.execute("PRAGMA foreign_keys=ON")
+            profile_columns={row["name"] for row in db.execute("PRAGMA table_info(execution_profiles)")}
+            autonomous_columns={
+                "autonomous_armed":"INTEGER NOT NULL DEFAULT 0",
+                "armed_at":"TEXT",
+                "armed_until":"TEXT",
+                "armed_by_user":"TEXT",
+                "decision_provider":"TEXT NOT NULL DEFAULT 'no_trade'",
+                "model_identifier":"TEXT",
+                "minimum_confidence":"REAL NOT NULL DEFAULT 0.70",
+                "allowed_sessions_json":"TEXT NOT NULL DEFAULT '[\"london\",\"new_york\",\"overlap\"]'",
+                "schedule_ref":"TEXT",
+                "autonomous_shadow_mode":"INTEGER NOT NULL DEFAULT 1",
+                "cooldown_minutes_after_loss":"INTEGER NOT NULL DEFAULT 60",
+            }
+            for column,declaration in autonomous_columns.items():
+                if column not in profile_columns:
+                    db.execute(f"ALTER TABLE execution_profiles ADD COLUMN {column} {declaration}")
             now = _now()
             db.execute("""INSERT OR IGNORE INTO strategy_templates
                 (public_id,name,version,description,config_json,created_at)
                 VALUES ('strategy_hourly_forex_v1','hourly_forex','1','Built-in hourly forex template','{}',?)""", (now,))
+            db.execute("""INSERT OR IGNORE INTO strategy_templates
+                (public_id,name,version,description,config_json,created_at) VALUES
+                ('strategy_ai_forex_confluence_v1','ai_forex_confluence','1',
+                 'Bounded multi-timeframe AI forex confluence strategy',?,?)""",
+                (json.dumps({"pairs":["EURUSD","GBPUSD","AUDUSD","NZDUSD","USDCAD"],
+                 "timeframes":["1d","4h","1h","15m"],"required_indicators":["sma20","sma50","rsi14","macd","atr14","structure","support_resistance"],
+                 "required_macro_series":["policy_rates","inflation","labor","growth"],"demo_only":True}),now))
             # Preserve legacy selections as durable accounts without changing credentials.
             legacy = db.execute("""SELECT id,user_id,server,account_id,account_number,environment
                 FROM broker_connections WHERE account_id IS NOT NULL AND account_number IS NOT NULL""").fetchall()
@@ -182,6 +232,7 @@ class BrokerRepository:
             environment TEXT NOT NULL DEFAULT 'unknown' CHECK(environment IN ('demo','live','unknown')),
             label TEXT, broker_name TEXT NOT NULL DEFAULT 'TradeLocker', status TEXT NOT NULL DEFAULT 'active',
             last_authenticated_at TEXT, last_discovery_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            needs_discovery_refresh INTEGER NOT NULL DEFAULT 1, discovery_version INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)""")
 
     def _fernet(self) -> Fernet:
@@ -217,7 +268,7 @@ class BrokerRepository:
                     raise BrokerStorageError("Choose the connection to reauthenticate.")
             if target:
                 db.execute("""UPDATE broker_connections SET base_url=?,username=?,password_encrypted=?,server=?,environment=?,
-                    label=COALESCE(?,label),status='active',last_authenticated_at=?,updated_at=? WHERE id=? AND user_id=?""",
+                    label=COALESCE(?,label),status='active',needs_discovery_refresh=1,last_authenticated_at=?,updated_at=? WHERE id=? AND user_id=?""",
                     (base_url.rstrip('/'),username,encrypted,server,env,label,now,now,target["id"],user_id))
                 connection_id = int(target["id"])
             else:
@@ -258,10 +309,11 @@ class BrokerRepository:
     def list_connections(self, auth0_sub: str) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute("""SELECT b.public_id,b.label,b.broker_name,b.server,b.environment,b.status,
-                b.last_authenticated_at,b.last_discovery_at,COUNT(a.id) account_count
+                b.last_authenticated_at,b.last_discovery_at,b.needs_discovery_refresh,b.discovery_version,COUNT(a.id) account_count,MAX(a.last_verified_at) last_verified_at,
+                MAX(a.is_default_analysis) is_default
                 FROM broker_connections b JOIN users u ON u.id=b.user_id LEFT JOIN broker_accounts a ON a.connection_id=b.id
                 WHERE u.auth0_sub=? GROUP BY b.id ORDER BY b.id""", (auth0_sub,)).fetchall()
-        return [{**dict(r), "connection_id": r["public_id"], "enabled": r["status"] == "active"} for r in rows]
+        return [{**dict(r), "connection_id": r["public_id"], "enabled": r["status"] == "active", "is_default":bool(r["is_default"])} for r in rows]
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -303,25 +355,41 @@ class BrokerRepository:
             db.execute("UPDATE broker_accounts SET available=0,unavailable_since=COALESCE(unavailable_since,?) WHERE connection_id=?",(now,owner["id"]))
             for aid,anum in seen:
                 db.execute("UPDATE broker_accounts SET available=1,unavailable_since=NULL WHERE connection_id=? AND broker_account_id=? AND acc_num=?",(owner["id"],aid,anum))
-            db.execute("UPDATE broker_connections SET last_discovery_at=?,updated_at=? WHERE id=?",(now,now,owner["id"]))
+            db.execute("UPDATE broker_connections SET last_discovery_at=?,updated_at=?,needs_discovery_refresh=0,discovery_version=1,status='active' WHERE id=?",(now,now,owner["id"]))
         return self.list_accounts(auth0_sub)
 
     def list_accounts(self, auth0_sub: str) -> list[dict[str, Any]]:
         with self._connect() as db:
-            rows=db.execute("""SELECT a.public_id,a.account_alias,a.account_name,a.currency,a.environment,a.broker_active,
-                a.locally_enabled,a.available,a.is_default_analysis,a.last_verified_at,a.unavailable_since,b.public_id connection_id,b.label connection_label,b.server
+            rows=db.execute("""SELECT a.public_id,a.account_alias,a.account_name,a.currency,a.environment,a.is_demo,a.broker_active,
+                a.locally_enabled,a.available,a.is_default_analysis,a.last_verified_at,a.unavailable_since,b.public_id connection_id,b.label connection_label,b.server,b.broker_name
                 FROM broker_accounts a JOIN users u ON u.id=a.user_id JOIN broker_connections b ON b.id=a.connection_id
                 WHERE u.auth0_sub=? ORDER BY a.is_default_analysis DESC,a.account_alias COLLATE NOCASE""",(auth0_sub,)).fetchall()
-        return [{**dict(r),"account_id":r["public_id"],"broker_active":bool(r["broker_active"]),"locally_enabled":bool(r["locally_enabled"]),"available":bool(r["available"]),"is_default_analysis":bool(r["is_default_analysis"])} for r in rows]
+        profiles=self.list_profiles(auth0_sub)
+        result=[]
+        for r in rows:
+            item={**dict(r),"account_id":r["public_id"],"broker_active":bool(r["broker_active"]),"locally_enabled":bool(r["locally_enabled"]),"available":bool(r["available"]),"is_default_analysis":bool(r["is_default_analysis"])}
+            item["profiles"]=[p for p in profiles if p["account_id"] == r["public_id"]]
+            result.append(item)
+        return result
 
-    def get_account_record(self, auth0_sub: str, *, alias: str | None=None, profile: str | None=None) -> sqlite3.Row | None:
+    def list_connection_tree(self, auth0_sub: str) -> list[dict[str,Any]]:
+        accounts=self.list_accounts(auth0_sub)
+        result=[]
+        for connection in self.list_connections(auth0_sub):
+            result.append({**connection,"accounts":[a for a in accounts if a["connection_id"] == connection["public_id"]]})
+        return result
+
+    def get_account_record(self, auth0_sub: str, *, alias: str | None=None, account_ref: str | None=None, profile: str | None=None) -> sqlite3.Row | None:
         with self._connect() as db:
             params: list[Any]=[auth0_sub]; condition="a.is_default_analysis=1"
             join=""
             if alias is not None: condition="a.account_alias=? COLLATE NOCASE"; params.append(alias)
+            elif account_ref is not None: condition="a.public_id=?"; params.append(account_ref)
             elif profile is not None:
                 join=" JOIN execution_profiles p ON p.broker_account_id=a.id"; condition="(p.public_id=? OR p.name=? COLLATE NOCASE)"; params.extend([profile,profile])
-            return db.execute(f"""SELECT a.*,b.public_id connection_ref,b.base_url,b.username,b.password_encrypted,b.server,b.status connection_status
+            profile_columns = "p.public_id profile_ref,p.enabled profile_enabled,p.execution_mode profile_execution_mode" if profile is not None else "NULL profile_ref,1 profile_enabled,NULL profile_execution_mode"
+            return db.execute(f"""SELECT a.*,b.public_id connection_ref,b.base_url,b.username,b.password_encrypted,b.server,b.status connection_status,
+                b.broker_name,b.label connection_label,{profile_columns}
                 FROM broker_accounts a JOIN users u ON u.id=a.user_id JOIN broker_connections b ON b.id=a.connection_id {join}
                 WHERE u.auth0_sub=? AND {condition} LIMIT 1""",params).fetchone()
 
@@ -365,6 +433,17 @@ class BrokerRepository:
         with self._connect() as db:
             return db.execute("UPDATE broker_connections SET status='disabled',updated_at=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)",(_now(),connection_ref,auth0_sub)).rowcount==1
 
+    def connection_needs_discovery(self, auth0_sub: str, connection_ref: str) -> bool:
+        with self._connect() as db:
+            row=db.execute("""SELECT b.needs_discovery_refresh FROM broker_connections b JOIN users u ON u.id=b.user_id
+                WHERE u.auth0_sub=? AND b.public_id=?""",(auth0_sub,connection_ref)).fetchone()
+        return bool(row and row["needs_discovery_refresh"])
+
+    def mark_reauthentication_required(self, auth0_sub: str, connection_ref: str) -> None:
+        with self._connect() as db:
+            db.execute("""UPDATE broker_connections SET status='reauthentication_required',needs_discovery_refresh=0,updated_at=?
+                WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",(_now(),connection_ref,auth0_sub))
+
     def delete_connection(self, auth0_sub: str) -> bool:
         connection=self.get_connection(auth0_sub)
         return self.disable_connection(auth0_sub,connection.connection_ref) if connection else False
@@ -372,37 +451,109 @@ class BrokerRepository:
     def list_profiles(self, auth0_sub: str) -> list[dict[str,Any]]:
         with self._connect() as db:
             rows=db.execute("""SELECT p.public_id,p.name,p.execution_mode,p.enabled,p.risk_json,p.allowed_instruments_json,
-                p.session_rules_json,p.news_filter_enabled,a.account_alias,a.public_id account_id,t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version
+                p.session_rules_json,p.news_filter_enabled,p.autonomous_armed,p.armed_at,p.armed_until,
+                p.decision_provider,p.model_identifier,p.minimum_confidence,p.allowed_sessions_json,p.schedule_ref,
+                p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,
+                a.account_alias,a.public_id account_id,a.environment account_environment,a.is_demo,
+                t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version
                 FROM execution_profiles p JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
                 JOIN strategy_templates t ON t.id=p.strategy_template_id WHERE u.auth0_sub=? ORDER BY p.name COLLATE NOCASE""",(auth0_sub,)).fetchall()
-        return [{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),"risk":json.loads(r["risk_json"]),"allowed_instruments":json.loads(r["allowed_instruments_json"]),"session_rules":json.loads(r["session_rules_json"])} for r in rows]
+        return [{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),
+            "autonomous_armed":bool(r["autonomous_armed"]),"autonomous_shadow_mode":bool(r["autonomous_shadow_mode"]),
+            "risk":json.loads(r["risk_json"]),"allowed_instruments":json.loads(r["allowed_instruments_json"]),
+            "session_rules":json.loads(r["session_rules_json"]),"allowed_sessions":json.loads(r["allowed_sessions_json"])} for r in rows]
+
+    def arm_autonomous_profile(self, auth0_sub: str, profile_ref: str, *, armed_until: str,
+                               decision_provider: str="no_trade", model_identifier: str|None=None,
+                               minimum_confidence: float=0.70, allowed_sessions: list[str]|None=None,
+                               schedule_ref: str|None=None, shadow_mode: bool=True) -> dict[str,Any]:
+        if decision_provider not in {"openai","no_trade"}:
+            raise BrokerStorageError("Unsupported autonomous decision provider.")
+        if not 0.5 <= float(minimum_confidence) <= 1.0:
+            raise BrokerStorageError("Minimum confidence must be between 0.5 and 1.0.")
+        sessions=allowed_sessions or ["london","new_york","overlap"]
+        if not sessions or any(item not in {"london","new_york","overlap"} for item in sessions):
+            raise BrokerStorageError("The autonomous session allowlist is invalid.")
+        try:
+            until=datetime.fromisoformat(armed_until.replace("Z","+00:00"))
+        except ValueError:
+            raise BrokerStorageError("The arming expiry is invalid.") from None
+        if until.tzinfo is None: until=until.replace(tzinfo=timezone.utc)
+        now=datetime.now(timezone.utc)
+        if until <= now or until > now + timedelta(hours=settings.autonomous_max_arming_hours):
+            raise BrokerStorageError(f"Arming must expire within {settings.autonomous_max_arming_hours} hours.")
+        with self._connect() as db:
+            target=db.execute("""SELECT p.id,a.environment,a.is_demo FROM execution_profiles p
+                JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
+                WHERE p.public_id=? AND u.auth0_sub=? AND p.enabled=1""",(profile_ref,auth0_sub)).fetchone()
+            if not target: raise BrokerStorageError("Enabled execution profile was not found.")
+            if target["environment"]!="demo" or target["is_demo"]!=1:
+                raise BrokerStorageError("Autonomous execution requires a verified demo account.")
+            db.execute("""UPDATE execution_profiles SET execution_mode='demo_autonomous',autonomous_armed=1,
+                armed_at=?,armed_until=?,armed_by_user=?,decision_provider=?,model_identifier=?,minimum_confidence=?,
+                allowed_sessions_json=?,schedule_ref=?,autonomous_shadow_mode=?,updated_at=? WHERE id=?""",
+                (now.isoformat(),until.astimezone(timezone.utc).isoformat(),auth0_sub,decision_provider,model_identifier,
+                 minimum_confidence,json.dumps(sessions),schedule_ref,shadow_mode,now.isoformat(),target["id"]))
+        return next(item for item in self.list_profiles(auth0_sub) if item["public_id"]==profile_ref)
+
+    def disarm_autonomous_profile(self, auth0_sub: str, profile_ref: str) -> bool:
+        now=_now()
+        with self._connect() as db:
+            cur=db.execute("""UPDATE execution_profiles SET autonomous_armed=0,armed_until=NULL,armed_by_user=NULL,
+                execution_mode=CASE WHEN execution_mode='demo_autonomous' THEN 'demo_manual' ELSE execution_mode END,
+                updated_at=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",
+                (now,profile_ref,auth0_sub))
+            return cur.rowcount==1
 
     def create_profile(self, auth0_sub: str, *, name: str, account_ref: str, strategy_template_id: str="strategy_hourly_forex_v1",
                        execution_mode: str="read_only", risk: dict|None=None, allowed_instruments: list[str]|None=None,
                        session_rules: dict|None=None, news_filter_enabled: bool=True) -> dict[str,Any]:
-        if execution_mode not in {"read_only","demo_enabled","disabled"}: raise BrokerStorageError("Invalid execution mode.")
+        if execution_mode not in {"read_only","demo_manual","demo_autonomous","disabled"}: raise BrokerStorageError("Invalid execution mode.")
+        policy={"risk_per_trade_percent":0.25,"daily_loss_limit_percent":3.0,"drawdown_cutoff_percent":10.0,
+            "maximum_open_positions":1,"maximum_pending_orders":1,"maximum_new_entries_per_day":2,"minimum_reward_risk":1.5}
+        policy.update(risk or {})
+        if not 0 < float(policy["risk_per_trade_percent"]) <= 1.0: raise BrokerStorageError("Risk per trade must be between 0 and 1 percent.")
+        if float(policy["daily_loss_limit_percent"]) > 3 or float(policy["drawdown_cutoff_percent"]) > 10:
+            raise BrokerStorageError("Profile risk limits exceed the demo safety ceiling.")
+        instruments=[str(pair).replace("/","").upper() for pair in (allowed_instruments or ["EURUSD","GBPUSD","AUDUSD","NZDUSD","USDCAD"])]
+        if not instruments or any(pair not in {"EURUSD","GBPUSD","AUDUSD","NZDUSD","USDCAD"} for pair in instruments):
+            raise BrokerStorageError("The profile instrument allowlist is invalid.")
         now=_now()
         with self._connect() as db:
             user=db.execute("SELECT id FROM users WHERE auth0_sub=?",(auth0_sub,)).fetchone()
-            account=db.execute("SELECT id FROM broker_accounts WHERE public_id=? AND user_id=?",(account_ref,user["id"] if user else -1)).fetchone()
+            account=db.execute("SELECT id,environment,is_demo FROM broker_accounts WHERE public_id=? AND user_id=?",(account_ref,user["id"] if user else -1)).fetchone()
             template=db.execute("SELECT id FROM strategy_templates WHERE public_id=?",(strategy_template_id,)).fetchone()
             if not account or not template: raise BrokerStorageError("Account or strategy template was not found.")
+            if execution_mode == "demo_autonomous": raise BrokerStorageError("Demo Autonomous is not implemented.")
+            if execution_mode == "demo_manual" and (account["environment"] != "demo" or account["is_demo"] != 1):
+                raise BrokerStorageError("Demo Manual requires a verified demo account.")
             try: db.execute("""INSERT INTO execution_profiles(public_id,user_id,broker_account_id,strategy_template_id,name,execution_mode,
                 risk_json,allowed_instruments_json,session_rules_json,news_filter_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (_ref("profile"),user["id"],account["id"],template["id"],name,execution_mode,json.dumps(risk or {}),json.dumps(allowed_instruments or []),json.dumps(session_rules or {}),news_filter_enabled,now,now))
+                (_ref("profile"),user["id"],account["id"],template["id"],name,execution_mode,json.dumps(policy),json.dumps(instruments),json.dumps(session_rules or {}),news_filter_enabled,now,now))
             except sqlite3.IntegrityError: raise BrokerStorageError("That profile name is already in use.") from None
         return next(p for p in self.list_profiles(auth0_sub) if p["name"].lower()==name.lower())
 
     def update_profile(self, auth0_sub: str, profile_ref: str, *, name: str | None=None,
                        execution_mode: str | None=None, enabled: bool | None=None) -> bool:
-        if execution_mode is not None and execution_mode not in {"read_only","demo_enabled","disabled"}:
+        if execution_mode is not None and execution_mode not in {"read_only","demo_manual","demo_autonomous","disabled"}:
             raise BrokerStorageError("Invalid execution mode.")
         assignments, values = ["updated_at=?"], [_now()]
         if name is not None: assignments.append("name=?"); values.append(name)
-        if execution_mode is not None: assignments.append("execution_mode=?"); values.append(execution_mode)
-        if enabled is not None: assignments.append("enabled=?"); values.append(enabled)
+        if execution_mode is not None:
+            assignments.append("execution_mode=?"); values.append(execution_mode)
+            if execution_mode != "demo_autonomous":
+                assignments.extend(["autonomous_armed=0","armed_until=NULL","armed_by_user=NULL"])
+        if enabled is not None:
+            assignments.append("enabled=?"); values.append(enabled)
+            if not enabled:assignments.extend(["autonomous_armed=0","armed_until=NULL","armed_by_user=NULL"])
         values.extend([profile_ref,auth0_sub])
         with self._connect() as db:
+            if execution_mode in {"demo_manual","demo_autonomous"}:
+                target=db.execute("""SELECT a.environment,a.is_demo FROM execution_profiles p JOIN broker_accounts a ON a.id=p.broker_account_id
+                    JOIN users u ON u.id=p.user_id WHERE p.public_id=? AND u.auth0_sub=?""",(profile_ref,auth0_sub)).fetchone()
+                if not target or target["environment"] != "demo" or target["is_demo"] != 1:
+                    raise BrokerStorageError("Demo execution requires a verified demo account.")
+                if execution_mode == "demo_autonomous": raise BrokerStorageError("Demo Autonomous is not implemented.")
             try: cur=db.execute(f"UPDATE execution_profiles SET {','.join(assignments)} WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)",values)
             except sqlite3.IntegrityError: raise BrokerStorageError("That profile name is already in use.") from None
             return cur.rowcount==1

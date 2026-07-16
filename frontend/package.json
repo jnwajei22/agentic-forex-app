@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "node --test src/lib/chatgpt-return.test.ts"
+    "test": "node --test src/lib/*.test.ts"
   },
   "dependencies": {
     "@auth0/nextjs-auth0": "^4.22.0",

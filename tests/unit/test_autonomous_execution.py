@@ -22,6 +22,7 @@ def metadata(**overrides):
         "pip_size": 0.0001, "lot_step": 0.01, "min_lots": 0.01,
         "max_lots": 100.0, "quote_currency": "USD", "minimum_stop_distance": 0.0001,
         "commission_per_lot": 0.0,
+        "leverage": 100.0,
     }
     values.update(overrides)
     return InstrumentMetadata(**values)
@@ -40,6 +41,17 @@ def test_usd_quoted_position_sizing_uses_contract_and_increment():
     assert result["lot_size"] == pytest.approx(1.0)
     assert result["quantity"] == pytest.approx(100_000)
     assert result["estimated_risk"] == pytest.approx(100)
+    assert result["estimated_margin"] == pytest.approx(1100)
+
+
+def test_sizing_rejects_unverifiable_or_insufficient_margin():
+    with pytest.raises(AutonomousExecutionError,match="leverage"):
+        calculate_broker_position_size(balance=10_000,available_funds=10_000,risk_percent=.25,
+            entry=1.1,stop_loss=1.099,metadata=metadata(leverage=None),quote_to_account_rate=1)
+    with pytest.raises(AutonomousExecutionError) as error:
+        calculate_broker_position_size(balance=10_000,available_funds=10,risk_percent=.25,
+            entry=1.1,stop_loss=1.099,metadata=metadata(),quote_to_account_rate=1)
+    assert error.value.code=="insufficient_margin"
 
 
 def test_usd_base_position_sizing_converts_quote_currency():
@@ -182,26 +194,29 @@ def configured_service(tmp_path, monkeypatch, *, base_url="https://demo.tradeloc
     brokers = BrokerRepository(tmp_path / "broker.db", secret="test-secret")
     brokers.save_connection("user", base_url=base_url, username="u", password="p", server="s", environment=environment)
     brokers.select_account("user", "a1", "7")
+    account = brokers.list_accounts("user")[0]
+    profile = brokers.create_profile("user", name="Demo profile", account_ref=account["public_id"])
     execution = ExecutionRepository(tmp_path / "broker.db")
-    return AutonomousDemoService(
+    service = AutonomousDemoService(
         broker_repository=brokers, execution_repository=execution, client_factory=DiscoveryClient,
-    ), execution
+    )
+    service.test_profile_ref = profile["public_id"]
+    return service, execution
 
 
 @pytest.mark.asyncio
 async def test_verified_demo_context_defaults_to_read_only(tmp_path, monkeypatch):
     service, _ = configured_service(tmp_path, monkeypatch)
     with pytest.raises(AutonomousExecutionError) as error:
-        await service.context("user")
+        await service.context("user", service.test_profile_ref)
     assert error.value.code == "execution_mode_read_only"
 
 
 @pytest.mark.asyncio
 async def test_demo_mode_can_be_enabled_only_for_scoped_account(tmp_path, monkeypatch):
     service, execution = configured_service(tmp_path, monkeypatch)
-    connection = service.brokers.get_connection("user")
-    execution.set_mode("user", connection.connection_id, "a1", "7", ExecutionMode.DEMO_MANUAL)
-    context = await service.context("user")
+    service.brokers.update_profile("user", service.test_profile_ref, execution_mode="demo_manual")
+    context = await service.context("user", service.test_profile_ref)
     assert context.execution_mode == ExecutionMode.DEMO_MANUAL
     assert context.account_id == "a1" and context.acc_num == "7"
 
@@ -218,7 +233,7 @@ async def test_demo_mode_can_be_enabled_only_for_scoped_account(tmp_path, monkey
 async def test_environment_conflicts_fail_closed(tmp_path, monkeypatch, base_url, environment):
     service, _ = configured_service(tmp_path, monkeypatch, base_url=base_url, environment=environment)
     with pytest.raises(AutonomousExecutionError) as error:
-        await service.context("user", require_mode=False)
+        await service.context("user", service.test_profile_ref, require_mode=False)
     assert error.value.code == "demo_environment_verification_failed"
 
 
