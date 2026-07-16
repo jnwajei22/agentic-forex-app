@@ -176,13 +176,46 @@ def _log_owner_mismatch(route: str, reference: str, caller: str, owner: str | No
 @router.post("/oauth/token")
 async def exchange_token(request: Request) -> JSONResponse:
     form = {key: values[-1] for key, values in parse_qs((await request.body()).decode()).items()}
-    if form.get("grant_type") != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-    result = oauth_repository().exchange_code(
-        code=form.get("code", ""), client_id=form.get("client_id", ""),
-        redirect_uri=form.get("redirect_uri", ""), code_verifier=form.get("code_verifier", ""),
-        resource=form.get("resource", ""),
-    )
+    grant_type = form.get("grant_type", "")
+    client_id = form.get("client_id", "")
+    if grant_type == "authorization_code":
+        result = oauth_repository().exchange_code(
+            code=form.get("code", ""), client_id=client_id,
+            redirect_uri=form.get("redirect_uri", ""),
+            code_verifier=form.get("code_verifier", ""),
+            resource=form.get("resource", ""),
+        )
+    elif grant_type == "refresh_token":
+        result = oauth_repository().exchange_refresh_token(
+            refresh_token=form.get("refresh_token", ""), client_id=client_id,
+            resource=form.get("resource") or settings.public_base_url.rstrip("/"),
+            scope=form.get("scope"),
+        )
+    else:
+        _log_token_lifecycle(grant_type or "missing", client_id, "rejected", False, "unsupported_grant_type")
+        return _token_response({"error": "unsupported_grant_type"}, status_code=400)
     if result is None:
-        return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    return JSONResponse(result, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+        _log_token_lifecycle(grant_type, client_id, "rejected", False, "invalid_grant")
+        return _token_response({"error": "invalid_grant"}, status_code=400)
+    _log_token_lifecycle(grant_type, client_id, "issued", True, None)
+    return _token_response(result)
+
+
+def _token_response(content: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        content, status_code=status_code,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+def _log_token_lifecycle(
+    grant_type: str, client_id: str, result: str,
+    refresh_token_issued: bool, failure_category: str | None,
+) -> None:
+    logger.info(
+        "OAuth token grant_type=%s result=%s client_fp=%s access_token_ttl=%s "
+        "refresh_token_issued=%s failure_category=%s",
+        grant_type, result, _safe_fingerprint(client_id),
+        settings.oauth_access_token_ttl_seconds, refresh_token_issued,
+        failure_category,
+    )

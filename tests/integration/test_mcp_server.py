@@ -112,6 +112,10 @@ def test_authorization_server_metadata_uses_agentic_forex_oauth_endpoints(monkey
     with TestClient(app) as client:
         response = client.get("/.well-known/oauth-authorization-server")
 
+    assert response.json()["grant_types_supported"] == ["authorization_code", "refresh_token"]
+    assert response.json()["response_types_supported"] == ["code"]
+    assert response.json()["code_challenge_methods_supported"] == ["S256"]
+
     assert response.status_code == 200
     metadata = response.json()
     assert metadata["authorization_endpoint"] == "https://app.example.test/oauth/authorize"

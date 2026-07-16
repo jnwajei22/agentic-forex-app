@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -10,6 +11,8 @@ class Settings(BaseSettings):
     oauth_token_url: str | None = None
     oauth_transaction_secret: str | None = None
     oauth_allowed_client_ids: str | None = None
+    oauth_access_token_ttl_seconds: int = Field(default=3600, gt=0)
+    oauth_refresh_token_ttl_seconds: int = Field(default=7776000, gt=0)
     onboarding_assertion_secret: str | None = None
     onboarding_assertion_issuers: str | None = None
     sqlite_path: str = "storage/app.db"

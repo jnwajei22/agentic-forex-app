@@ -17,7 +17,7 @@ def document(**overrides):
     value = {
         "redirect_uris": ["https://chatgpt.com/connector/oauth/callback-id"],
         "response_types": ["code"],
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
     }
     value.update(overrides)
@@ -42,6 +42,7 @@ async def test_valid_chatgpt_cimd_document_is_loaded_and_cached():
     second = await loader.load("https://chatgpt.com/oauth/client.json")
     assert first.client_id == "https://chatgpt.com/oauth/client.json"
     assert first.redirect_uris == ("https://chatgpt.com/connector/oauth/callback-id",)
+    assert first.grant_types == ("authorization_code", "refresh_token")
     assert second == first
     assert calls == 1
 

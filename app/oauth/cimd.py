@@ -16,6 +16,7 @@ MAX_CIMD_BYTES = 64 * 1024
 CIMD_TIMEOUT_SECONDS = 4.0
 CIMD_CACHE_SECONDS = 300
 SUPPORTED_TOKEN_AUTH_METHODS = {"none"}
+SUPPORTED_GRANT_TYPES = {"authorization_code", "refresh_token"}
 
 
 class CIMDError(ValueError):
@@ -27,6 +28,7 @@ class CIMDMetadata:
     client_id: str
     redirect_uris: tuple[str, ...]
     token_endpoint_auth_methods: tuple[str, ...]
+    grant_types: tuple[str, ...] = ("authorization_code",)
 
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
@@ -126,7 +128,12 @@ class CIMDLoader:
             raise CIMDError("CIMD redirect_uris must contain HTTPS URLs.")
         response_types = payload.get("response_types", ["code"])
         grant_types = payload.get("grant_types", ["authorization_code"])
-        if "code" not in response_types or "authorization_code" not in grant_types:
+        if (not isinstance(response_types, list)
+                or any(not isinstance(item, str) for item in response_types)
+                or not isinstance(grant_types, list)
+                or any(not isinstance(grant, str) for grant in grant_types)
+                or any(grant not in SUPPORTED_GRANT_TYPES for grant in grant_types)
+                or "code" not in response_types or "authorization_code" not in grant_types):
             raise CIMDError("CIMD client must support the authorization-code flow.")
         methods = payload.get(
             "token_endpoint_auth_methods_supported",
@@ -138,6 +145,7 @@ class CIMDLoader:
             client_id=client_id,
             redirect_uris=tuple(redirects),
             token_endpoint_auth_methods=tuple(str(method) for method in methods),
+            grant_types=tuple(str(grant) for grant in grant_types),
         )
 
 

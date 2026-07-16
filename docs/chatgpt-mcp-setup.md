@@ -54,6 +54,16 @@ https://mcp.justinnwajei.com/mcp/
 
 Choose OAuth and enter the client/provider values requested by ChatGPT. Request `forex:read`, `forex:preview`, and `forex:execute` so all connector tools are available. The execute scope is required only for the consequential TradeLocker demo submission tool.
 
+## Silent OAuth renewal
+
+The authorization server advertises both `authorization_code` and `refresh_token` grants while retaining the existing PKCE S256 authorization-code flow. Every successful code exchange now returns an opaque refresh token alongside the one-hour bearer token. Refresh tokens are stored only as SHA-256 hashes, are bound to the Auth0 subject, OAuth client, granted scopes, and MCP resource, and rotate on every use.
+
+A successful refresh returns a new access token and a new refresh token. The previous refresh token becomes unusable atomically. Reuse detection revokes the remaining token family, preventing concurrent replay from creating multiple usable refresh credentials. A refresh may retain or narrow scopes but cannot add permissions. The MCP middleware resolves refreshed access tokens through the same stored-token claims path, preserving the original Auth0 subject.
+
+Existing deployments create the `oauth_refresh_tokens` table and indexes automatically on restart. Existing authorization-code and broker records are retained. Connections authorized before this deployment do not possess a refresh token, so reconnect ChatGPT once; subsequent access-token renewal can be silent until the rotating refresh credential expires or is revoked.
+
+Configure `OAUTH_ACCESS_TOKEN_TTL_SECONDS` (default `3600`) and `OAUTH_REFRESH_TOKEN_TTL_SECONDS` (default `7776000`, 90 days). Do not place token values in logs or configuration files. Refresh-token support does not change TradeLocker login, token refresh, credential encryption, connection ownership, or selected-account state.
+
 TradeLocker account discovery is a two-step flow. Configure `TRADELOCKER_BASE_URL`, `TRADELOCKER_USERNAME`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`, then run `get_tradelocker_accounts`. Copy the returned `accountId` and `accNum` into `TRADELOCKER_ACCOUNT_ID` and `TRADELOCKER_ACCOUNT_NUMBER` before using account-specific config, status, positions, symbols, quotes, or candles. Discovery never returns the configured password or TradeLocker tokens.
 
 - `get_market_candles`, `get_watchlist_market_data`, provider research tools, account status, positions, pending orders, and quotes with `forex:read`

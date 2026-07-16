@@ -65,7 +65,7 @@ async def oauth_authorization_server_metadata() -> dict[str, object]:
         or f"{settings.public_base_url.rstrip('/')}/oauth/token",
         "client_id_metadata_document_supported": True,
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["openid", "profile", "email", "forex:read", "forex:preview", "forex:execute"],
         "token_endpoint_auth_methods_supported": ["none"],

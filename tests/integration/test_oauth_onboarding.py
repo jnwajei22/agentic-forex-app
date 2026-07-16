@@ -168,6 +168,8 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
         })
         assert token.status_code == 200
         assert token.json()["token_type"] == "Bearer"
+        assert token.json()["expires_in"] == settings.oauth_access_token_ttl_seconds
+        assert token.json()["refresh_token"]
         assert "private-password" not in token.text
         mcp = client.post(
             "/mcp",
@@ -185,6 +187,33 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
             },
         )
         assert mcp.status_code == 200
+        refreshed = client.post("/oauth/token", data={
+            "grant_type": "refresh_token",
+            "refresh_token": token.json()["refresh_token"],
+            "client_id": "chatgpt-client",
+        })
+        assert refreshed.status_code == 200
+        assert refreshed.json()["refresh_token"] != token.json()["refresh_token"]
+        refreshed_mcp = client.post(
+            "/mcp", json={
+                "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "chatgpt-test", "version": "1"}},
+            },
+            headers={
+                "Authorization": f"Bearer {refreshed.json()['access_token']}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        assert refreshed_mcp.status_code == 200
+        reused = client.post("/oauth/token", data={
+            "grant_type": "refresh_token",
+            "refresh_token": token.json()["refresh_token"],
+            "client_id": "chatgpt-client",
+        })
+        assert reused.status_code == 400
+        assert reused.json() == {"error": "invalid_grant"}
 
 
 def test_oauth_rejects_invalid_callback(oauth_storage):
