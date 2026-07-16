@@ -31,7 +31,15 @@ def test_existing_live_connection_environment_is_migrated(tmp_path):
         environment = connection.execute(
             "SELECT environment FROM broker_connections WHERE id = 1"
         ).fetchone()[0]
+        account = connection.execute(
+            "SELECT account_alias, is_default_analysis FROM broker_accounts"
+        ).fetchone()
+        profile = connection.execute(
+            "SELECT execution_mode FROM execution_profiles"
+        ).fetchone()
     assert environment == "live"
+    assert account[0] and account[1] == 1
+    assert profile[0] == "read_only"
 
 
 def test_explicit_environment_is_stored_with_connection(tmp_path):

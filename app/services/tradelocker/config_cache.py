@@ -17,6 +17,8 @@ class TradeLockerConfigCacheKey:
     server: str
     account_id: str
     account_number: str
+    connection_id: str = ""
+    account_record_id: str = ""
 
 
 @dataclass(frozen=True)

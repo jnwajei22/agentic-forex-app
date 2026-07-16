@@ -6,7 +6,7 @@ import { accountSelectionPath } from "@/lib/chatgpt-return";
 import { afterCredentialsSaved } from "@/lib/onboarding-transaction";
 import { getConnectionAlert, type ConnectionAlert } from "@/lib/connection-alert";
 
-export default function ConnectTradeLockerForm({ returnTo, onboarding = false, initialAlert = null }: { returnTo: string | null; onboarding?: boolean; initialAlert?: ConnectionAlert }) {
+export default function ConnectTradeLockerForm({ returnTo, onboarding = false, initialAlert = null, connectionId = null, createNew = false }: { returnTo: string | null; onboarding?: boolean; initialAlert?: ConnectionAlert; connectionId?: string | null; createNew?: boolean }) {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [alert, setAlert] = useState<ConnectionAlert>(initialAlert);
@@ -21,6 +21,7 @@ export default function ConnectTradeLockerForm({ returnTo, onboarding = false, i
       body: JSON.stringify({
         base_url: environment === "live" ? "https://live.tradelocker.com/backend-api" : "https://demo.tradelocker.com/backend-api",
         environment,
+        connection_id: connectionId, create_new: createNew,
         username: form.get("username"), password: form.get("password"), server: form.get("server"),
       }),
     }).catch(() => null);

@@ -4,6 +4,7 @@ import { BackendError, backendFetch } from "@/lib/backend";
 import { backendErrorMessage } from "@/lib/backend-error-message";
 import { auth0 } from "@/lib/auth0";
 import { parseTradeLockerStatus, type TradeLockerStatus } from "@/lib/tradelocker-status";
+import AccountsPanel, { type AccountSummary, type ConnectionSummary, type ProfileSummary } from "./accounts-panel";
 
 type DashboardProps = { searchParams: Promise<{ connected?: string }> };
 
@@ -13,7 +14,13 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
   const showConnectedBanner = (await searchParams).connected === "1";
   let tradeLocker: TradeLockerStatus = parseTradeLockerStatus(null);
   let error = "";
-  try { tradeLocker = parseTradeLockerStatus(await backendFetch<unknown>("/api/broker/status")); }
+  let connections: ConnectionSummary[] = [], accounts: AccountSummary[] = [], profiles: ProfileSummary[] = [];
+  try {
+    tradeLocker = parseTradeLockerStatus(await backendFetch<unknown>("/api/broker/status"));
+    connections = (await backendFetch<{ connections: ConnectionSummary[] }>("/api/broker/connections")).connections;
+    accounts = (await backendFetch<{ accounts: AccountSummary[] }>("/api/broker/accounts")).accounts;
+    profiles = (await backendFetch<{ profiles: ProfileSummary[] }>("/api/execution-profiles")).profiles;
+  }
   catch (caught) { error = caught instanceof BackendError ? backendErrorMessage(caught) : "Unable to load TradeLocker connection status."; }
 
   const setupComplete = tradeLocker.status === "ready";
@@ -48,6 +55,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
         {tradeLocker.status === "connected_no_account" && <Link className="button secondary" href="/select-account">Select TradeLocker account</Link>}
         <Link className="button secondary" href="/settings">Settings</Link>
       </div>
+      <AccountsPanel connections={connections} accounts={accounts} profiles={profiles} />
     </main>
   );
 }

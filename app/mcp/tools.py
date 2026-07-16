@@ -10,7 +10,8 @@ from pydantic import ValidationError
 
 from app.auth.identity import get_current_user_sub
 from app.brokers.tradelocker.adapter import get_tradelocker_adapter
-from app.brokers.tradelocker.client import TradeLockerError
+from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
+from app.brokers.tradelocker.mapping import TradeLockerMappingError, map_configured_rows
 from app.brokers.paper.adapter import PaperBrokerAdapter
 from app.config.settings import settings
 from app.models.orders import OrderRequest
@@ -40,6 +41,7 @@ from app.services.tradelocker.account_status import (
     AccountStatusUnavailable,
     TradeLockerAccountStatusService,
 )
+from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
 from app.services.watchlist import get_default_watchlist
 from app.storage.brokers import BrokerRepository, BrokerStorageError
 
@@ -403,7 +405,7 @@ async def get_forex_research_bundle(
     }
 
 
-async def get_account_status() -> dict[str, Any]:
+async def get_account_status(account_alias: str | None = None) -> dict[str, Any]:
     """Return normalized, labeled state for the authenticated user's selected TradeLocker account. This read-only tool never returns paper data or an unlabeled broker array, and a zero balance is valid."""
     user_sub = get_current_user_sub()
     if not user_sub:
@@ -412,7 +414,8 @@ async def get_account_status() -> dict[str, Any]:
             message="Authenticate with Agentic Forex Desk before requesting TradeLocker account status.",
         ).model_dump(mode="json")
     try:
-        result = await TradeLockerAccountStatusService().retrieve(user_sub)
+        service = TradeLockerAccountStatusService()
+        result = await (service.retrieve(user_sub) if account_alias is None else service.retrieve(user_sub, account_alias))
         return result.model_dump(mode="json")
     except AccountStatusUnavailable as exc:
         return TradeLockerAccountStatusError(
@@ -446,26 +449,39 @@ async def get_paper_account_status() -> dict[str, Any]:
     return {"schema_version": "1.0", "status": "ok", "source": "paper", **result}
 
 
-async def get_open_positions() -> list[dict[str, Any]] | dict[str, Any]:
+async def _account_rows(account_alias: str | None, *, orders: bool) -> dict[str, Any]:
+    user_sub = get_current_user_sub()
+    if not user_sub:
+        return {"status": "error", "error": "authentication_required"}
+    try:
+        context = BrokerAccountResolver().resolve(user_sub, account_alias=account_alias)
+        async with TradeLockerClient(base_url=context.base_url, username=context.username,
+            password=context.password, server=context.server, account_id=context.account_id,
+            account_number=context.account_number) as client:
+            config = await client.get_config()
+            data = await (client.get_orders() if orders else client.get_positions())
+        rows = map_configured_rows(config_response=config, data_response=data,
+            config_key="ordersConfig" if orders else "positionsConfig",
+            data_key="orders" if orders else "positions")
+        return {"status": "ok", "account": context.safe_identity(),
+                "orders" if orders else "positions": rows}
+    except AccountResolutionError as exc:
+        return {"status": "error", "error": exc.code, "message": str(exc)}
+    except TradeLockerMappingError:
+        return {"status": "error", "error": "account_field_mapping_unavailable",
+                "message": "TradeLocker rows could not be safely labeled."}
+    except TradeLockerError as exc:
+        return _tradelocker_error(exc)
+
+
+async def get_open_positions(account_alias: str | None = None) -> dict[str, Any]:
     """Return current TradeLocker positions without shared caching."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().get_open_positions()
-    except TradeLockerError as exc:
-        return _tradelocker_error(exc)
+    return await _account_rows(account_alias, orders=False)
 
 
-async def get_pending_orders() -> dict[str, Any] | list[Any]:
+async def get_pending_orders(account_alias: str | None = None) -> dict[str, Any]:
     """Return current TradeLocker pending orders when the endpoint is available."""
-    missing = _missing_user_connection()
-    if missing:
-        return missing
-    try:
-        return await get_tradelocker_adapter().client.get_orders()
-    except TradeLockerError as exc:
-        return _tradelocker_error(exc)
+    return await _account_rows(account_alias, orders=True)
 
 
 async def get_trade_history(limit: int = 100) -> dict[str, Any]:
@@ -625,12 +641,33 @@ def get_provider_capabilities() -> dict[str, Any]:
 # Temporary compatibility aliases used by the current ChatGPT onboarding integration.
 async def get_my_tradelocker_accounts() -> dict[str, Any]:
     """Deprecated alias for get_tradelocker_accounts."""
-    return await get_tradelocker_accounts()
+    return await list_my_tradelocker_accounts()
 
 
-async def get_my_tradelocker_account_status() -> dict[str, Any]:
+async def get_my_tradelocker_account_status(account_alias: str | None = None) -> dict[str, Any]:
     """Deprecated alias for get_account_status."""
-    return await get_account_status()
+    return await get_account_status(account_alias)
+
+
+async def list_my_tradelocker_connections() -> dict[str, Any]:
+    """List the authenticated user's safe TradeLocker connection references."""
+    user_sub = get_current_user_sub()
+    if not user_sub: return {"status": "error", "error": "authentication_required"}
+    return {"status": "ok", "connections": BrokerRepository().list_connections(user_sub)}
+
+
+async def list_my_tradelocker_accounts() -> dict[str, Any]:
+    """List durable account aliases without exposing broker account identifiers."""
+    user_sub = get_current_user_sub()
+    if not user_sub: return {"status": "error", "error": "authentication_required"}
+    return {"status": "ok", "accounts": BrokerRepository().list_accounts(user_sub)}
+
+
+async def list_execution_profiles() -> dict[str, Any]:
+    """List safe execution-profile selectors for the authenticated user."""
+    user_sub = get_current_user_sub()
+    if not user_sub: return {"status": "error", "error": "authentication_required"}
+    return {"status": "ok", "profiles": BrokerRepository().list_profiles(user_sub)}
 
 
 async def get_my_tradelocker_symbols() -> dict[str, Any] | list[Any]:

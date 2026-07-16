@@ -105,6 +105,9 @@ mcp.tool(tools.get_trade_history)
 mcp.tool(tools.get_tradelocker_connection_status)
 mcp.tool(tools.get_my_broker_connection_status)
 mcp.tool(tools.get_my_tradelocker_accounts)
+mcp.tool(tools.list_my_tradelocker_connections)
+mcp.tool(tools.list_my_tradelocker_accounts)
+mcp.tool(tools.list_execution_profiles)
 mcp.tool(
     tools.get_my_tradelocker_account_status,
     output_schema=TRADELOCKER_ACCOUNT_STATUS_OUTPUT_SCHEMA,

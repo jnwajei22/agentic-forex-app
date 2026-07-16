@@ -14,11 +14,17 @@ const allowed = new Set([
   "broker/tradelocker/discover-accounts",
   "broker/tradelocker/select-account",
   "broker/tradelocker",
+  "broker/connections",
+  "broker/accounts",
+  "execution-profiles",
 ]);
 
 async function forward(request: NextRequest, segments: string[], method: string) {
   const path = segments.join("/");
-  if (!allowed.has(path)) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  const dynamicAllowed = /^broker\/(accounts|connections)\/[^/]+\/(alias|default|disable)$/.test(path)
+    || /^execution-profiles\/[^/]+$/.test(path);
+  const discoveryWithQuery = path === "broker/tradelocker/discover-accounts";
+  if (!allowed.has(path) && !dynamicAllowed && !discoveryWithQuery) return NextResponse.json({ error: "Not found" }, { status: 404 });
   try {
     const body = method === "GET" || method === "DELETE" ? undefined : await request.text();
     let result;
@@ -31,7 +37,7 @@ async function forward(request: NextRequest, segments: string[], method: string)
         method, body: body || undefined,
       });
     } else {
-      result = await backendFetch(`/api/${path}`, { method, body: body || undefined });
+      result = await backendFetch(`/api/${path}${request.nextUrl.search}`, { method, body: body || undefined });
     }
     return NextResponse.json(result);
   } catch (error) {
@@ -58,4 +64,8 @@ export async function POST(request: NextRequest, context: Context) {
 
 export async function DELETE(request: NextRequest, context: Context) {
   return forward(request, (await context.params).path, "DELETE");
+}
+
+export async function PUT(request: NextRequest, context: Context) {
+  return forward(request, (await context.params).path, "PUT");
 }

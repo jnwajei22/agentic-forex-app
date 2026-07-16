@@ -16,7 +16,8 @@ class TradeLockerAccountIdentity(TradeLockerModel):
     account_number: str
     name: str | None = None
     currency: str | None = None
-    environment: Literal["demo", "live"]
+    account_alias: str | None = None
+    environment: Literal["demo", "live", "unknown"]
     active: bool
 
 

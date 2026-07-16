@@ -6,7 +6,7 @@ import { ONBOARDING_COOKIE } from "@/lib/onboarding-transaction";
 import OnboardingShell from "@/components/onboarding-shell";
 import { getConnectionAlert } from "@/lib/connection-alert";
 
-export default async function ConnectTradeLockerPage({ searchParams }: { searchParams: Promise<{ returnTo?: string; connectionIssue?: string; reconnect_required?: string }> }) {
+export default async function ConnectTradeLockerPage({ searchParams }: { searchParams: Promise<{ returnTo?: string; connectionIssue?: string; reconnect_required?: string; connection_id?: string; new?: string }> }) {
   const query = await searchParams;
   const returnTo = safeChatGptReturnTo(query.returnTo);
   const session = await requireSession(withReturnTo("/connect-tradelocker", returnTo));
@@ -22,6 +22,6 @@ export default async function ConnectTradeLockerPage({ searchParams }: { searchP
   return <OnboardingShell eyebrow="TradeLocker setup" title="Connect TradeLocker">
     <p>Enter your TradeLocker credentials. These are separate from your portal login.</p>
     <p>Credentials are sent securely to the MCP server and are never stored in browser storage.</p>
-    <ConnectTradeLockerForm returnTo={returnTo} onboarding={onboarding} initialAlert={initialAlert} />
+    <ConnectTradeLockerForm returnTo={returnTo} onboarding={onboarding} initialAlert={initialAlert} connectionId={query.connection_id ?? null} createNew={query.new === "1"} />
   </OnboardingShell>;
 }

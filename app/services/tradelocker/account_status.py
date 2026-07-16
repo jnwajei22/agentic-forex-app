@@ -25,7 +25,10 @@ from app.services.tradelocker.config_cache import (
     TradeLockerConfigCacheKey,
     tradelocker_config_cache,
 )
-from app.storage.brokers import BrokerConnection, BrokerRepository, BrokerStorageError
+from app.storage.brokers import BrokerRepository, BrokerStorageError
+from app.services.tradelocker.accounts import (
+    AccountResolutionError, BrokerAccountContext, BrokerAccountResolver,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,12 +51,14 @@ class SelectedTradeLockerContext:
     environment: str
     server: str
     active: bool
+    account_alias: str | None = None
+    account_record_id: str = ""
 
     @property
     def cache_key(self) -> TradeLockerConfigCacheKey:
         return TradeLockerConfigCacheKey(
             self.auth0_user_id, self.environment, self.server,
-            self.account_id, self.account_number,
+            self.account_id, self.account_number, self.connection_id, self.account_record_id,
         )
 
 
@@ -93,7 +98,7 @@ class TradeLockerAccountStatusService:
         self.cache = cache
         self.client_factory = client_factory
 
-    async def retrieve(self, auth0_user_id: str) -> TradeLockerAccountStatus:
+    async def retrieve(self, auth0_user_id: str, account_alias: str | None = None) -> TradeLockerAccountStatus:
         started = perf_counter()
         context: SelectedTradeLockerContext | None = None
         mapping_success = False
@@ -103,28 +108,26 @@ class TradeLockerAccountStatusService:
         refresh_occurred = False
         client: TradeLockerClient | None = None
         try:
-            connection = self._connection(auth0_user_id)
+            resolved = self._resolve(auth0_user_id, account_alias)
             client = self.client_factory(
-                base_url=connection.base_url,
-                username=connection.username,
-                password=connection.password,
-                server=connection.server,
-                account_id=connection.account_id,
-                account_number=connection.account_number,
+                base_url=resolved.base_url, username=resolved.username, password=resolved.password,
+                server=resolved.server, account_id=resolved.account_id,
+                account_number=resolved.account_number,
             )
             try:
                 accounts = await client.get_accounts()
-                selected = self._selected_account(connection, accounts)
+                selected = self._selected_account(resolved, accounts)
                 context = SelectedTradeLockerContext(
                     auth0_user_id=auth0_user_id,
-                    connection_id=connection.connection_id,
-                    account_id=connection.account_id or "",
-                    account_number=connection.account_number or "",
+                    connection_id=resolved.connection_id,
+                    account_id=resolved.account_id,
+                    account_number=resolved.account_number,
                     account_name=self._optional_text(selected.get("name")),
                     currency=self._optional_text(selected.get("currency")),
-                    environment=connection.environment,
-                    server=connection.server,
+                    environment=resolved.environment, server=resolved.server,
                     active=_active(selected),
+                    account_alias=resolved.account_alias,
+                    account_record_id=resolved.account_record_id,
                 )
                 config = self.cache.get(context.cache_key)
                 config_from_cache = config is not None
@@ -155,6 +158,8 @@ class TradeLockerAccountStatusService:
                 return result
             finally:
                 await client.aclose()
+        except AccountResolutionError as exc:
+            raise AccountStatusUnavailable(exc.code, str(exc)) from exc
         except BrokerStorageError as exc:
             raise AccountStatusUnavailable(
                 "broker_storage_error", "The stored TradeLocker connection is unavailable."
@@ -181,20 +186,8 @@ class TradeLockerAccountStatusService:
                 (perf_counter() - started) * 1000, refresh_occurred,
             )
 
-    def _connection(self, auth0_user_id: str) -> BrokerConnection:
-        connection = self.repository.get_connection(auth0_user_id)
-        if connection is None:
-            raise AccountStatusUnavailable(
-                "setup_required", "TradeLocker setup is required for the current user."
-            )
-        if not connection.account_id or not connection.account_number:
-            raise AccountStatusUnavailable(
-                "selected_account_required", "Select a TradeLocker account before requesting status."
-            )
-        return connection
-
     @staticmethod
-    def _selected_account(connection: BrokerConnection, payload: Any) -> dict[str, Any]:
+    def _selected_account(connection: BrokerAccountContext, payload: Any) -> dict[str, Any]:
         accounts = payload.get("accounts") if isinstance(payload, dict) else None
         if not isinstance(accounts, list):
             raise AccountStatusUnavailable(
@@ -210,6 +203,18 @@ class TradeLockerAccountStatusService:
         raise AccountStatusUnavailable(
             "selected_account_unavailable", "The selected TradeLocker account could not be verified."
         )
+
+    def _resolve(self, auth0_user_id: str, account_alias: str | None) -> BrokerAccountContext:
+        # Small repository fakes and legacy integrations can still supply the old selected connection.
+        if not hasattr(self.repository, "get_account_record") and account_alias is None:
+            connection = self.repository.get_connection(auth0_user_id)
+            if connection is None or not connection.account_id or not connection.account_number:
+                raise AccountStatusUnavailable("selected_account_required", "Select a TradeLocker account before requesting status.")
+            return BrokerAccountContext(auth0_user_id, connection.connection_id,
+                connection.connection_ref or connection.connection_id, "", connection.account_number,
+                connection.account_id, connection.account_number, None, None, connection.environment,
+                connection.server, True, connection.base_url, connection.username, connection.password)
+        return BrokerAccountResolver(self.repository).resolve(auth0_user_id, account_alias=account_alias)
 
     @staticmethod
     def _assert_context(client: TradeLockerClient, context: SelectedTradeLockerContext) -> None:
@@ -249,7 +254,9 @@ class TradeLockerAccountStatusService:
         return TradeLockerAccountStatus(
             retrieved_at=datetime.now(timezone.utc),
             account=TradeLockerAccountIdentity(
-                account_id=context.account_id, account_number=context.account_number,
+                account_id=context.account_record_id or context.account_id,
+                account_number=context.account_alias or context.account_number,
+                account_alias=context.account_alias,
                 name=context.account_name, currency=context.currency,
                 environment=context.environment, active=context.active,
             ),

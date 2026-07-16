@@ -56,6 +56,11 @@ EXPECTED_TOOLS = {
     "record_autonomous_no_trade",
     "get_autonomous_run_result",
 }
+EXPECTED_TOOLS.update({
+    "list_my_tradelocker_connections",
+    "list_my_tradelocker_accounts",
+    "list_execution_profiles",
+})
 INITIALIZE_PAYLOAD = {
     "jsonrpc": "2.0",
     "id": 1,

@@ -36,6 +36,9 @@ class TradeLockerCredentials(BaseModel):
     password: str = Field(repr=False)
     server: str
     environment: Literal["demo", "live"] | None = None
+    connection_id: str | None = Field(default=None, validation_alias=AliasChoices("connection_id", "connectionId"))
+    label: str | None = None
+    create_new: bool = Field(default=False, validation_alias=AliasChoices("create_new", "createNew"))
 
 
 class AccountSelection(BaseModel):
@@ -43,6 +46,28 @@ class AccountSelection(BaseModel):
     account_number: str = Field(
         validation_alias=AliasChoices("account_number", "accountNumber", "accNum")
     )
+    connection_id: str | None = Field(default=None, validation_alias=AliasChoices("connection_id", "connectionId"))
+
+
+class AccountAliasUpdate(BaseModel):
+    alias: str = Field(min_length=1, max_length=64)
+
+
+class ExecutionProfileCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    account_id: str = Field(validation_alias=AliasChoices("account_id", "accountId"))
+    strategy_template_id: str = "strategy_hourly_forex_v1"
+    execution_mode: Literal["read_only", "demo_enabled", "disabled"] = "read_only"
+    risk: dict[str, Any] = Field(default_factory=dict)
+    allowed_instruments: list[str] = Field(default_factory=list)
+    session_rules: dict[str, Any] = Field(default_factory=dict)
+    news_filter_enabled: bool = True
+
+
+class ExecutionProfileUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    execution_mode: Literal["read_only", "demo_enabled", "disabled"] | None = None
+    enabled: bool | None = None
 
 
 async def current_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -124,6 +149,7 @@ async def validated_onboarding_status(user_sub: str) -> TradeLockerOnboardingSta
             message="TradeLocker connection status is temporarily unavailable.",
             retryable=True,
         )
+    repo.sync_accounts(user_sub, connection.connection_ref, discovered)
     if not connection.account_id or not connection.account_number:
         return TradeLockerOnboardingStatus(
             status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
@@ -163,14 +189,17 @@ async def save_credentials(
             password=payload.password, server=payload.server,
             account_id=None, account_number=None,
         ) as client:
-            await client.get_accounts()
+            discovered = await client.get_accounts()
     except TradeLockerError as exc:
         return _discovery_error_response(exc, request_id, "save_credentials")
-    repository().save_connection(
+    repo = repository()
+    connection = repo.save_connection(
         claims["sub"], base_url=payload.base_url, username=payload.username,
         password=payload.password, server=payload.server, environment=payload.environment,
-        email=claims.get("email"),
+        email=claims.get("email"), connection_ref=payload.connection_id,
+        label=payload.label, create_new=payload.create_new,
     )
+    repo.sync_accounts(claims["sub"], connection.connection_ref, discovered)
     tradelocker_config_cache.invalidate_user(claims["sub"])
     return TradeLockerOnboardingStatus(
         status=TradeLockerConnectionStatus.CONNECTED_NO_ACCOUNT,
@@ -179,8 +208,9 @@ async def save_credentials(
 
 
 @router.post("/broker/tradelocker/discover-accounts")
-async def discover_accounts(claims: dict = Depends(current_claims)):
-    connection = repository().get_connection(claims["sub"])
+async def discover_accounts(connection_id: str | None = None, claims: dict = Depends(current_claims)):
+    repo = repository()
+    connection = repo.get_connection(claims["sub"], connection_id)
     if connection is None:
         return TradeLockerOnboardingStatus(
             status=TradeLockerConnectionStatus.NOT_CONNECTED,
@@ -192,7 +222,11 @@ async def discover_accounts(claims: dict = Depends(current_claims)):
             password=connection.password, server=connection.server,
             account_id=None, account_number=None,
         ) as client:
-            return await client.get_accounts()
+            discovered = await client.get_accounts()
+            repo.sync_accounts(claims["sub"], connection.connection_ref, discovered)
+            # Legacy onboarding still needs the broker pair for its immediate selection POST.
+            # Durable account listings use /api/broker/accounts and expose only safe IDs.
+            return discovered
     except TradeLockerError as exc:
         return _discovery_error_response(
             exc, uuid.uuid4().hex, "discover_accounts"
@@ -234,7 +268,7 @@ async def select_account(
     payload: AccountSelection, claims: dict = Depends(current_claims)
 ) -> dict:
     if not repository().select_account(
-        claims["sub"], payload.account_id, payload.account_number
+        claims["sub"], payload.account_id, payload.account_number, payload.connection_id
     ):
         return TradeLockerOnboardingStatus(
             status=TradeLockerConnectionStatus.NOT_CONNECTED,
@@ -259,6 +293,84 @@ async def delete_broker(claims: dict = Depends(current_claims)) -> dict:
     repository().delete_connection(claims["sub"])
     tradelocker_config_cache.invalidate_user(claims["sub"])
     return {"status": "deleted", "provider": "tradelocker"}
+
+
+@router.get("/broker/connections")
+async def list_connections(claims: dict = Depends(current_claims)) -> dict:
+    return {"connections": repository().list_connections(claims["sub"])}
+
+
+@router.get("/broker/accounts")
+async def list_accounts(claims: dict = Depends(current_claims)) -> dict:
+    return {"accounts": repository().list_accounts(claims["sub"])}
+
+
+@router.put("/broker/accounts/{account_id}/alias")
+async def rename_account(account_id: str, payload: AccountAliasUpdate, claims: dict = Depends(current_claims)) -> dict:
+    try:
+        changed = repository().rename_account(claims["sub"], account_id, payload.alias)
+    except BrokerStorageError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if not changed: raise HTTPException(status_code=404, detail="Account not found.")
+    return {"status": "updated", "account_id": account_id}
+
+
+@router.put("/broker/accounts/{account_id}/default")
+async def default_account(account_id: str, claims: dict = Depends(current_claims)) -> dict:
+    if not repository().set_default_account(claims["sub"], account_id):
+        raise HTTPException(status_code=404, detail="Account not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status": "updated", "account_id": account_id}
+
+
+@router.put("/broker/accounts/{account_id}/disable")
+async def disable_account(account_id: str, claims: dict = Depends(current_claims)) -> dict:
+    if not repository().set_account_enabled(claims["sub"], account_id, False):
+        raise HTTPException(status_code=404, detail="Account not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status": "disabled", "account_id": account_id}
+
+
+@router.put("/broker/connections/{connection_id}/disable")
+async def disable_connection(connection_id: str, claims: dict = Depends(current_claims)) -> dict:
+    if not repository().disable_connection(claims["sub"], connection_id):
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status": "disabled", "connection_id": connection_id}
+
+
+@router.get("/execution-profiles")
+async def list_execution_profiles(claims: dict = Depends(current_claims)) -> dict:
+    return {"profiles": repository().list_profiles(claims["sub"])}
+
+
+@router.post("/execution-profiles", status_code=201)
+async def create_execution_profile(payload: ExecutionProfileCreate, claims: dict = Depends(current_claims)) -> dict:
+    try:
+        return repository().create_profile(claims["sub"], name=payload.name, account_ref=payload.account_id,
+            strategy_template_id=payload.strategy_template_id, execution_mode=payload.execution_mode,
+            risk=payload.risk, allowed_instruments=payload.allowed_instruments,
+            session_rules=payload.session_rules, news_filter_enabled=payload.news_filter_enabled)
+    except BrokerStorageError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.put("/execution-profiles/{profile_id}")
+async def update_execution_profile(profile_id: str, payload: ExecutionProfileUpdate, claims: dict = Depends(current_claims)) -> dict:
+    try:
+        changed = repository().update_profile(claims["sub"], profile_id, name=payload.name,
+            execution_mode=payload.execution_mode, enabled=payload.enabled)
+    except BrokerStorageError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if not changed: raise HTTPException(status_code=404, detail="Profile not found.")
+    return {"status":"updated","profile_id":profile_id}
+
+
+@router.delete("/execution-profiles/{profile_id}")
+async def delete_execution_profile(profile_id: str, claims: dict = Depends(current_claims)) -> dict:
+    if not repository().delete_profile(claims["sub"],profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found.")
+    return {"status":"deleted","profile_id":profile_id}
 
 
 @router.get("/broker/tradelocker/execution-settings")
