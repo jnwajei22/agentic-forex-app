@@ -160,7 +160,9 @@ class AutonomousDecisionRunner:
             pair_context=context.get("market",{}).get(decision.symbol or "",{})
             if not pair_context.get("complete") or any(not item.get("complete") for item in pair_context.get("timeframes",{}).values()):validation.append("market_data_incomplete")
             if snapshot.get("news_blackouts"):validation.append("news_blackout")
-            if not snapshot.get("execution_eligibility"):validation.append("execution_ineligible")
+            risk_blockers=snapshot.get("risk_state",{}).get("blocking_reasons") or []
+            validation.extend(str(reason) for reason in risk_blockers)
+            if not snapshot.get("execution_eligibility") and not risk_blockers:validation.append("execution_ineligible")
             if validation:
                 self.execution.update_decision_run(run_id,validation_json={"approved":False,"reasons":validation})
                 return self._finish(run_id,"blocked",validation)

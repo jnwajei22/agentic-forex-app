@@ -575,7 +575,10 @@ class AutonomousDemoService:
             "maximum_new_trade_risk": account.balance * context.risk["risk_per_trade_percent"] / 100,
             "current_drawdown_percent": max(0.0, (high_watermark - equity) / high_watermark * 100) if high_watermark > 0 else 100.0,
             "can_open_position": account.positions_count < context.risk["maximum_open_positions"] and account.pending_orders_count < context.risk["maximum_pending_orders"],
-            "blocking_reasons": [],
+            "blocking_reasons": (["maximum_open_positions_reached"]
+                if account.positions_count >= context.risk["maximum_open_positions"] else [])
+                + (["maximum_pending_orders_reached"]
+                if account.pending_orders_count >= context.risk["maximum_pending_orders"] else []),
         }
         result = {
             "schema_version": "1.0", "status": "ok", "snapshot_id": snapshot_id,

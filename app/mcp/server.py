@@ -18,7 +18,9 @@ mcp = FastMCP(
         "not retrieve data or calculate indicators. TradeLocker remains authoritative for "
         "execution prices; Finnhub and FRED are context sources. This server does not provide "
         "technical analysis, forecasts, or trade recommendations. For setup_required responses, give the setup_url "
-        "to the user and ask them to connect with the same Auth0 account before retrying."
+        "to the user and ask them to connect with the same Auth0 account before retrying. "
+        "When an authenticated user asks to start, stop, or emergency-stop autonomous trading, use the corresponding "
+        "single ChatGPT-first autonomous control tool instead of asking for provider, model, schedule, arming, or mode settings."
     ),
 )
 
@@ -62,6 +64,14 @@ mcp.tool(tools.get_forex_research_bundle)
 mcp.tool(tools.get_provider_capabilities)
 mcp.tool(tools.review_forex_order)
 mcp.tool(tools.set_kill_switch)
+mcp.tool(tools.start_autonomous_trading,
+    annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=True,idempotentHint=True,openWorldHint=True))
+mcp.tool(tools.stop_autonomous_trading,
+    annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.emergency_stop_autonomous_trading,
+    annotations=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=True,openWorldHint=False))
+mcp.tool(tools.get_autonomous_trading_status,
+    annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False))
 mcp.tool(
     tools.get_autonomous_demo_status,
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),

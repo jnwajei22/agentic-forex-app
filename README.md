@@ -86,3 +86,5 @@ KILL_SWITCH_ENABLED=true
 ```
 
 The backend implements only explicitly enabled, profile-bound TradeLocker **demo** execution, including the durable demo scheduler documented under `docs/`. It does not implement live execution, a Pine interpreter, strategy optimization, or a backtester.
+
+ChatGPT-first autonomous control is exposed through `start_autonomous_trading`, `stop_autonomous_trading`, `emergency_stop_autonomous_trading`, and `get_autonomous_trading_status`. Scheduled cycles require a separate persistent worker; see [Persistent autonomous worker](docs/autonomous-worker-deployment.md). MCP requests never launch worker subprocesses.

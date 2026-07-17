@@ -33,6 +33,10 @@ EXPECTED_TOOLS = {
     "get_provider_capabilities",
     "review_forex_order",
     "set_kill_switch",
+    "start_autonomous_trading",
+    "stop_autonomous_trading",
+    "emergency_stop_autonomous_trading",
+    "get_autonomous_trading_status",
     "get_account_status",
     "get_paper_account_status",
     "get_open_positions",
@@ -337,6 +341,16 @@ def test_read_scope_cannot_trigger_autonomous_execution(monkeypatch):
     assert 'scope="forex:execute"' in response.headers["www-authenticate"]
 
 
+def test_read_scope_cannot_start_chatgpt_managed_autonomy(monkeypatch):
+    _enable_test_oauth(monkeypatch,scopes="forex:read")
+    with TestClient(app) as client:
+        response=client.post("/mcp",json={"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"start_autonomous_trading","arguments":{"environment":"demo"}}},
+            headers={**MCP_HEADERS,"Authorization":"Bearer read-only-jwt"})
+    assert response.status_code==403
+    assert 'scope="forex:execute"' in response.headers["www-authenticate"]
+
+
 def test_shared_secret_remains_available_for_explicit_manual_mode(monkeypatch):
     monkeypatch.setattr(settings, "mcp_require_oauth", False)
     monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
@@ -364,6 +378,10 @@ async def test_every_registered_tool_has_an_explicit_oauth_scope():
     registered={tool.name for tool in await mcp.list_tools()}
     assert registered==set(TOOL_SCOPES)
     assert TOOL_SCOPES["run_autonomous_demo_profile"]=="forex:execute"
+    assert TOOL_SCOPES["start_autonomous_trading"]=="forex:execute"
+    assert TOOL_SCOPES["stop_autonomous_trading"]=="forex:execute"
+    assert TOOL_SCOPES["emergency_stop_autonomous_trading"]=="forex:execute"
+    assert TOOL_SCOPES["get_autonomous_trading_status"]=="forex:read"
     assert TOOL_SCOPES["review_demo_order"]=="forex:preview"
     assert TOOL_SCOPES["review_cancel_demo_order"]=="forex:preview"
     assert TOOL_SCOPES["review_close_demo_position"]=="forex:preview"
@@ -371,6 +389,19 @@ async def test_every_registered_tool_has_an_explicit_oauth_scope():
     assert TOOL_SCOPES["submit_cancel_demo_order"]=="forex:execute"
     assert TOOL_SCOPES["submit_close_demo_position"]=="forex:execute"
     assert "get_tradelocker_connection_status" in registered
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_first_autonomy_tools_have_bounded_public_schemas():
+    registered={tool.name:tool for tool in await mcp.list_tools()}
+    start=registered["start_autonomous_trading"]
+    assert set(start.parameters["properties"]) == {"environment","account_alias","profile_ref","run_now",
+        "use_strategy_schedule","live_confirmation"}
+    assert start.parameters["properties"]["environment"]["enum"] == ["demo","live"]
+    assert registered["stop_autonomous_trading"].annotations.idempotentHint is True
+    assert registered["get_autonomous_trading_status"].annotations.readOnlyHint is True
+    for forbidden in ("decision_provider","model_identifier","openai_api_key","execution_mode","armed_until","shadow_mode"):
+        assert forbidden not in start.parameters["properties"]
 
 
 @pytest.mark.asyncio

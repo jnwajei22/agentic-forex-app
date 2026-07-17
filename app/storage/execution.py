@@ -219,6 +219,7 @@ class ExecutionRepository:
     def update_autonomous_controls(
         self, user_sub: str, changes: dict[str, bool], *, updated_by: str,
         source: str = "dashboard", reason: str | None = None,
+        audit_unchanged: bool = False,
     ) -> dict[str, Any]:
         allowed = {"global_autonomous_kill_switch", "demo_autonomous_enabled", "live_autonomous_enabled"}
         if not changes or set(changes) - allowed or any(not isinstance(value, bool) for value in changes.values()):
@@ -233,6 +234,10 @@ class ExecutionRepository:
             for key, value in changes.items():
                 old = bool(current[key])
                 if old == value:
+                    if audit_unchanged:
+                        db.execute("""INSERT INTO autonomous_control_audit(user_sub,control_name,old_value,new_value,
+                            changed_at,changed_by,source,reason) VALUES(?,?,?,?,?,?,?,?)""",
+                            (user_sub, key, old, value, now, safe_actor, safe_source, safe_reason))
                     continue
                 db.execute(f"UPDATE autonomous_controls SET {key}=?,updated_at=?,updated_by=?,last_change_reason=? WHERE user_sub=?",
                     (value, now, safe_actor, safe_reason, user_sub))

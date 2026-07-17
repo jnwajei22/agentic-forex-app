@@ -20,6 +20,12 @@ DEFAULT_TIMEZONE="America/Chicago"
 DEFAULT_LOCAL_TIMES=("05:00","07:00","09:00","11:00","13:15")
 
 
+async def dispatch_autonomous_cycle(runner:AutonomousDecisionRunner,user_sub:str,profile_ref:str,
+                                    run_key:str,trigger_reason:str,*,allow_safe_retry:bool=False)->dict[str,Any]:
+    """Shared durable-run dispatch used by both scheduled and explicit immediate cycles."""
+    return await runner.run(user_sub,profile_ref,run_key,trigger_reason,allow_safe_retry=allow_safe_retry)
+
+
 def validate_local_times(values:list[str])->list[str]:
     normalized=[]
     for value in values:
@@ -143,8 +149,8 @@ class AutonomousSchedulerWorker:
             if not self.schedules.mark_running(dispatch["id"],self.worker_id,settings.autonomous_scheduler_lease_seconds):
                 counts["skipped"]+=1;logger.info("autonomous_scheduler_lock_contention worker_id=%s dispatch_id=%s",self.worker_id,dispatch["id"]);continue
             try:
-                result=await self.runner_factory().run(dispatch["user_sub"],dispatch["profile_ref"],dispatch["run_key"],
-                    f"scheduled:{dispatch['id']}",allow_safe_retry=True)
+                result=await dispatch_autonomous_cycle(self.runner_factory(),dispatch["user_sub"],dispatch["profile_ref"],
+                    dispatch["run_key"],f"scheduled:{dispatch['id']}",allow_safe_retry=True)
             except Exception:
                 result={"status":"error","outcome":"ERROR","reason_codes":["scheduler_runner_failure"],"run_id":None,
                     "preview_id":None,"execution_id":None}

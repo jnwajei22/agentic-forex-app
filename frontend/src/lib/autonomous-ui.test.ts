@@ -16,11 +16,16 @@ test("dashboard exposes the simplified autonomous controls", () => {
 test("profile card primary actions are simplified and danger actions remain in edit", () => {
   const profileActions = source.match(/className="actions compact profile-actions">([\s\S]*?)<\/div><\/div>;/)?.[1] ?? "";
   assert.match(profileActions, /Check Status/);
-  assert.match(profileActions, />Schedule</);
+  assert.doesNotMatch(profileActions, />Schedule</);
   assert.match(profileActions, /Edit Profile/);
   assert.doesNotMatch(profileActions, /Disable Profile|Delete Profile/);
   assert.match(source, /Danger Zone/);
   assert.match(source, /Disable Profile/);
   assert.match(source, /Delete Profile/);
   assert.match(source, /true, dialog\.profile\.name/);
+});
+
+test("normal profile editing does not expose server-side decision configuration", () => {
+  assert.doesNotMatch(source, /Decision Engine|Decision Provider|Model Not Selected|Minimum Confidence|No Trade — Testing Only/);
+  assert.doesNotMatch(source, /model_identifier|minimum_confidence|decision_provider: dialog\.draft/);
 });

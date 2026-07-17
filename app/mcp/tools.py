@@ -39,6 +39,7 @@ from app.services.market_data.series_cache import market_series_cache
 from app.services.trading.previews import create_order_preview
 from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError, normalize_pair
 from app.services.autonomous.runner import AutonomousDecisionRunner
+from app.services.autonomous.control import ChatGPTAutonomyService, AutonomousControlError
 from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleStorageError
 from app.storage.execution import ExecutionRepository
@@ -655,6 +656,63 @@ def _authenticated_user() -> str:
             "no_authenticated_user", "Authenticate before using autonomous-demo tools."
         )
     return user_sub
+
+
+async def start_autonomous_trading(
+    environment: Literal["demo", "live"], account_alias: str | None = None,
+    profile_ref: str | None = None, run_now: bool = True,
+    use_strategy_schedule: bool = True, live_confirmation: str | None = None,
+) -> dict[str, Any]:
+    """Start ChatGPT-managed autonomy using the owned account, server decision defaults, durable controls, schedule, and runner."""
+    try:
+        return await ChatGPTAutonomyService().start(_authenticated_user(), environment,
+            account_alias=account_alias, profile_ref=profile_ref, run_now=run_now,
+            use_strategy_schedule=use_strategy_schedule, live_confirmation=live_confirmation)
+    except AutonomousControlError as exc:
+        return exc.as_dict()
+    except (BrokerStorageError, ScheduleStorageError, ValueError):
+        logger.exception("start_autonomous_trading_failed error_category=control_persistence_failed")
+        return {"status":"blocked","error":"control_persistence_failed",
+            "message":"Autonomous control state could not be persisted.",
+            "blocking_reasons":["control_persistence_failed"]}
+
+
+def stop_autonomous_trading(
+    environment: Literal["demo", "live"], account_alias: str | None = None,
+) -> dict[str, Any]:
+    """Stop new autonomous cycles for one environment without changing broker orders, positions, profiles, or schedules."""
+    try:
+        return ChatGPTAutonomyService().stop(_authenticated_user(), environment, account_alias=account_alias)
+    except AutonomousControlError as exc:
+        return exc.as_dict()
+    except (BrokerStorageError, ScheduleStorageError, ValueError):
+        return {"status":"blocked","error":"control_persistence_failed",
+            "message":"Autonomous control state could not be persisted.",
+            "blocking_reasons":["control_persistence_failed"]}
+
+
+def emergency_stop_autonomous_trading(reason: str) -> dict[str, Any]:
+    """Enable the global autonomous kill switch while preserving all existing broker orders and positions."""
+    try:
+        return ChatGPTAutonomyService().emergency_stop(_authenticated_user(), reason)
+    except AutonomousControlError as exc:
+        return exc.as_dict()
+    except (BrokerStorageError, ValueError):
+        return {"status":"blocked","error":"control_persistence_failed",
+            "message":"The emergency stop could not be persisted.",
+            "blocking_reasons":["control_persistence_failed"]}
+
+
+def get_autonomous_trading_status() -> dict[str, Any]:
+    """Return concise owned controls, accounts, profiles, provider readiness, worker health, schedules, runs, and blockers."""
+    try:
+        return ChatGPTAutonomyService().status(_authenticated_user())
+    except AutonomousControlError as exc:
+        return exc.as_dict()
+    except (BrokerStorageError, ScheduleStorageError, ValueError):
+        return {"status":"blocked","error":"autonomous_status_unavailable",
+            "message":"Autonomous trading status is unavailable.",
+            "blocking_reasons":["autonomous_status_unavailable"]}
 
 
 async def get_autonomous_demo_status(profile_ref: str) -> dict[str, Any]:
