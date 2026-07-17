@@ -17,6 +17,7 @@ from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository
 from app.storage.schedules import ScheduleRepository
 from app.jobs.autonomous_scheduler import AutonomousSchedulerWorker
+from app.oauth.constants import CANONICAL_MCP_RESOURCE
 
 
 @asynccontextmanager
@@ -65,8 +66,8 @@ async def oauth_protected_resource_metadata() -> dict[str, object]:
             ),
         )
     return {
-        "resource": "https://mcp.justinnwajei.com",
-        "authorization_servers": [settings.public_base_url.rstrip("/")],
+        "resource": CANONICAL_MCP_RESOURCE,
+        "authorization_servers": [CANONICAL_MCP_RESOURCE],
         "scopes_supported": ["forex:read", "forex:preview", "forex:execute"],
     }
 
@@ -80,11 +81,11 @@ async def oauth_authorization_server_metadata() -> dict[str, object]:
             detail="OAuth onboarding authorization endpoints are not configured.",
         )
     return {
-        "issuer": settings.public_base_url.rstrip("/"),
+        "issuer": CANONICAL_MCP_RESOURCE,
         "authorization_endpoint": settings.oauth_authorization_url
-        or f"{settings.public_base_url.rstrip('/')}/oauth/authorize",
+        or f"{CANONICAL_MCP_RESOURCE}/oauth/authorize",
         "token_endpoint": settings.oauth_token_url
-        or f"{settings.public_base_url.rstrip('/')}/oauth/token",
+        or f"{CANONICAL_MCP_RESOURCE}/oauth/token",
         "client_id_metadata_document_supported": True,
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],

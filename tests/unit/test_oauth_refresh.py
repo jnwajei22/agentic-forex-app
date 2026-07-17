@@ -11,9 +11,10 @@ from app.main import app
 from app.config.settings import settings
 from app.storage.brokers import BrokerRepository
 from app.storage.oauth import OAuthRepository
+from app.oauth.constants import CANONICAL_MCP_RESOURCE
 
 
-RESOURCE = "https://mcp.example.test"
+RESOURCE = CANONICAL_MCP_RESOURCE
 CLIENT = "chatgpt-client"
 USER = "auth0|refresh-user"
 VERIFIER = "refresh-pkce-verifier-with-sufficient-entropy"
@@ -67,6 +68,28 @@ def test_access_token_uses_configured_ttl(repository, monkeypatch):
         created, expires = db.execute("SELECT created_at, expires_at FROM oauth_access_tokens").fetchone()
     assert result["expires_in"] == 1234
     assert (datetime.fromisoformat(expires) - datetime.fromisoformat(created)).total_seconds() == 1234
+
+
+def test_access_token_status_reports_exact_rejection_categories(repository):
+    unknown, claims = repository.access_token_status("not-issued", RESOURCE)
+    assert (unknown, claims) == ("token_record_not_found", None)
+
+    mutations = {
+        "token_expired": ("expires_at", "2000-01-01T00:00:00+00:00"),
+        "revoked_token": ("revoked_at", "2026-01-01T00:00:00+00:00"),
+        "audience_resource_mismatch": ("resource", "https://wrong.example"),
+        "subject_missing": ("user_sub", ""),
+    }
+    for expected, (column, value) in mutations.items():
+        result = issue_pair(repository)
+        token_hash = hashlib.sha256(result["access_token"].encode()).hexdigest()
+        with sqlite3.connect(repository.db_path) as db:
+            db.execute(
+                f"UPDATE oauth_access_tokens SET {column}=? WHERE token_hash=?",
+                (value, token_hash),
+            )
+        category, claims = repository.access_token_status(result["access_token"], RESOURCE)
+        assert (category, claims) == (expected, None)
 
 
 def test_refresh_rotates_and_preserves_original_user(repository):
@@ -202,6 +225,7 @@ def test_existing_oauth_database_is_migrated_without_deletion(tmp_path):
     assert old == (USER,)
     assert refresh_table == ("oauth_refresh_tokens",)
     assert "resource" in columns
+    assert "revoked_at" in columns
 
 
 def test_oauth_lifecycle_logs_are_sanitized(repository, caplog):

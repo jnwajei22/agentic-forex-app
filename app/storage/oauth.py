@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config.settings import settings
+from app.oauth.constants import CANONICAL_MCP_RESOURCE, canonical_resource, normalize_resource
 
 
 class OAuthStorageError(RuntimeError):
@@ -127,6 +128,9 @@ class OAuthRepository:
                 columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                 if "resource" not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN resource TEXT")
+            access_columns = {row[1] for row in connection.execute("PRAGMA table_info(oauth_access_tokens)")}
+            if "revoked_at" not in access_columns:
+                connection.execute("ALTER TABLE oauth_access_tokens ADD COLUMN revoked_at TEXT")
 
     def _signed_reference(self) -> str:
         opaque = secrets.token_urlsafe(32)
@@ -141,6 +145,7 @@ class OAuthRepository:
     def create_transaction(self, *, client_id: str, redirect_uri: str, state: str,
                            scope: str, code_challenge: str, code_challenge_method: str,
                            resource: str, nonce: str | None = None) -> str:
+        resource = canonical_resource(resource) or resource
         reference = self._signed_reference()
         now = _now()
         with self._connect() as connection:
@@ -215,6 +220,7 @@ class OAuthRepository:
 
     def exchange_code(self, *, code: str, client_id: str, redirect_uri: str,
                       code_verifier: str, resource: str) -> dict | None:
+        resource = canonical_resource(resource) or normalize_resource(resource)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -274,6 +280,7 @@ class OAuthRepository:
         self, *, refresh_token: str, client_id: str, resource: str,
         scope: str | None = None,
     ) -> dict | None:
+        resource = canonical_resource(resource) or normalize_resource(resource)
         token_hash = _hash(refresh_token)
         now = _now()
         with self._connect() as connection:
@@ -329,14 +336,29 @@ class OAuthRepository:
             return cursor.rowcount == 1
 
     def access_token_claims(self, token: str) -> dict | None:
+        category, claims = self.access_token_status(token, CANONICAL_MCP_RESOURCE)
+        return claims if category == "accepted" else None
+
+    def access_token_status(self, token: str, expected_resource: str) -> tuple[str, dict | None]:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM oauth_access_tokens WHERE token_hash = ?", (_hash(token),)
             ).fetchone()
-        if row is None or datetime.fromisoformat(row["expires_at"]) <= _now():
-            return None
-        return {"sub": row["user_sub"], "scope": row["scope"], "client_id": row["client_id"],
-                "aud": row["resource"], "resource": row["resource"]}
+        if row is None:
+            return "token_record_not_found", None
+        if row["revoked_at"]:
+            return "revoked_token", None
+        if datetime.fromisoformat(row["expires_at"]) <= _now():
+            return "token_expired", None
+        resource = canonical_resource(row["resource"])
+        expected = canonical_resource(expected_resource)
+        if resource is None or expected is None or resource != expected:
+            return "audience_resource_mismatch", None
+        if not row["user_sub"]:
+            return "subject_missing", None
+        return "accepted", {"sub": row["user_sub"], "scope": row["scope"],
+            "client_id": row["client_id"], "aud": resource, "resource": resource,
+            "iss": CANONICAL_MCP_RESOURCE, "exp": row["expires_at"]}
 
     def consume_onboarding_assertion_nonce(self, nonce: str, expires_at: datetime) -> bool:
         now = _now()

@@ -53,6 +53,26 @@ from app.storage.brokers import BrokerRepository, BrokerStorageError
 
 logger = logging.getLogger(__name__)
 
+DEMO_BLOCKING_MESSAGES={
+    "pair_not_allowed":"The symbol is not allowed by the bound execution profile.",
+    "duplicate_setup":"An active preview already exists for this symbol and account.",
+    "invalid_protective_prices":"Entry, stop loss, and take profit are inconsistent with the order side.",
+    "reward_risk_too_low":"The server-calculated reward-to-risk ratio is below the profile minimum.",
+    "provider_unavailable":"Required Finnhub market-event data is unavailable or stale.",
+    "required_macro_provider_unavailable":"Strategy-required FRED macro data is unavailable or stale.",
+    "news_blackout":"A configured economic-news blackout is active.",
+    "position_or_order_limit":"The profile-bound account has reached its open-position or pending-order limit.",
+    "market_data_incomplete":"The TradeLocker market snapshot is incomplete.",
+    "broker_stop_distance_invalid":"The stop distance is below the broker minimum.",
+    "position_size_unverifiable":"Broker quantity, conversion, or instrument metadata could not be verified.",
+    "margin_unverifiable":"Broker margin requirements could not be verified.",
+    "insufficient_margin":"The server-calculated order margin exceeds available funds.",
+    "spread_too_wide":"The TradeLocker spread exceeds the configured maximum.",
+    "profile_account_context_mismatch":"The profile-bound account context changed during validation.",
+    "account_mapping_unavailable":"The profile-bound account state could not be mapped safely.",
+    "market_snapshot_unavailable":"TradeLocker positions, orders, quote, candles, or configuration are unavailable.",
+}
+
 
 def _setup_url() -> str:
     return (
@@ -778,7 +798,8 @@ async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short
         if not isinstance(result,dict) or any(result.get(field) is None for field in required):
             logger.error("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=preview_payload_missing",
                 user,profile_id,normalize_pair(symbol))
-            return _demo_review_error("preview_payload_missing","The validated preview payload is incomplete.")
+            return _demo_review_error("preview_payload_missing","The validated preview payload is incomplete.",
+                symbol=symbol,order_type=order_type)
         result["reason"]=reason;result["submission_allowed"]=result.get("status")=="approved"
         result["blocking_reasons"]=result.get("violations") or []
         logger.info("demo_order_reviewed user_ref=%s profile_ref=%s symbol=%s preview_id=%s submission_allowed=%s",
@@ -787,22 +808,32 @@ async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short
     except ValidationError:
         logger.warning("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=invalid_proposal",
             user,profile_id,normalize_pair(symbol))
-        return _demo_review_error("invalid_proposal","The order proposal schema is invalid.")
+        return _demo_review_error("invalid_proposal","The order proposal schema is invalid.",
+            symbol=symbol,order_type=order_type)
     except AutonomousExecutionError as exc:
-        logger.warning("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=%s",
-            user,profile_id,normalize_pair(symbol),exc.code)
+        logger.warning("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=%s blocking_codes=%s",
+            user,profile_id,normalize_pair(symbol),exc.code,",".join(exc.reasons))
         return _demo_review_error(exc.code,
-            "The demo order preview was blocked by a required validation or data dependency.",exc.reasons)
+            "The demo order preview was blocked by deterministic server validation.",exc.reasons,
+            symbol=symbol,order_type=order_type)
     except Exception:
         logger.error("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=internal_review_error",
             user,profile_id,normalize_pair(symbol))
-        return _demo_review_error("internal_review_error","The demo order preview is temporarily unavailable.")
+        return _demo_review_error("internal_review_error","The demo order preview is temporarily unavailable.",
+            symbol=symbol,order_type=order_type)
 
 
-def _demo_review_error(category:str,message:str,reasons:list[str]|None=None)->dict[str,Any]:
-    return {"schema_version":"1.0","status":"rejected","error":category,"message":message,
-        "blocking_reasons":reasons or [category],"preview_id":None,"expires_at":None,
-        "quantity":None,"estimated_risk":None,"estimated_margin":None,"submission_allowed":False}
+def _demo_review_error(category:str,message:str,reasons:list[str]|None=None,*,
+                       symbol:str|None=None,order_type:str|None=None)->dict[str,Any]:
+    codes=reasons or [category]
+    blockers=[{"code":code,"message":DEMO_BLOCKING_MESSAGES.get(code,
+        "A required server-side validation did not pass.")} for code in codes]
+    return {"schema_version":"1.0","status":"blocked","error":category,
+        "error_category":category,"message":message,"blocking_reasons":blockers,
+        "preview_id":None,"expires_at":None,"submission_allowed":False,
+        "calculation":{"requested_symbol":normalize_pair(symbol) if symbol else None,
+            "order_type":order_type,"quantity":None,"estimated_risk":None,"estimated_margin":None},
+        "quantity":None,"estimated_risk":None,"estimated_margin":None}
 
 
 async def submit_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:

@@ -11,6 +11,7 @@ from app.config.settings import settings
 from app.storage.oauth import OAuthRepository, OAuthStorageError
 from app.oauth.cimd import CIMDError, cimd_loader
 from app.auth.onboarding import current_onboarding_claims, transaction_digest
+from app.oauth.constants import CANONICAL_MCP_RESOURCE, canonical_resource, normalize_resource
 
 
 router = APIRouter(tags=["oauth"])
@@ -58,8 +59,8 @@ async def authorize(
     if not requested_scopes or not requested_scopes <= ALLOWED_SCOPES:
         raise HTTPException(status_code=400, detail="Unsupported OAuth scope.")
     callback = _validate_callback(redirect_uri)
-    expected_resource = settings.public_base_url.rstrip("/")
-    if resource != expected_resource:
+    expected_resource = canonical_resource(resource)
+    if expected_resource is None:
         raise HTTPException(status_code=400, detail="OAuth resource is missing or invalid.")
     reference = oauth_repository().create_transaction(
         client_id=client_id, redirect_uri=callback, state=state, scope=scope,
@@ -186,9 +187,10 @@ async def exchange_token(request: Request) -> JSONResponse:
             resource=form.get("resource", ""),
         )
     elif grant_type == "refresh_token":
+        requested_resource=form.get("resource")
         result = oauth_repository().exchange_refresh_token(
             refresh_token=form.get("refresh_token", ""), client_id=client_id,
-            resource=form.get("resource") or settings.public_base_url.rstrip("/"),
+            resource=normalize_resource(requested_resource) if requested_resource else CANONICAL_MCP_RESOURCE,
             scope=form.get("scope"),
         )
     else:

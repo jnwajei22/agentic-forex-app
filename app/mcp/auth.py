@@ -1,6 +1,8 @@
 import hmac
+import hashlib
 import json
 import logging
+import sqlite3
 from collections.abc import Iterable
 
 import anyio
@@ -12,10 +14,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.config.settings import settings
 from app.auth.identity import reset_current_claims, set_current_claims
 from app.storage.oauth import OAuthRepository, OAuthStorageError
+from app.oauth.constants import CANONICAL_MCP_RESOURCE
 
 
 logger = logging.getLogger(__name__)
-RESOURCE = "https://mcp.justinnwajei.com"
+RESOURCE = CANONICAL_MCP_RESOURCE
 RESOURCE_METADATA_URL = f"{RESOURCE}/.well-known/oauth-protected-resource"
 OAUTH_CHALLENGE = f'Bearer resource_metadata="{RESOURCE_METADATA_URL}"'
 TOOL_SCOPES = {
@@ -83,11 +86,32 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-def _bearer_token(scope: Scope) -> str | None:
-    scheme, separator, token = (_header(scope, b"authorization") or "").partition(" ")
-    if not separator or scheme.lower() != "bearer" or not token:
-        return None
-    return token
+def _bearer_token(scope: Scope) -> tuple[str | None, str | None]:
+    raw = _header(scope, b"authorization")
+    if raw is None or not raw.strip():
+        return None, "missing_authorization_header"
+    parts = raw.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        return None, "malformed_bearer_header"
+    return parts[1], None
+
+
+def _token_fingerprint(token: str | None) -> str:
+    return hashlib.sha256((token or "<none>").encode()).hexdigest()[:12]
+
+
+def _log_rejection(category: str, token: str | None = None, **fields: str) -> None:
+    suffix = " ".join(f"{key}={value}" for key,value in fields.items())
+    logger.warning("mcp_oauth_rejected reason=%s token_fp=%s%s",category,
+        _token_fingerprint(token),f" {suffix}" if suffix else "")
+
+
+def _jwt_failure_category(exc: jwt.PyJWTError) -> str:
+    if isinstance(exc,jwt.ExpiredSignatureError):return "token_expired"
+    if isinstance(exc,jwt.InvalidIssuerError):return "issuer_mismatch"
+    if isinstance(exc,jwt.InvalidAudienceError):return "audience_resource_mismatch"
+    if isinstance(exc,jwt.InvalidSignatureError):return "invalid_signature"
+    return "other_validation_error"
 
 
 def _verify_access_token(token: str) -> dict:
@@ -180,7 +204,7 @@ class MCPAuthMiddleware:
             if settings.mcp_allow_public_no_auth:
                 await self.app(scope, receive, send)
                 return
-            token = _bearer_token(scope)
+            token, _ = _bearer_token(scope)
             if settings.mcp_shared_secret and token and hmac.compare_digest(
                 token, settings.mcp_shared_secret
             ):
@@ -191,33 +215,43 @@ class MCPAuthMiddleware:
             )
             return
 
-        token = _bearer_token(scope)
+        token, header_error = _bearer_token(scope)
         if not token:
+            _log_rejection(header_error or "missing_authorization_header")
             await _json_response(
                 scope, receive, send, "OAuth access token is required.", 401, OAUTH_CHALLENGE
             )
             return
 
         try:
-            claims = await anyio.to_thread.run_sync(
-                lambda: OAuthRepository().access_token_claims(token)
+            token_state, claims = await anyio.to_thread.run_sync(
+                lambda: OAuthRepository().access_token_status(token, RESOURCE)
             )
-        except OAuthStorageError:
-            claims = None
+        except (OAuthStorageError, sqlite3.Error, OSError):
+            _log_rejection("token_lookup_unavailable",token)
+            await JSONResponse({"detail":"OAuth token validation is temporarily unavailable."},status_code=503)(scope,receive,send)
+            return
         try:
-            if claims is None:
+            if claims is None and token.count(".") == 2:
                 claims = await anyio.to_thread.run_sync(_verify_access_token, token)
+            elif claims is None:
+                category = "unknown_token_fingerprint" if token_state == "token_record_not_found" else token_state
+                _log_rejection(category,token,storage_reason=token_state)
+                await _json_response(scope,receive,send,"Invalid OAuth access token.",401,OAUTH_CHALLENGE)
+                return
         except RuntimeError as exc:
             logger.error("MCP OAuth configuration error: %s", exc)
             await JSONResponse({"detail": str(exc)}, status_code=503)(scope, receive, send)
             return
-        except jwt.PyJWTError:
+        except jwt.PyJWTError as exc:
+            _log_rejection(_jwt_failure_category(exc),token)
             await _json_response(
                 scope, receive, send, "Invalid OAuth access token.", 401, OAUTH_CHALLENGE
             )
             return
 
         if not isinstance(claims.get("sub"), str) or not claims["sub"]:
+            _log_rejection("subject_missing",token)
             await _json_response(
                 scope, receive, send, "OAuth token is missing the subject claim.", 401, OAUTH_CHALLENGE
             )

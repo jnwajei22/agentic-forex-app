@@ -87,9 +87,9 @@ MCP_HEADERS = {
 
 def _enable_test_oauth(monkeypatch, scopes="forex:read forex:preview"):
     monkeypatch.setattr(settings, "mcp_require_oauth", True)
-    monkeypatch.setattr(
-        auth, "_verify_access_token", lambda token: {"sub": "auth0|test", "scope": scopes}
-    )
+    monkeypatch.setattr(auth,"OAuthRepository",lambda:type("TestTokens",(),{
+        "access_token_status":lambda self,token,resource:("accepted",{"sub":"auth0|test","scope":scopes,
+            "aud":resource,"resource":resource})})())
 
 
 def test_missing_auth_issuer_is_invalid_when_oauth_is_required(monkeypatch):
@@ -204,6 +204,32 @@ def test_mcp_valid_jwt_is_accepted(monkeypatch):
     assert '"name":"Agentic Forex Desk"' in response.text
 
 
+def test_mcp_oauth_rejections_are_diagnostic_and_do_not_log_tokens(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(settings, "mcp_require_oauth", True)
+    monkeypatch.setattr(settings, "sqlite_path", str(tmp_path / "oauth-diagnostics.db"))
+    secret_token = "opaque-secret-token-that-must-not-be-logged"
+    with caplog.at_level("WARNING", logger="app.mcp.auth"):
+        with TestClient(app) as client:
+            missing = client.post("/mcp", json=INITIALIZE_PAYLOAD, headers=MCP_HEADERS)
+            malformed = client.post(
+                "/mcp", json=INITIALIZE_PAYLOAD,
+                headers={**MCP_HEADERS, "Authorization": "Basic credentials"},
+            )
+            unknown = client.post(
+                "/mcp", json=INITIALIZE_PAYLOAD,
+                headers={**MCP_HEADERS, "Authorization": f"Bearer {secret_token}"},
+            )
+
+    assert (missing.status_code, malformed.status_code, unknown.status_code) == (401, 401, 401)
+    assert "reason=missing_authorization_header" in caplog.text
+    assert "reason=malformed_bearer_header" in caplog.text
+    assert "reason=unknown_token_fingerprint" in caplog.text
+    assert "storage_reason=token_record_not_found" in caplog.text
+    assert secret_token not in caplog.text
+
+
 def test_jwt_verification_checks_signature_issuer_audience_and_expiry(monkeypatch):
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     issuer = "https://tenant.auth0.com/"
@@ -271,6 +297,36 @@ def test_insufficient_scope_is_rejected(monkeypatch):
     assert 'scope="forex:preview"' in response.headers["www-authenticate"]
 
 
+@pytest.mark.parametrize(("tool_name", "required_scope"), [
+    ("get_demo_execution_status", "forex:read"),
+    ("review_demo_order", "forex:preview"),
+    ("submit_demo_order", "forex:execute"),
+])
+def test_profile_demo_tools_accept_only_their_required_scope(
+    monkeypatch, tool_name, required_scope
+):
+    payload = {
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {"name": tool_name, "arguments": {}},
+    }
+    _enable_test_oauth(monkeypatch, scopes=required_scope)
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/mcp", json=payload,
+            headers={**MCP_HEADERS, "Authorization": "Bearer scoped-token"},
+        )
+    assert accepted.status_code == 200
+
+    _enable_test_oauth(monkeypatch, scopes="")
+    with TestClient(app) as client:
+        denied = client.post(
+            "/mcp", json=payload,
+            headers={**MCP_HEADERS, "Authorization": "Bearer unscoped-token"},
+        )
+    assert denied.status_code == 403
+    assert f'scope="{required_scope}"' in denied.headers["www-authenticate"]
+
+
 def test_read_scope_cannot_trigger_autonomous_execution(monkeypatch):
     _enable_test_oauth(monkeypatch,scopes="forex:read")
     with TestClient(app) as client:
@@ -308,6 +364,12 @@ async def test_every_registered_tool_has_an_explicit_oauth_scope():
     registered={tool.name for tool in await mcp.list_tools()}
     assert registered==set(TOOL_SCOPES)
     assert TOOL_SCOPES["run_autonomous_demo_profile"]=="forex:execute"
+    assert TOOL_SCOPES["review_demo_order"]=="forex:preview"
+    assert TOOL_SCOPES["review_cancel_demo_order"]=="forex:preview"
+    assert TOOL_SCOPES["review_close_demo_position"]=="forex:preview"
+    assert TOOL_SCOPES["submit_demo_order"]=="forex:execute"
+    assert TOOL_SCOPES["submit_cancel_demo_order"]=="forex:execute"
+    assert TOOL_SCOPES["submit_close_demo_position"]=="forex:execute"
     assert "get_tradelocker_connection_status" in registered
 
 

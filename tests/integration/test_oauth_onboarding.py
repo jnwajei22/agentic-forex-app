@@ -14,7 +14,9 @@ from app.api.routes import oauth, platform
 from app.config.settings import settings
 from app.main import app
 from app.storage.brokers import BrokerRepository
+from app.storage.oauth import OAuthRepository
 from app.oauth.cimd import CIMDMetadata
+from app.oauth.constants import CANONICAL_MCP_RESOURCE
 
 
 @pytest.fixture
@@ -88,7 +90,9 @@ class FakeTradeLockerClient:
 
 def begin_authorization(client: TestClient, verifier="oauth-pkce-verifier", *,
                         client_id="chatgpt-client",
-                        redirect_uri="https://chatgpt.com/aip/callback?existing=1"):
+                        redirect_uri="https://chatgpt.com/aip/callback?existing=1",
+                        resource=CANONICAL_MCP_RESOURCE,
+                        scope="forex:read forex:preview"):
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     response = client.get(
         "/oauth/authorize",
@@ -97,10 +101,10 @@ def begin_authorization(client: TestClient, verifier="oauth-pkce-verifier", *,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "state": "original-oauth-state",
-            "scope": "forex:read forex:preview",
+            "scope": scope,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "resource": "https://mcp.example.test",
+            "resource": resource,
         },
         follow_redirects=False,
     )
@@ -108,6 +112,14 @@ def begin_authorization(client: TestClient, verifier="oauth-pkce-verifier", *,
     location = urlparse(response.headers["location"])
     assert f"{location.scheme}://{location.netloc}{location.path}" == "https://portal.example.test/oauth/start"
     return parse_qs(location.query)["transaction"][0], verifier
+
+
+def test_authorize_normalizes_canonical_resource_trailing_slash(oauth_storage):
+    with TestClient(app) as client:
+        transaction, _ = begin_authorization(
+            client, resource=f"{CANONICAL_MCP_RESOURCE}/"
+        )
+    assert transaction
 
 
 def test_first_time_oauth_stays_pending_until_tradelocker_setup(
@@ -149,7 +161,7 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
             "client_id": "chatgpt-client",
             "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
             "code_verifier": "incorrect-pkce-verifier",
-            "resource": "https://mcp.example.test",
+            "resource": CANONICAL_MCP_RESOURCE,
         })
         assert rejected.status_code == 400
         wrong_resource = client.post("/oauth/token", data={
@@ -164,7 +176,7 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
             "client_id": "chatgpt-client",
             "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
             "code_verifier": verifier,
-            "resource": "https://mcp.example.test",
+            "resource": CANONICAL_MCP_RESOURCE,
         })
         assert token.status_code == 200
         assert token.json()["token_type"] == "Bearer"
@@ -187,6 +199,26 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
             },
         )
         assert mcp.status_code == 200
+        preview_cannot_submit = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": {"name": "submit_demo_order", "arguments": {}},
+            },
+            headers={
+                "Authorization": f"Bearer {token.json()['access_token']}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        assert preview_cannot_submit.status_code == 403
+        assert 'scope="forex:execute"' in preview_cannot_submit.headers["www-authenticate"]
+        persisted_state, persisted_claims = OAuthRepository().access_token_status(
+            token.json()["access_token"], CANONICAL_MCP_RESOURCE
+        )
+        assert persisted_state == "accepted"
+        assert persisted_claims["sub"] == "auth0|user-a"
+        assert persisted_claims["scope"] == "forex:read forex:preview"
         refreshed = client.post("/oauth/token", data={
             "grant_type": "refresh_token",
             "refresh_token": token.json()["refresh_token"],
@@ -215,6 +247,50 @@ def test_first_time_oauth_stays_pending_until_tradelocker_setup(
         assert reused.status_code == 400
         assert reused.json() == {"error": "invalid_grant"}
 
+        upgraded_transaction, upgraded_verifier = begin_authorization(
+            client,
+            verifier="upgraded-oauth-pkce-verifier-with-sufficient-entropy",
+            scope="openid email forex:read forex:preview forex:execute",
+        )
+        assert onboarding_post(
+            client, "/api/oauth/onboarding/bind", upgraded_transaction
+        ).status_code == 200
+        upgraded_status = onboarding_post(
+            client, "/api/oauth/onboarding/status", upgraded_transaction
+        ).json()
+        assert upgraded_status["status"] == "ready"
+        upgraded_completed = onboarding_post(
+            client, "/api/oauth/onboarding/complete", upgraded_transaction,
+            {"csrf_token": upgraded_status["csrf_token"]},
+        ).json()
+        upgraded_code = parse_qs(
+            urlparse(upgraded_completed["redirect_url"]).query
+        )["code"][0]
+        upgraded = client.post("/oauth/token", data={
+            "grant_type": "authorization_code", "code": upgraded_code,
+            "client_id": "chatgpt-client",
+            "redirect_uri": "https://chatgpt.com/aip/callback?existing=1",
+            "code_verifier": upgraded_verifier,
+            "resource": f"{CANONICAL_MCP_RESOURCE}/",
+        })
+        assert upgraded.status_code == 200
+        assert upgraded.json()["scope"] == (
+            "openid email forex:read forex:preview forex:execute"
+        )
+        upgraded_submission_scope = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                "params": {"name": "submit_demo_order", "arguments": {}},
+            },
+            headers={
+                "Authorization": f"Bearer {upgraded.json()['access_token']}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        assert upgraded_submission_scope.status_code == 200
+
 
 def test_oauth_rejects_invalid_callback(oauth_storage):
     with TestClient(app) as client:
@@ -222,7 +298,7 @@ def test_oauth_rejects_invalid_callback(oauth_storage):
             "client_id": "chatgpt-client", "redirect_uri": "https://evil.example/callback",
             "response_type": "code", "state": "state", "scope": "forex:read",
             "code_challenge": "a" * 43, "code_challenge_method": "S256",
-            "resource": "https://mcp.example.test",
+            "resource": CANONICAL_MCP_RESOURCE,
         })
     assert response.status_code == 400
 
@@ -233,7 +309,7 @@ def test_arbitrary_static_client_is_rejected(oauth_storage):
             "client_id": "not-allowed", "redirect_uri": "https://chatgpt.com/aip/callback",
             "response_type": "code", "state": "state", "scope": "forex:read",
             "code_challenge": "a" * 43, "code_challenge_method": "S256",
-            "resource": "https://mcp.example.test",
+            "resource": CANONICAL_MCP_RESOURCE,
         })
     assert response.status_code == 400
     assert "Static OAuth client is not allowed" in response.text
@@ -266,7 +342,7 @@ def test_cimd_identity_and_exact_redirect_survive_token_exchange(oauth_storage, 
         token = client.post("/oauth/token", data={
             "grant_type": "authorization_code", "code": query["code"][0],
             "client_id": cimd_url, "redirect_uri": callback,
-            "code_verifier": verifier, "resource": "https://mcp.example.test",
+            "code_verifier": verifier, "resource": CANONICAL_MCP_RESOURCE,
         })
     assert token.status_code == 200
     oauth.cimd_loader.load.assert_awaited_once_with(cimd_url)
@@ -285,7 +361,7 @@ def test_cimd_unknown_redirect_is_rejected(oauth_storage, monkeypatch):
             "redirect_uri": "https://chatgpt.com/connector/oauth/unknown",
             "response_type": "code", "state": "state", "scope": "forex:read",
             "code_challenge": "a" * 43, "code_challenge_method": "S256",
-            "resource": "https://mcp.example.test",
+            "resource": CANONICAL_MCP_RESOURCE,
         })
     assert response.status_code == 400
 

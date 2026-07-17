@@ -165,10 +165,60 @@ async def test_failed_review_dependency_returns_controlled_payload(monkeypatch, 
     finally:
         reset_current_claims(token)
 
-    assert result["status"] == "rejected"
+    assert result["status"] == "blocked"
     assert result["error"] == "market_snapshot_unavailable"
-    assert result["blocking_reasons"] == ["market_snapshot_unavailable"]
+    assert result["error_category"] == "market_snapshot_unavailable"
+    assert result["blocking_reasons"] == [{"code":"market_snapshot_unavailable",
+        "message":"TradeLocker positions, orders, quote, candles, or configuration are unavailable."}]
     assert result["preview_id"] is None
     assert result["submission_allowed"] is False
+    assert result["calculation"] == {"requested_symbol":"EURUSD","order_type":"market",
+        "quantity":None,"estimated_risk":None,"estimated_margin":None}
     assert "dependency-secret-must-not-leak" not in str(result)
     assert "dependency-secret-must-not-leak" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_risk_validation_failure_exposes_exact_safe_blockers(monkeypatch, caplog):
+    class RiskRejectedService:
+        async def snapshot(self, user, profile, symbol):
+            return {"snapshot_id": "snapshot-safe", "market": {"pairs": {"EURUSD": {
+                "quote": {"d": {"bp": 1.1000, "ap": 1.1002}}}}}}
+
+        @staticmethod
+        def _quote(payload):
+            return 1.1000, 1.1002
+
+        async def review(self, user, profile, proposal):
+            raise AutonomousExecutionError(
+                "risk_validation_failed",
+                "internal validation context must not be returned",
+                status="rejected",
+                reasons=["provider_unavailable", "reward_risk_too_low"],
+            )
+
+    monkeypatch.setattr(tools, "AutonomousDemoService", RiskRejectedService)
+    token = set_current_claims({"sub": "user"})
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = await tools.review_demo_order(
+                "profile-safe", "EURUSD", "long", "market",
+                1.0992, 1.1022, "bounded test setup",
+            )
+    finally:
+        reset_current_claims(token)
+
+    assert result["status"] == "blocked"
+    assert result["error_category"] == "risk_validation_failed"
+    assert result["blocking_reasons"] == [
+        {"code": "provider_unavailable", "message":
+            "Required Finnhub market-event data is unavailable or stale."},
+        {"code": "reward_risk_too_low", "message":
+            "The server-calculated reward-to-risk ratio is below the profile minimum."},
+    ]
+    assert result["preview_id"] is None
+    assert result["submission_allowed"] is False
+    assert result["calculation"]["requested_symbol"] == "EURUSD"
+    assert "blocking_codes=provider_unavailable,reward_risk_too_low" in caplog.text
+    assert "internal validation context" not in str(result)
+    assert "internal validation context" not in caplog.text
