@@ -22,6 +22,7 @@ const allowed = new Set([
   "autonomous-runs",
   "autonomous-daily-summary",
   "autonomous-worker-health",
+  "autonomous-controls",
   "operations/kill-switch/enable",
 ]);
 
@@ -78,4 +79,8 @@ export async function DELETE(request: NextRequest, context: Context) {
 
 export async function PUT(request: NextRequest, context: Context) {
   return forward(request, (await context.params).path, "PUT");
+}
+
+export async function PATCH(request: NextRequest, context: Context) {
+  return forward(request, (await context.params).path, "PATCH");
 }

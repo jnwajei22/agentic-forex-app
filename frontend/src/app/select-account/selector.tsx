@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { completedSetupPath } from "@/lib/chatgpt-return";
 import { afterAccountSelected } from "@/lib/onboarding-transaction";
+import { BrowserBackendError, browserBackendMutation } from "@/lib/browser-backend";
 
 type Account = { accountId?: string | number; accNum?: string | number; name?: string; currency?: string; status?: string };
 
@@ -17,10 +18,9 @@ export default function AccountSelector({ returnTo, onboarding = false }: { retu
 
   useEffect(() => {
     let active = true;
-    fetch("/api/backend/broker/tradelocker/discover-accounts", { method: "POST" })
-      .then(async response => {
-        const body = await response.json();
-        if (!response.ok || body.status === "error" || body.status === "not_connected") throw new Error(body.message ?? "Unable to retrieve TradeLocker accounts. Check the credentials and server selection, then try again.");
+    browserBackendMutation<{ status?: string; message?: string; accounts?: Account[] }>("broker/tradelocker/discover-accounts", "POST")
+      .then(body => {
+        if (body.status === "error" || body.status === "not_connected") throw new Error(body.message ?? "Unable to retrieve TradeLocker accounts. Check the credentials and server selection, then try again.");
         if (active) setAccounts(body.accounts ?? []);
       })
       .catch(caught => active && setError(caught instanceof Error ? caught.message : "Unable to discover accounts."))
@@ -32,11 +32,12 @@ export default function AccountSelector({ returnTo, onboarding = false }: { retu
     const account = accounts[Number(selected)];
     if (!account || account.accountId == null || account.accNum == null) { setError("Select a valid account."); return; }
     setSaving(true); setError("");
-    const response = await fetch("/api/backend/broker/tradelocker/select-account", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ accountId: String(account.accountId), accNum: String(account.accNum) }),
-    }).catch(() => null);
-    if (!response?.ok) { const body = await response?.json().catch(() => ({})); setError(body?.error ?? "Unable to select the account."); setSaving(false); return; }
+    try {
+      await browserBackendMutation("broker/tradelocker/select-account", "POST", { accountId: String(account.accountId), accNum: String(account.accNum) });
+    } catch (caught) {
+      setError(caught instanceof BrowserBackendError ? caught.message : "Unable to select the account.");
+      setSaving(false); return;
+    }
     router.push(afterAccountSelected(onboarding, completedSetupPath(returnTo))); router.refresh();
   }
 

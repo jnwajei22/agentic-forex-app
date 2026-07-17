@@ -3,6 +3,7 @@ import { auth0 } from "@/lib/auth0";
 import { parseTradeLockerStatus, type TradeLockerStatus } from "@/lib/tradelocker-status";
 import StatusBadge from "@/components/status-badge";
 import RetryButton from "@/components/retry-button";
+import type { AutonomousControls } from "@/lib/browser-backend";
 import AccountsPanel, {
   type AccountSummary,
   type ConnectionSummary,
@@ -10,7 +11,6 @@ import AccountsPanel, {
   type ProfileSummary,
   type ScheduleSummary,
   type WorkerHealth,
-  type AutonomousControls,
 } from "./accounts-panel";
 
 type DashboardProps = { searchParams: Promise<{ connected?: string }> };

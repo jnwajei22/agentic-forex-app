@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import AppModal from "@/components/app-modal";
 import StatusBadge from "@/components/status-badge";
 import { parseTradeLockerStatus, type TradeLockerStatus } from "@/lib/tradelocker-status";
+import { browserBackendFetch, browserBackendMutation } from "@/lib/browser-backend";
 
 export default function SettingsPanel() {
   const router = useRouter();
@@ -19,9 +20,7 @@ export default function SettingsPanel() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch("/api/backend/broker/status");
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error();
+      const body = await browserBackendFetch<Record<string, unknown>>("broker/status");
       setStatus(parseTradeLockerStatus(body));
     } catch {
       setStatus(null);
@@ -33,10 +32,8 @@ export default function SettingsPanel() {
 
   useEffect(() => {
     let active = true;
-    fetch("/api/backend/broker/status")
-      .then(async response => {
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error();
+    browserBackendFetch<Record<string, unknown>>("broker/status")
+      .then(body => {
         if (active) setStatus(parseTradeLockerStatus(body));
       })
       .catch(() => {
@@ -50,8 +47,7 @@ export default function SettingsPanel() {
     setDeleting(true);
     setError("");
     try {
-      const response = await fetch("/api/backend/broker/tradelocker", { method: "DELETE" });
-      if (!response.ok) throw new Error();
+      await browserBackendMutation("broker/tradelocker", "DELETE");
       setConfirmDisable(false);
       router.refresh();
       await load();

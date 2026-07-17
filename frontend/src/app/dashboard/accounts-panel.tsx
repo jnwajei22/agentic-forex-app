@@ -6,6 +6,7 @@ import AppModal from "@/components/app-modal";
 import ScheduleModal, { type ScheduleValue } from "@/components/schedule-modal";
 import StatusBadge from "@/components/status-badge";
 import { displayBroker, displayStrategy, displayValue } from "@/lib/display";
+import { BrowserBackendError, browserBackendFetch, browserBackendMutation, updateAutonomousControls, type AutonomousControls, type AutonomousControlPatch } from "@/lib/browser-backend";
 
 export type ConnectionSummary = { public_id: string; label?: string; broker_name?: string; server: string; environment: string; enabled: boolean; account_count: number; last_verified_at?: string; is_default: boolean };
 export type ProfileRisk = { risk_per_trade_percent?: number; daily_loss_limit_percent?: number; drawdown_cutoff_percent?: number; maximum_open_positions?: number; maximum_pending_orders?: number; maximum_new_entries_per_day?: number; minimum_reward_risk?: number };
@@ -14,7 +15,6 @@ export type AccountSummary = { public_id: string; account_alias: string; account
 export type ScheduleSummary = { id: string; profile_ref: string; timezone: string; expression: { times: string[] }; enabled: boolean; next_run_at?: string; next_run_at_local?: string; last_run_at?: string; last_run_at_local?: string; last_run_status?: string; maximum_lateness_seconds: number; latest_dispatch?: { id: string; state: string; safe_retry: boolean; reason_code?: string; outcome?: string } };
 export type WorkerHealth = { status: string; workers: Array<{ worker_id: string; status: string; last_heartbeat_at: string; healthy: boolean }> };
 export type DailySummary = { date: string; outcomes: { TRADE: number; NO_TRADE: number; BLOCKED: number; ERROR: number }; daily_entry_count: number; kill_switch: boolean; armed_profiles: number };
-export type AutonomousControls = { global_autonomous_kill_switch: boolean; demo_autonomous_enabled: boolean; live_autonomous_enabled: boolean; live_execution_supported: boolean; updated_at: string; effective: { demo: string; live: string } };
 
 type ConfirmDialog = { kind: "confirm"; title: string; description: string; action: () => Promise<void>; destructive?: boolean; expectedText?: string };
 type RenameDialog = { kind: "rename"; account: AccountSummary; value: string };
@@ -36,19 +36,28 @@ export default function AccountsPanel({ loadState, connections, accounts, execut
   const [profileStatus, setProfileStatus] = useState<Record<string, string>>({});
   const [dialog, setDialog] = useState<DialogState>(null);
   const [scheduleDialog, setScheduleDialog] = useState<ScheduleDialog>(null);
+  const [controls, setControls] = useState(autonomousControls);
 
   async function mutate(path: string, method = "PUT", body?: object): Promise<boolean> {
     setBusy(path); setError("");
     try {
-      const response = await fetch(`/api/backend/${path}`, { method, headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({})) as { detail?: unknown; message?: unknown };
-        setError(typeof payload.message === "string" ? payload.message : typeof payload.detail === "string" ? payload.detail : "Unable to save this change. Try again.");
-        return false;
-      }
+      await browserBackendMutation(path, method as "POST" | "PUT" | "PATCH" | "DELETE", body);
       router.refresh(); return true;
-    } catch { setError("Backend API unavailable. This change was not saved."); return false; }
+    } catch (caught) { setError(caught instanceof BrowserBackendError ? caught.message : "Backend API unavailable. This change was not saved."); return false; }
     finally { setBusy(null); }
+  }
+
+  async function patchControls(patch: AutonomousControlPatch): Promise<boolean> {
+    const previous = controls;
+    setBusy("autonomous-controls"); setError("");
+    try {
+      await updateAutonomousControls(previous, patch, setControls);
+      router.refresh();
+      return true;
+    } catch (caught) {
+      setError(caught instanceof BrowserBackendError ? caught.message : "Backend API unavailable. This change was not saved.");
+      return false;
+    } finally { setBusy(null); }
   }
 
   function confirm(title: string, description: string, action: () => Promise<void>, destructive = true, expectedText?: string) {
@@ -62,10 +71,9 @@ export default function AccountsPanel({ loadState, connections, accounts, execut
   async function checkStatus(profile: ProfileSummary) {
     setProfileStatus(current => ({ ...current, [profile.public_id]: "Checking…" }));
     try {
-      const response = await fetch(`/api/backend/execution-profiles/${profile.public_id}/autonomy/status`);
-      const body = await response.json().catch(() => ({}));
+      const body = await browserBackendFetch<{ blocking_reasons?: unknown[]; autonomous_active?: boolean }>(`execution-profiles/${profile.public_id}/autonomy/status`);
       const reasons = Array.isArray(body.blocking_reasons) ? body.blocking_reasons.map(String) : [];
-      setProfileStatus(current => ({ ...current, [profile.public_id]: response.ok && body.autonomous_active ? "Autonomous Active" : reasons.length ? `Blocked: ${reasons.map(displayValue).join(", ")}` : "Manual" }));
+      setProfileStatus(current => ({ ...current, [profile.public_id]: body.autonomous_active ? "Autonomous Active" : reasons.length ? `Blocked: ${reasons.map(displayValue).join(", ")}` : "Manual" }));
     } catch { setProfileStatus(current => ({ ...current, [profile.public_id]: "Status Unavailable" })); }
   }
 
@@ -78,8 +86,8 @@ export default function AccountsPanel({ loadState, connections, accounts, execut
   const autonomousState = (account: AccountSummary, profile: ProfileSummary) => {
     if (!profile.enabled) return "profile_disabled";
     if (!account.available || !account.locally_enabled) return "unavailable";
-    if (autonomousControls.global_autonomous_kill_switch) return "kill_switch_enabled";
-    return account.environment === "demo" ? (autonomousControls.demo_autonomous_enabled ? "active" : "manual") : (autonomousControls.live_autonomous_enabled ? "blocked" : "manual");
+    if (controls.global_autonomous_kill_switch) return "kill_switch_enabled";
+    return account.environment === "demo" ? (controls.demo_autonomous_enabled ? "active" : "manual") : (controls.live_autonomous_enabled ? "blocked" : "manual");
   };
 
   return <>
@@ -87,11 +95,11 @@ export default function AccountsPanel({ loadState, connections, accounts, execut
       <article className="card operational-card">
         <div className="label">Autonomous Trading</div>
         {error && <div className="error" role="alert">{error}</div>}
-        <ControlRow title="Global Autonomous Kill Switch" description="Blocks all new autonomous demo and live submissions. Manual activity remains available." value={autonomousControls.global_autonomous_kill_switch} onLabel="Kill Switch Enabled" offLabel="Kill Switch Off" disabled={Boolean(busy)} onChange={value => void mutate("autonomous-controls", "PATCH", { global_autonomous_kill_switch: value, reason: "Dashboard toggle" })} />
-        <ControlRow title="Demo Autonomous Trading" description="Allows enabled demo profiles to trade autonomously according to their schedules and risk rules." value={autonomousControls.demo_autonomous_enabled} onLabel="Demo Autonomous On" offLabel="Demo Autonomous Off" disabled={Boolean(busy)} onChange={value => void mutate("autonomous-controls", "PATCH", { demo_autonomous_enabled: value, reason: "Dashboard toggle" })} />
-        <ControlRow title="Live Autonomous Trading" description="Allows eligible live profiles to trade autonomously using real funds." value={autonomousControls.live_autonomous_enabled} onLabel="Live Autonomous On" offLabel="Live Autonomous Off" disabled={Boolean(busy)} onChange={value => value ? setDialog({ kind: "live", confirmation: "" }) : void mutate("autonomous-controls", "PATCH", { live_autonomous_enabled: false, reason: "Dashboard toggle" })} />
-        {!autonomousControls.live_execution_supported && <div className="error">Live execution path not yet available</div>}
-        <small>Last updated: {autonomousControls.updated_at ? new Date(autonomousControls.updated_at).toLocaleString() : "Not yet changed"}</small>
+        <ControlRow title="Global Autonomous Kill Switch" description="Blocks all new autonomous demo and live submissions. Manual activity remains available." value={controls.global_autonomous_kill_switch} onLabel="Kill Switch Enabled" offLabel="Kill Switch Off" disabled={Boolean(busy)} onChange={value => void patchControls({ global_autonomous_kill_switch: value })} />
+        <ControlRow title="Demo Autonomous Trading" description="Allows enabled demo profiles to trade autonomously according to their schedules and risk rules." value={controls.demo_autonomous_enabled} onLabel="Demo Autonomous On" offLabel="Demo Autonomous Off" disabled={Boolean(busy)} onChange={value => void patchControls({ demo_autonomous_enabled: value })} />
+        <ControlRow title="Live Autonomous Trading" description="Allows eligible live profiles to trade autonomously using real funds." value={controls.live_autonomous_enabled} onLabel="Live Autonomous On" offLabel="Live Autonomous Off" disabled={Boolean(busy)} onChange={value => value ? setDialog({ kind: "live", confirmation: "" }) : void patchControls({ live_autonomous_enabled: false })} />
+        {!controls.live_execution_supported && <div className="error">Live execution path not yet available</div>}
+        <small>Last updated: {controls.updated_at ? new Date(controls.updated_at).toLocaleString() : "Not yet changed"}</small>
       </article>
 
       <div className="section-heading"><div><div className="eyebrow">TradeLocker Connections</div><h2>Connections, Accounts, and Execution Profiles</h2><p>Profiles stay bound to one account. Environment controls determine whether they run manually or autonomously.</p></div><a className="button" href="/connect-tradelocker?new=1">Add Connection</a></div>
@@ -118,7 +126,7 @@ export default function AccountsPanel({ loadState, connections, accounts, execut
       <article className="card operational-card"><div className="label">Recent Demo Executions</div>{executions.length ? executions.map(item => <p key={item.id}><strong>{displayValue(item.action_type)}</strong> · {displayValue(item.state)} · {new Date(item.created_at).toLocaleString()}</p>) : <p>No demo executions have been recorded.</p>}</article>
     </section>
 
-    <ActionDialog dialog={dialog} busy={Boolean(busy)} setDialog={setDialog} mutate={mutate} liveAccounts={liveAccounts} liveProfiles={liveProfiles} globalKillSwitch={autonomousControls.global_autonomous_kill_switch} confirm={confirm} />
+    <ActionDialog dialog={dialog} busy={Boolean(busy)} setDialog={setDialog} mutate={mutate} patchControls={patchControls} liveAccounts={liveAccounts} liveProfiles={liveProfiles} globalKillSwitch={controls.global_autonomous_kill_switch} confirm={confirm} />
     {scheduleDialog && <ScheduleModal key={scheduleDialog.profile.public_id} open profile={{ name: scheduleDialog.profile.name, accountAlias: scheduleDialog.account.account_alias, strategy: displayStrategy(scheduleDialog.profile.strategy_name, scheduleDialog.profile.strategy_version), executionMode: scheduleDialog.account.environment === "live" ? "Live" : "Demo" }} initial={{ timezone: scheduleDialog.current?.timezone, times: scheduleDialog.current?.expression.times, enabled: scheduleDialog.current?.enabled }} saving={Boolean(busy)} onClose={() => setScheduleDialog(null)} onSave={async (value: ScheduleValue) => { const saved = await mutate(`execution-profiles/${scheduleDialog.profile.public_id}/autonomy/schedule`, "POST", { ...value, maximum_lateness_seconds: 600 }); if (saved) setScheduleDialog(null); }} />}
   </>;
 }
@@ -127,11 +135,11 @@ function ControlRow({ title, description, value, onLabel, offLabel, disabled, on
   return <div className="profile-row"><div><strong>{title}</strong><p>{description}</p><StatusBadge value={value ? "active" : "manual"} label={value ? onLabel : offLabel} /></div><label className="toggle-row"><input aria-label={title} type="checkbox" checked={value} disabled={disabled} onChange={event => onChange(event.target.checked)} /><span>{value ? "On" : "Off"}</span></label></div>;
 }
 
-function ActionDialog({ dialog, busy, setDialog, mutate, liveAccounts, liveProfiles, globalKillSwitch, confirm }: { dialog: DialogState; busy: boolean; setDialog: (dialog: DialogState) => void; mutate: (path: string, method?: string, body?: object) => Promise<boolean>; liveAccounts: AccountSummary[]; liveProfiles: ProfileSummary[]; globalKillSwitch: boolean; confirm: (title: string, description: string, action: () => Promise<void>, destructive?: boolean, expectedText?: string) => void }) {
+function ActionDialog({ dialog, busy, setDialog, mutate, patchControls, liveAccounts, liveProfiles, globalKillSwitch, confirm }: { dialog: DialogState; busy: boolean; setDialog: (dialog: DialogState) => void; mutate: (path: string, method?: string, body?: object) => Promise<boolean>; patchControls: (patch: AutonomousControlPatch) => Promise<boolean>; liveAccounts: AccountSummary[]; liveProfiles: ProfileSummary[]; globalKillSwitch: boolean; confirm: (title: string, description: string, action: () => Promise<void>, destructive?: boolean, expectedText?: string) => void }) {
   const [typed, setTyped] = useState("");
   if (!dialog) return null;
   if (dialog.kind === "confirm") return <AppModal open title={dialog.title} description={dialog.description} onClose={() => setDialog(null)}>{dialog.expectedText && <div className="field"><label htmlFor="typed-confirmation">Type <strong>{dialog.expectedText}</strong> to confirm</label><input id="typed-confirmation" value={typed} onChange={event => setTyped(event.target.value)} /></div>}<div className="modal-actions"><button className="button secondary" type="button" onClick={() => setDialog(null)}>Cancel</button><button className={dialog.destructive ? "button danger-solid" : "button"} disabled={busy || Boolean(dialog.expectedText && typed !== dialog.expectedText)} onClick={async () => { await dialog.action(); setDialog(null); }}>{busy ? "Saving…" : "Confirm"}</button></div></AppModal>;
-  if (dialog.kind === "live") return <AppModal open title="Enable Live Autonomous Trading" description="Live trading uses real funds. The current repository has no live execution path, so runs will remain blocked." onClose={() => setDialog(null)}><div className="modal-summary"><p><strong>Affected accounts:</strong> {liveAccounts.map(item => item.account_alias).join(", ") || "None"}</p><p><strong>Enabled profiles:</strong> {liveProfiles.map(item => item.name).join(", ") || "None"}</p>{liveProfiles.map(item => <p key={item.public_id}><strong>{item.name} risk:</strong> {item.risk?.risk_per_trade_percent ?? .25}% per trade; max {item.risk?.maximum_open_positions ?? 1} open position</p>)}<p><strong>Global kill switch:</strong> {globalKillSwitch ? "Enabled" : "Off"}</p></div><div className="field"><label htmlFor="live-confirmation">Type <strong>ENABLE LIVE AUTONOMY</strong></label><input id="live-confirmation" value={dialog.confirmation} onChange={event => setDialog({ ...dialog, confirmation: event.target.value })} /></div><div className="modal-actions"><button className="button secondary" onClick={() => setDialog(null)}>Cancel</button><button className="button danger-solid" disabled={busy || dialog.confirmation !== "ENABLE LIVE AUTONOMY"} onClick={async () => { if (await mutate("autonomous-controls", "PATCH", { live_autonomous_enabled: true, live_confirmation: dialog.confirmation, reason: "Explicit live activation" })) setDialog(null); }}>Enable Live Autonomous Trading</button></div></AppModal>;
+  if (dialog.kind === "live") return <AppModal open title="Enable Live Autonomous Trading" description="Live trading uses real funds. The current repository has no live execution path, so runs will remain blocked." onClose={() => setDialog(null)}><div className="modal-summary"><p><strong>Affected accounts:</strong> {liveAccounts.map(item => item.account_alias).join(", ") || "None"}</p><p><strong>Enabled profiles:</strong> {liveProfiles.map(item => item.name).join(", ") || "None"}</p>{liveProfiles.map(item => <p key={item.public_id}><strong>{item.name} risk:</strong> {item.risk?.risk_per_trade_percent ?? .25}% per trade; max {item.risk?.maximum_open_positions ?? 1} open position</p>)}<p><strong>Global kill switch:</strong> {globalKillSwitch ? "Enabled" : "Off"}</p></div><div className="field"><label htmlFor="live-confirmation">Type <strong>ENABLE LIVE AUTONOMY</strong></label><input id="live-confirmation" value={dialog.confirmation} onChange={event => setDialog({ ...dialog, confirmation: event.target.value })} /></div><div className="modal-actions"><button className="button secondary" onClick={() => setDialog(null)}>Cancel</button><button className="button danger-solid" disabled={busy || dialog.confirmation !== "ENABLE LIVE AUTONOMY"} onClick={async () => { if (await patchControls({ live_autonomous_enabled: true, live_confirmation: dialog.confirmation })) setDialog(null); }}>Enable Live Autonomous Trading</button></div></AppModal>;
 
   const title = dialog.kind === "rename" ? "Rename Account Alias" : dialog.kind === "create" ? "Create Execution Profile" : "Edit Profile";
   return <AppModal open title={title} onClose={() => setDialog(null)}><form onSubmit={async event => { event.preventDefault(); let saved = false; if (dialog.kind === "rename") saved = Boolean(dialog.value.trim()) && await mutate(`broker/accounts/${dialog.account.public_id}/alias`, "PUT", { alias: dialog.value.trim() }); if (dialog.kind === "create") saved = Boolean(dialog.value.trim()) && await mutate("execution-profiles", "POST", { name: dialog.value.trim(), account_id: dialog.account.public_id }); if (dialog.kind === "edit") saved = await mutate(`execution-profiles/${dialog.profile.public_id}`, "PUT", { name: dialog.draft.name, enabled: dialog.draft.enabled, strategy_template_id: dialog.draft.strategyTemplateId, allowed_instruments: dialog.draft.allowedPairs.split(",").map(value => value.trim()).filter(Boolean), risk: dialog.draft.risk }); if (saved) setDialog(null); }}>

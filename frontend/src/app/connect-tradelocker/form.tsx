@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { accountSelectionPath } from "@/lib/chatgpt-return";
 import { afterCredentialsSaved } from "@/lib/onboarding-transaction";
 import { getConnectionAlert, type ConnectionAlert } from "@/lib/connection-alert";
+import { BrowserBackendError, browserBackendMutation } from "@/lib/browser-backend";
 
 export default function ConnectTradeLockerForm({ returnTo, onboarding = false, initialAlert = null, connectionId = null, createNew = false }: { returnTo: string | null; onboarding?: boolean; initialAlert?: ConnectionAlert; connectionId?: string | null; createNew?: boolean }) {
   const router = useRouter();
@@ -16,27 +17,25 @@ export default function ConnectTradeLockerForm({ returnTo, onboarding = false, i
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const environment = String(form.get("environment"));
-    const response = await fetch("/api/backend/broker/tradelocker/save-credentials", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    try {
+      await browserBackendMutation("broker/tradelocker/save-credentials", "POST", {
         base_url: environment === "live" ? "https://live.tradelocker.com/backend-api" : "https://demo.tradelocker.com/backend-api",
         environment,
         connection_id: connectionId, create_new: createNew,
         username: form.get("username"), password: form.get("password"), server: form.get("server"),
-      }),
-    }).catch(() => null);
-    if (!response?.ok) {
-      const body = await response?.json().catch(() => ({}));
-      const issue = body?.error === "tradelocker_credentials_rejected"
+      });
+    } catch (caught) {
+      const body = caught instanceof BrowserBackendError ? caught.payload : {};
+      const issue = body.error === "tradelocker_credentials_rejected"
         ? "invalid_credentials"
-        : response?.status && response.status >= 500
+        : caught instanceof BrowserBackendError && caught.status >= 500
           ? "upstream_unavailable"
           : null;
       setAlert(getConnectionAlert({
         connectionIssue: issue,
         reconnectRequired: false,
         hasStoredConnection: false,
-      }) ?? { kind: "error", message: body?.message ?? "Unable to save TradeLocker credentials." });
+      }) ?? { kind: "error", message: caught instanceof Error ? caught.message : "Unable to save TradeLocker credentials." });
       const password = formElement.elements.namedItem("password");
       if (password instanceof HTMLInputElement) password.value = "";
       setLoading(false); return;
