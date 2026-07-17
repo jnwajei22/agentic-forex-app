@@ -20,6 +20,7 @@ from app.models.onboarding import (
 from app.models.autonomous import ExecutionMode, ExecutionSettingsUpdate
 from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
 from app.services.autonomous.runner import AutonomousDecisionRunner
+from app.services.autonomous.decision import decision_provider_readiness
 from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
@@ -78,6 +79,9 @@ class ExecutionProfileUpdate(BaseModel):
     allowed_instruments: list[str] | None = None
     session_rules: dict[str, Any] | None = None
     news_filter_enabled: bool | None = None
+    decision_provider: Literal["openai","no_trade"] | None = None
+    model_identifier: str | None = Field(default=None,max_length=80)
+    minimum_confidence: float | None = Field(default=None,ge=0,le=1)
 
 
 class AutonomousControlsUpdate(BaseModel):
@@ -133,6 +137,11 @@ def repository() -> BrokerRepository:
         return BrokerRepository()
     except BrokerStorageError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+def _profile_with_provider_readiness(profile: dict[str, Any]) -> dict[str, Any]:
+    return {**profile, "provider_readiness": decision_provider_readiness(
+        profile.get("decision_provider"), profile.get("model_identifier"))}
 
 
 @router.get("/me")
@@ -355,7 +364,10 @@ async def list_connections(claims: dict = Depends(current_claims)) -> dict:
 
 @router.get("/broker/accounts")
 async def list_accounts(claims: dict = Depends(current_claims)) -> dict:
-    return {"accounts": repository().list_accounts(claims["sub"])}
+    accounts=repository().list_accounts(claims["sub"])
+    for account in accounts:
+        account["profiles"]=[_profile_with_provider_readiness(profile) for profile in account.get("profiles",[])]
+    return {"accounts": accounts}
 
 
 @router.put("/broker/accounts/{account_id}/alias")
@@ -394,7 +406,7 @@ async def disable_connection(connection_id: str, claims: dict = Depends(current_
 
 @router.get("/execution-profiles")
 async def list_execution_profiles(claims: dict = Depends(current_claims)) -> dict:
-    return {"profiles": repository().list_profiles(claims["sub"])}
+    return {"profiles": [_profile_with_provider_readiness(profile) for profile in repository().list_profiles(claims["sub"])]}
 
 
 @router.post("/execution-profiles", status_code=201)
@@ -415,11 +427,13 @@ async def update_execution_profile(profile_id: str, payload: ExecutionProfileUpd
             execution_mode=payload.execution_mode, enabled=payload.enabled,
             strategy_template_id=payload.strategy_template_id,risk=payload.risk,
             allowed_instruments=payload.allowed_instruments,session_rules=payload.session_rules,
-            news_filter_enabled=payload.news_filter_enabled)
+            news_filter_enabled=payload.news_filter_enabled,decision_provider=payload.decision_provider,
+            model_identifier=payload.model_identifier,minimum_confidence=payload.minimum_confidence)
     except BrokerStorageError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if not changed: raise HTTPException(status_code=404, detail="Profile not found.")
-    return {"status":"updated","profile_id":profile_id}
+    profile=next(item for item in repository().list_profiles(claims["sub"]) if item["public_id"]==profile_id)
+    return {"status":"updated","profile_id":profile_id,"profile":_profile_with_provider_readiness(profile)}
 
 
 @router.delete("/execution-profiles/{profile_id}")

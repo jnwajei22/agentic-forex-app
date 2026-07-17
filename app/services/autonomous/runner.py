@@ -8,7 +8,7 @@ from uuid import uuid4
 from app.config.settings import settings
 from app.models.autonomous import AutonomousOrderProposal
 from app.services.autonomous.context import build_decision_context
-from app.services.autonomous.decision import DecisionAction, DecisionProvider, production_provider
+from app.services.autonomous.decision import DecisionAction, DecisionProvider, decision_provider_readiness, production_provider
 from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
 from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository, utcnow
@@ -61,8 +61,8 @@ class AutonomousDecisionRunner:
         if now.weekday()>=5:reasons.append("weekend_blocked")
         allowed=set(profile.get("allowed_sessions") or [])
         if allowed and not allowed.intersection(self._session(now)):reasons.append("outside_allowed_session")
-        provider=profile.get("decision_provider") or "no_trade"
-        if provider=="openai" and not settings.openai_api_key:reasons.append("provider_unavailable")
+        readiness=decision_provider_readiness(profile.get("decision_provider"),profile.get("model_identifier"))
+        reasons.extend(readiness["blocking_reasons"])
         return list(dict.fromkeys(reasons))
 
     @staticmethod
@@ -105,6 +105,7 @@ class AutonomousDecisionRunner:
             "execution_mode":profile.get("execution_mode"),"execution_mode_deprecated":True,
             "armed":None,"armed_until":None,"shadow_mode":None,"legacy_controls_deprecated":True,
             "decision_provider":profile.get("decision_provider"),"model_identifier":profile.get("model_identifier"),
+            "provider_readiness":decision_provider_readiness(profile.get("decision_provider"),profile.get("model_identifier")),
             "minimum_confidence":profile.get("minimum_confidence"),"kill_switch":controls["global_autonomous_kill_switch"],
             "blocking_reasons":reasons,"latest_run":self._public_run(latest) if latest else None}
 

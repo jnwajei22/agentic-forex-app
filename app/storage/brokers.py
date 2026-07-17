@@ -540,10 +540,23 @@ class BrokerRepository:
                        strategy_template_id: str | None=None, risk: dict[str,Any] | None=None,
                        allowed_instruments: list[str] | None=None,
                        session_rules: dict[str,Any] | None=None,
-                       news_filter_enabled: bool | None=None) -> bool:
+                       news_filter_enabled: bool | None=None,
+                       decision_provider: str | None=None, model_identifier: str | None=None,
+                       minimum_confidence: float | None=None) -> bool:
         if execution_mode is not None and execution_mode not in {"read_only","demo_manual","demo_autonomous","disabled"}:
             raise BrokerStorageError("Invalid execution mode.")
         assignments, values = ["updated_at=?"], [_now()]
+        if decision_provider is not None:
+            if decision_provider not in {"openai","no_trade"}:
+                raise BrokerStorageError("Unsupported autonomous decision provider.")
+            assignments.extend(["decision_provider=?","model_identifier=?"])
+            values.extend([decision_provider, model_identifier.strip() if model_identifier and model_identifier.strip() else None])
+        elif model_identifier is not None:
+            assignments.append("model_identifier=?"); values.append(model_identifier.strip() or None)
+        if minimum_confidence is not None:
+            if not 0 <= float(minimum_confidence) <= 1:
+                raise BrokerStorageError("Minimum confidence must be between 0 and 1.")
+            assignments.append("minimum_confidence=?"); values.append(float(minimum_confidence))
         if name is not None: assignments.append("name=?"); values.append(name)
         if execution_mode is not None:
             assignments.append("execution_mode=?"); values.append(execution_mode)

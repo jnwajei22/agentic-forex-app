@@ -5,6 +5,7 @@ from app.services.autonomous.runner import AutonomousDecisionRunner
 from app.storage.execution import ExecutionRepository
 from app.storage.brokers import BrokerRepository
 from app.storage.schedules import ScheduleRepository
+import asyncio
 
 
 def test_controls_default_safe_are_durable_audited_and_user_isolated(tmp_path, monkeypatch):
@@ -58,6 +59,33 @@ def test_live_toggle_fails_closed_without_live_execution_path(tmp_path, monkeypa
         "account_environment": "live", "is_demo": 0, "allowed_sessions": [], "decision_provider": "no_trade"}
     reasons = runner._blocking_reasons(profile, datetime(2026, 1, 14, 14, tzinfo=timezone.utc), "user")
     assert reasons == ["live_autonomous_execution_not_implemented"]
+
+
+def test_missing_openai_configuration_blocks_before_any_broker_operation(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "kill_switch_enabled", False)
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    database = tmp_path / "provider-block.db"
+    brokers, profile = _profile_for_environment(database, "demo")
+    brokers.update_profile("demo", profile["public_id"], decision_provider="openai",
+        model_identifier=None, minimum_confidence=0.7)
+    execution = ExecutionRepository(database)
+    execution.update_autonomous_controls("demo", {"demo_autonomous_enabled": True},
+        updated_by="demo", source="test")
+
+    class NoBrokerCalls:
+        calls = 0
+        async def snapshot(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("Broker snapshot must not run when provider configuration is blocked.")
+
+    demo = NoBrokerCalls()
+    runner = AutonomousDecisionRunner(brokers=brokers, execution=execution, demo=demo)
+    result = asyncio.run(runner.run("demo", profile["public_id"], "missing-provider-config", "test"))
+
+    assert result["status"] == "skipped"
+    assert "openai_api_key_missing" in result["reason_codes"]
+    assert "model_not_selected" in result["reason_codes"]
+    assert demo.calls == 0
 
 
 def _profile_for_environment(database, environment):

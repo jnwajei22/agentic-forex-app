@@ -73,6 +73,46 @@ def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmati
         assert isolated["live_autonomous_enabled"] is False
 
 
+def test_profile_decision_engine_update_persists_and_reports_safe_readiness(platform_storage, monkeypatch):
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    connection = platform_storage.save_connection("auth0|provider-user",
+        base_url="https://demo.tradelocker.test/backend-api", username="private-user", password="private-password",
+        server="demo", environment="demo")
+    platform_storage.sync_accounts("auth0|provider-user", connection.connection_ref,
+        {"accounts": [{"accountId": "provider-account", "accNum": "1"}]})
+    account = platform_storage.list_accounts("auth0|provider-user")[0]
+    profile = platform_storage.create_profile("auth0|provider-user", name="Provider Profile",
+        account_ref=account["public_id"])
+
+    with _client_for("auth0|provider-user") as client:
+        updated = client.put(f"/api/execution-profiles/{profile['public_id']}", json={
+            "decision_provider": "openai", "model_identifier": "gpt-test-model",
+            "minimum_confidence": 0.82,
+        })
+        assert updated.status_code == 200
+        saved = updated.json()["profile"]
+        assert saved["decision_provider"] == "openai"
+        assert saved["model_identifier"] == "gpt-test-model"
+        assert saved["minimum_confidence"] == 0.82
+        assert saved["provider_readiness"]["label"] == "API Key Missing"
+        assert saved["provider_readiness"]["blocking_reasons"] == ["openai_api_key_missing"]
+        assert "api_key" not in saved or saved.get("api_key") is None
+
+        rejected = client.put(f"/api/execution-profiles/{profile['public_id']}", json={
+            "decision_provider": "openai", "model_identifier": "gpt-test-model",
+            "minimum_confidence": 1.01,
+        })
+        assert rejected.status_code == 422
+
+        missing_model = client.put(f"/api/execution-profiles/{profile['public_id']}", json={
+            "decision_provider": "openai", "model_identifier": None, "minimum_confidence": 0.7,
+        })
+        assert missing_model.status_code == 200
+        assert "model_not_selected" in missing_model.json()["profile"]["provider_readiness"]["blocking_reasons"]
+
+    assert ExecutionRepository(platform_storage.db_path).recent_decision_runs("auth0|provider-user") == []
+
+
 def test_profile_delete_api_requires_exact_name_confirmation(platform_storage):
     connection = platform_storage.save_connection("auth0|delete-user",
         base_url="https://demo.tradelocker.test/backend-api", username="u", password="p",

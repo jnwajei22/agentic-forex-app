@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import time
 from enum import StrEnum
 from typing import Any, Protocol
@@ -8,6 +9,35 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config.settings import settings
+
+
+SUPPORTED_DECISION_PROVIDERS = ("openai", "no_trade")
+
+
+def decision_provider_readiness(provider: str | None, model_identifier: str | None) -> dict[str, Any]:
+    name = provider or "no_trade"
+    api_key_configured = bool((settings.openai_api_key or "").strip())
+    provider_available = importlib.util.find_spec("openai") is not None
+    if name == "no_trade":
+        return {"status": "testing_only", "label": "Testing Only", "ready": True,
+            "blocking_reasons": [], "api_key_configured": api_key_configured,
+            "provider_available": provider_available}
+    if name != "openai":
+        return {"status": "provider_unavailable", "label": "Provider Unavailable", "ready": False,
+            "blocking_reasons": ["provider_unavailable"], "api_key_configured": False,
+            "provider_available": False}
+    reasons: list[str] = []
+    available = provider_available
+    if not available: reasons.append("provider_unavailable")
+    if not api_key_configured: reasons.append("openai_api_key_missing")
+    if not model_identifier or not model_identifier.strip(): reasons.append("model_not_selected")
+    if "provider_unavailable" in reasons: status, label = "provider_unavailable", "Provider Unavailable"
+    elif "openai_api_key_missing" in reasons: status, label = "api_key_missing", "API Key Missing"
+    elif "model_not_selected" in reasons: status, label = "model_not_selected", "Model Not Selected"
+    else: status, label = "ready", "Ready"
+    return {"status": status, "label": label, "ready": not reasons,
+        "blocking_reasons": reasons, "api_key_configured": api_key_configured,
+        "provider_available": available}
 
 
 class DecisionAction(StrEnum):

@@ -100,6 +100,7 @@ async def test_autonomous_trade_uses_manual_preview_submit_service_once(tmp_path
         strategy_template_id="strategy_ai_forex_confluence_v1")
     brokers.arm_autonomous_profile("user", profile["public_id"],
         armed_until=(utcnow() + timedelta(hours=1)).isoformat(), decision_provider="openai",
+        model_identifier="fixture-model",
         allowed_sessions=["london", "new_york", "overlap"], shadow_mode=False)
     service = _ManualExecutionFixture()
     provider = DeterministicTestDecisionProvider(StructuredDecision(action=DecisionAction.TRADE,
