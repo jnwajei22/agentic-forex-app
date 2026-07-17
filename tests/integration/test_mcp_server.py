@@ -537,7 +537,7 @@ async def test_mcp_watchlist_is_configuration_only():
     assert watchlist[0]["pair"] == "EUR/USD"
 
 
-def test_mcp_order_review_is_rejected_without_live_submission(monkeypatch):
+def test_autonomous_kill_switch_does_not_block_manual_mcp_review(monkeypatch):
     submit_order = AsyncMock(side_effect=AssertionError("TradeLocker invoked"))
     monkeypatch.setattr(TradeLockerAdapter, "submit_order", submit_order)
     monkeypatch.setattr(settings, "kill_switch_enabled", True)
@@ -553,8 +553,8 @@ def test_mcp_order_review_is_rejected_without_live_submission(monkeypatch):
         }
     )
 
-    assert preview["status"] == "rejected"
-    assert "Kill switch is enabled." in preview["violations"]
+    assert preview["status"] == "preview_only"
+    assert "Kill switch is enabled." not in preview["violations"]
     submit_order.assert_not_awaited()
 
 

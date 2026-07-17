@@ -61,8 +61,8 @@ class AutonomousScheduleService:
     def _profile(self,user_sub:str,profile_ref:str)->dict[str,Any]:
         profile=next((item for item in self.brokers.list_profiles(user_sub) if item["public_id"]==profile_ref),None)
         if not profile:raise ScheduleStorageError("Execution profile was not found.")
-        if profile.get("account_environment")!="demo" or profile.get("is_demo")!=1:
-            raise ScheduleStorageError("Only a verified demo profile can have an autonomous schedule.")
+        if profile.get("account_environment") not in {"demo","live"} or profile.get("is_demo") not in {0,1}:
+            raise ScheduleStorageError("The profile account environment is not verified.")
         return profile
 
     def save(self,user_sub:str,profile_ref:str,*,timezone_name:str=DEFAULT_TIMEZONE,
@@ -110,9 +110,10 @@ class AutonomousScheduleService:
                 "daily_pnl":risk.get("daily_realized_pnl"),"open_pnl":risk.get("open_pnl")})
         profiles=self.brokers.list_profiles(user_sub)
         entry_count=sum(1 for item in runs if item.get("state")=="trade" and item.get("execution_id"))
+        controls=self.execution.get_autonomous_controls(user_sub)
         return {"schema_version":"1.0","date":target.isoformat(),"timezone":"UTC","outcomes":outcomes,
-            "daily_entry_count":entry_count,"kill_switch":self.execution.kill_switch_enabled(),
-            "armed_profiles":sum(1 for item in profiles if item.get("autonomous_armed")),"runs":details}
+            "daily_entry_count":entry_count,"kill_switch":controls["global_autonomous_kill_switch"],
+            "autonomous_controls":controls,"armed_profiles":0,"armed_profiles_deprecated":True,"runs":details}
 
     @staticmethod
     def _present(schedule:dict[str,Any])->dict[str,Any]:
@@ -160,6 +161,10 @@ class AutonomousSchedulerWorker:
                 self.schedules.finish_dispatch(dispatch["id"],state="retry_wait",outcome=result.get("outcome"),run_id=result.get("run_id"),
                     reason_code=reason,summary=result,safe_retry=True,next_retry_at=(current+timedelta(seconds=delay)).isoformat(),retry_count=retries)
                 counts["retrying"]+=1
+            elif result.get("status")=="skipped":
+                self.schedules.finish_dispatch(dispatch["id"],state="skipped",outcome=result.get("outcome"),run_id=result.get("run_id"),
+                    reason_code=reason,summary=result,safe_retry=False,retry_count=retries)
+                counts["skipped"]+=1
             else:
                 state="retry_exhausted" if safe else "completed"
                 self.schedules.finish_dispatch(dispatch["id"],state=state,outcome=result.get("outcome"),run_id=result.get("run_id"),

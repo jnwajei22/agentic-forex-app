@@ -69,9 +69,24 @@ class ExecutionProfileCreate(BaseModel):
 
 
 class ExecutionProfileUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=64)
     execution_mode: Literal["read_only", "demo_manual", "demo_autonomous", "disabled"] | None = None
     enabled: bool | None = None
+    strategy_template_id: str | None = None
+    risk: dict[str, Any] | None = None
+    allowed_instruments: list[str] | None = None
+    session_rules: dict[str, Any] | None = None
+    news_filter_enabled: bool | None = None
+
+
+class AutonomousControlsUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    global_autonomous_kill_switch: bool | None = None
+    demo_autonomous_enabled: bool | None = None
+    live_autonomous_enabled: bool | None = None
+    live_confirmation: str | None = Field(default=None,max_length=40)
+    reason: str | None = Field(default=None,max_length=240)
 
 
 class AutonomousArmRequest(BaseModel):
@@ -397,7 +412,10 @@ async def create_execution_profile(payload: ExecutionProfileCreate, claims: dict
 async def update_execution_profile(profile_id: str, payload: ExecutionProfileUpdate, claims: dict = Depends(current_claims)) -> dict:
     try:
         changed = repository().update_profile(claims["sub"], profile_id, name=payload.name,
-            execution_mode=payload.execution_mode, enabled=payload.enabled)
+            execution_mode=payload.execution_mode, enabled=payload.enabled,
+            strategy_template_id=payload.strategy_template_id,risk=payload.risk,
+            allowed_instruments=payload.allowed_instruments,session_rules=payload.session_rules,
+            news_filter_enabled=payload.news_filter_enabled)
     except BrokerStorageError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if not changed: raise HTTPException(status_code=404, detail="Profile not found.")
@@ -405,7 +423,13 @@ async def update_execution_profile(profile_id: str, payload: ExecutionProfileUpd
 
 
 @router.delete("/execution-profiles/{profile_id}")
-async def delete_execution_profile(profile_id: str, claims: dict = Depends(current_claims)) -> dict:
+async def delete_execution_profile(profile_id: str, confirmation_name: str, claims: dict = Depends(current_claims)) -> dict:
+    profile=next((item for item in repository().list_profiles(claims["sub"]) if item["public_id"]==profile_id),None)
+    if not profile:raise HTTPException(status_code=404, detail="Profile not found.")
+    if confirmation_name!=profile["name"]:
+        raise HTTPException(status_code=409,detail={"error":"profile_name_confirmation_required",
+            "message":"Type the exact profile name to delete this profile."})
+    ScheduleRepository().disable_profile_schedule(claims["sub"],profile_id)
     if not repository().delete_profile(claims["sub"],profile_id):
         raise HTTPException(status_code=404, detail="Profile not found.")
     return {"status":"deleted","profile_id":profile_id}
@@ -413,28 +437,38 @@ async def delete_execution_profile(profile_id: str, claims: dict = Depends(curre
 
 @router.post("/execution-profiles/{profile_id}/autonomy/arm")
 async def arm_autonomous_profile(profile_id:str,payload:AutonomousArmRequest,claims:dict=Depends(current_claims))->dict:
-    armed_until=payload.armed_until or (datetime.now(timezone.utc)+timedelta(hours=payload.arming_hours)).isoformat()
-    try:
-        # Re-verify the profile-bound account against TradeLocker before granting time-bounded authority.
-        await AutonomousDemoService().context(claims["sub"],profile_id,require_mode=False)
-        profile=repository().arm_autonomous_profile(claims["sub"],profile_id,armed_until=armed_until,
-            decision_provider=payload.decision_provider,model_identifier=payload.model_identifier,
-            minimum_confidence=payload.minimum_confidence,allowed_sessions=list(payload.allowed_sessions),
-            schedule_ref=payload.schedule_ref,shadow_mode=payload.shadow_mode)
-    except (BrokerStorageError,AutonomousExecutionError) as exc:
-        detail=exc.as_dict() if isinstance(exc,AutonomousExecutionError) else str(exc)
-        raise HTTPException(status_code=409,detail=detail) from None
-    logger.info("autonomous_profile_armed user_id=%s profile_ref=%s provider=%s shadow_mode=%s armed_until=%s",
-        claims["sub"],profile_id,payload.decision_provider,payload.shadow_mode,armed_until)
-    return {"status":"armed","profile":profile}
+    raise HTTPException(status_code=410,detail={"error":"arming_deprecated",
+        "message":"Timed arming is deprecated. Use the durable Demo Autonomous Trading control."})
 
 
 @router.post("/execution-profiles/{profile_id}/autonomy/disarm")
 async def disarm_autonomous_profile(profile_id:str,claims:dict=Depends(current_claims))->dict:
-    if not repository().disarm_autonomous_profile(claims["sub"],profile_id):
-        raise HTTPException(status_code=404,detail="Profile not found.")
-    logger.info("autonomous_profile_disarmed user_id=%s profile_ref=%s",claims["sub"],profile_id)
-    return {"status":"disarmed","profile_id":profile_id}
+    raise HTTPException(status_code=410,detail={"error":"arming_deprecated",
+        "message":"Timed disarming is deprecated. Disable the environment toggle or the profile."})
+
+
+@router.get("/autonomous-controls")
+async def get_autonomous_controls(claims:dict=Depends(current_claims))->dict:
+    return ExecutionRepository().get_autonomous_controls(claims["sub"])
+
+
+@router.patch("/autonomous-controls")
+async def patch_autonomous_controls(payload:AutonomousControlsUpdate,claims:dict=Depends(current_claims))->dict:
+    changes={key:value for key,value in payload.model_dump().items()
+        if key in {"global_autonomous_kill_switch","demo_autonomous_enabled","live_autonomous_enabled"}
+        and value is not None}
+    if not changes:raise HTTPException(status_code=422,detail="At least one autonomous control is required.")
+    if changes.get("live_autonomous_enabled") is True and payload.live_confirmation!="ENABLE LIVE AUTONOMY":
+        raise HTTPException(status_code=409,detail={"error":"live_confirmation_required",
+            "message":"Type ENABLE LIVE AUTONOMY to enable live autonomous trading."})
+    try:return ExecutionRepository().update_autonomous_controls(claims["sub"],changes,
+        updated_by=claims["sub"],source="dashboard",reason=payload.reason)
+    except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc)) from None
+
+
+@router.get("/autonomous-controls/audit")
+async def autonomous_control_audit(claims:dict=Depends(current_claims))->dict:
+    return {"events":ExecutionRepository().autonomous_control_audit(claims["sub"])}
 
 
 @router.get("/execution-profiles/{profile_id}/autonomy/status")
@@ -508,7 +542,7 @@ async def autonomous_worker_health_api(claims:dict=Depends(current_claims))->dic
 
 @router.post("/operations/kill-switch/enable")
 async def enable_kill_switch_api(claims:dict=Depends(current_claims))->dict:
-    ExecutionRepository().enable_kill_switch(claims["sub"])
+    ExecutionRepository().enable_kill_switch(claims["sub"],source="dashboard",reason="Legacy enable endpoint")
     logger.warning("kill_switch_enabled user_id=%s source=dashboard",claims["sub"])
     return {"status":"enabled","kill_switch":True}
 

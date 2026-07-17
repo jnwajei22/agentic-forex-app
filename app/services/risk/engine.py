@@ -9,9 +9,6 @@ class RiskDecision:
 def validate_order_request(order: OrderRequest) -> RiskDecision:
     violations: list[str] = []
 
-    if settings.kill_switch_enabled:
-        violations.append("Kill switch is enabled.")
-
     if order.stop_loss is None:
         violations.append("Stop loss is required.")
 

@@ -29,12 +29,12 @@ def test_short_stop_must_be_above_entry(monkeypatch):
     assert not decision.allowed
     assert any("Short stop loss" in v for v in decision.violations)
 
-def test_kill_switch_rejects_order_preview(monkeypatch):
+def test_autonomous_kill_switch_does_not_reject_manual_preview(monkeypatch):
     monkeypatch.setattr(settings, "kill_switch_enabled", True)
     order = OrderRequest(
         pair="EUR/USD", side=Direction.long, entry=1.1000,
         stop_loss=1.0950, take_profit=1.1100, risk_percent=0.5,
     )
     preview = create_order_preview(order)
-    assert preview.status == OrderPreviewStatus.rejected
-    assert "Kill switch is enabled." in preview.violations
+    assert preview.status == OrderPreviewStatus.preview_only
+    assert "Kill switch is enabled." not in preview.violations

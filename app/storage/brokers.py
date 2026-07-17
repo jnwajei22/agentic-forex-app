@@ -455,6 +455,7 @@ class BrokerRepository:
                 p.decision_provider,p.model_identifier,p.minimum_confidence,p.allowed_sessions_json,p.schedule_ref,
                 p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,
                 a.account_alias,a.public_id account_id,a.environment account_environment,a.is_demo,
+                a.available account_available,a.broker_active,a.locally_enabled,
                 t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version,t.config_json strategy_config_json
                 FROM execution_profiles p JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
                 JOIN strategy_templates t ON t.id=p.strategy_template_id WHERE u.auth0_sub=? ORDER BY p.name COLLATE NOCASE""",(auth0_sub,)).fetchall()
@@ -535,7 +536,11 @@ class BrokerRepository:
         return next(p for p in self.list_profiles(auth0_sub) if p["name"].lower()==name.lower())
 
     def update_profile(self, auth0_sub: str, profile_ref: str, *, name: str | None=None,
-                       execution_mode: str | None=None, enabled: bool | None=None) -> bool:
+                       execution_mode: str | None=None, enabled: bool | None=None,
+                       strategy_template_id: str | None=None, risk: dict[str,Any] | None=None,
+                       allowed_instruments: list[str] | None=None,
+                       session_rules: dict[str,Any] | None=None,
+                       news_filter_enabled: bool | None=None) -> bool:
         if execution_mode is not None and execution_mode not in {"read_only","demo_manual","demo_autonomous","disabled"}:
             raise BrokerStorageError("Invalid execution mode.")
         assignments, values = ["updated_at=?"], [_now()]
@@ -547,6 +552,33 @@ class BrokerRepository:
         if enabled is not None:
             assignments.append("enabled=?"); values.append(enabled)
             if not enabled:assignments.extend(["autonomous_armed=0","armed_until=NULL","armed_by_user=NULL"])
+        if risk is not None:
+            current=next((item for item in self.list_profiles(auth0_sub) if item["public_id"]==profile_ref),None)
+            if current is None: return False
+            policy={**current["risk"],**risk}
+            if not 0 < float(policy.get("risk_per_trade_percent",0)) <= 1.0:
+                raise BrokerStorageError("Risk per trade must be between 0 and 1 percent.")
+            if not 0 < float(policy.get("daily_loss_limit_percent",0)) <= 3.0:
+                raise BrokerStorageError("Daily loss limit must be between 0 and 3 percent.")
+            if not 0 < float(policy.get("drawdown_cutoff_percent",0)) <= 10.0:
+                raise BrokerStorageError("Drawdown cutoff must be between 0 and 10 percent.")
+            for key in ("maximum_open_positions","maximum_pending_orders","maximum_new_entries_per_day"):
+                if not 1 <= int(policy.get(key,0)) <= 100: raise BrokerStorageError(f"Invalid {key.replace('_',' ')}.")
+            if float(policy.get("minimum_reward_risk",0)) < 1.5:
+                raise BrokerStorageError("Minimum reward-to-risk cannot be below 1.5.")
+            assignments.append("risk_json=?");values.append(json.dumps(policy))
+        if allowed_instruments is not None:
+            instruments=[str(pair).replace("/","").upper() for pair in allowed_instruments]
+            if not instruments or any(pair not in {"EURUSD","GBPUSD","AUDUSD","NZDUSD","USDCAD"} for pair in instruments):
+                raise BrokerStorageError("The profile instrument allowlist is invalid.")
+            assignments.append("allowed_instruments_json=?");values.append(json.dumps(instruments))
+        if session_rules is not None:assignments.append("session_rules_json=?");values.append(json.dumps(session_rules))
+        if news_filter_enabled is not None:assignments.append("news_filter_enabled=?");values.append(news_filter_enabled)
+        if strategy_template_id is not None:
+            with self._connect() as lookup:
+                template=lookup.execute("SELECT id FROM strategy_templates WHERE public_id=?",(strategy_template_id,)).fetchone()
+            if not template:raise BrokerStorageError("Strategy template was not found.")
+            assignments.append("strategy_template_id=?");values.append(template["id"])
         values.extend([profile_ref,auth0_sub])
         with self._connect() as db:
             if execution_mode in {"demo_manual","demo_autonomous"}:

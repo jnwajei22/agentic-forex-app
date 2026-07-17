@@ -67,5 +67,5 @@ def test_forex_routes_never_invoke_live_trading(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "rejected"
+    assert response.json()["status"] == "preview_only"
     submit_order.assert_not_awaited()

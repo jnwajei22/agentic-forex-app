@@ -100,6 +100,13 @@ class ScheduleRepository:
     def delete_schedule(self,user_sub:str,schedule_id:str)->bool:
         with self._connect() as db:return db.execute("DELETE FROM autonomous_schedules WHERE id=? AND user_sub=?",(schedule_id,user_sub)).rowcount==1
 
+    def disable_profile_schedule(self,user_sub:str,profile_ref:str)->bool:
+        now=utcnow().isoformat()
+        with self._connect() as db:
+            return db.execute("""UPDATE autonomous_schedules SET enabled=0,next_run_at=NULL,
+                disabled_at=?,updated_at=? WHERE user_sub=? AND profile_ref=?""",
+                (now,now,user_sub,profile_ref)).rowcount > 0
+
     def set_enabled(self,user_sub:str,schedule_id:str,enabled:bool,next_run_at:str|None)->bool:
         now=utcnow().isoformat()
         with self._connect() as db:

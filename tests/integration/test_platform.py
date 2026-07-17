@@ -50,6 +50,47 @@ def _client_for(subject: str) -> TestClient:
     return TestClient(app)
 
 
+def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmation(platform_storage, monkeypatch):
+    monkeypatch.setattr(settings, "kill_switch_enabled", False)
+    with _client_for("auth0|controls-a") as client:
+        initial = client.get("/api/autonomous-controls")
+        assert initial.status_code == 200
+        assert initial.json()["live_autonomous_enabled"] is False
+        changed = client.patch("/api/autonomous-controls", json={"demo_autonomous_enabled": True, "reason": "dashboard"})
+        assert changed.status_code == 200 and changed.json()["demo_autonomous_enabled"] is True
+        rejected = client.patch("/api/autonomous-controls", json={"live_autonomous_enabled": True})
+        assert rejected.status_code == 409
+        accepted = client.patch("/api/autonomous-controls", json={
+            "live_autonomous_enabled": True, "live_confirmation": "ENABLE LIVE AUTONOMY"})
+        assert accepted.status_code == 200
+        assert accepted.json()["live_execution_supported"] is False
+        audit = client.get("/api/autonomous-controls/audit").json()["events"]
+        assert {item["control_name"] for item in audit} == {"demo_autonomous_enabled", "live_autonomous_enabled"}
+
+    with _client_for("auth0|controls-b") as client:
+        isolated = client.get("/api/autonomous-controls").json()
+        assert isolated["demo_autonomous_enabled"] is False
+        assert isolated["live_autonomous_enabled"] is False
+
+
+def test_profile_delete_api_requires_exact_name_confirmation(platform_storage):
+    connection = platform_storage.save_connection("auth0|delete-user",
+        base_url="https://demo.tradelocker.test/backend-api", username="u", password="p",
+        server="demo", environment="demo")
+    platform_storage.sync_accounts("auth0|delete-user", connection.connection_ref,
+        {"accounts": [{"accountId": "a", "accNum": "1"}]})
+    account = platform_storage.list_accounts("auth0|delete-user")[0]
+    profile = platform_storage.create_profile("auth0|delete-user", name="Exact Profile", account_ref=account["public_id"])
+
+    with _client_for("auth0|delete-user") as client:
+        rejected = client.delete(f"/api/execution-profiles/{profile['public_id']}?confirmation_name=wrong")
+        assert rejected.status_code == 409
+        accepted = client.delete(f"/api/execution-profiles/{profile['public_id']}?confirmation_name=Exact%20Profile")
+        assert accepted.status_code == 200
+
+    assert platform_storage.list_profiles("auth0|delete-user") == []
+
+
 class _DemoStatusDiscoveryClient:
     def __init__(self, **kwargs):
         self.account_id = kwargs["account_id"]

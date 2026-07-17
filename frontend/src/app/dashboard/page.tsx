@@ -10,6 +10,7 @@ import AccountsPanel, {
   type ProfileSummary,
   type ScheduleSummary,
   type WorkerHealth,
+  type AutonomousControls,
 } from "./accounts-panel";
 
 type DashboardProps = { searchParams: Promise<{ connected?: string }> };
@@ -31,11 +32,16 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
     date: "", outcomes: { TRADE: 0, NO_TRADE: 0, BLOCKED: 0, ERROR: 0 },
     daily_entry_count: 0, kill_switch: true, armed_profiles: 0,
   };
+  let autonomousControls: AutonomousControls = {
+    global_autonomous_kill_switch: true, demo_autonomous_enabled: false,
+    live_autonomous_enabled: false, live_execution_supported: false,
+    updated_at: "", effective: { demo: "blocked", live: "blocked" },
+  };
   let loadState: "loaded" | "unavailable" = "loaded";
 
   try {
     const [statusResult, connectionsResult, accountsResult, profilesResult, executionsResult,
-      schedulesResult, workerResult, dailyResult] = await Promise.all([
+      schedulesResult, workerResult, dailyResult, controlsResult] = await Promise.all([
       backendFetch<unknown>("/api/broker/status"),
       backendFetch<{ connections: ConnectionSummary[] }>("/api/broker/connections"),
       backendFetch<{ accounts: AccountSummary[] }>("/api/broker/accounts"),
@@ -44,6 +50,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
       backendFetch<{ schedules: ScheduleSummary[] }>("/api/autonomous-schedules"),
       backendFetch<WorkerHealth>("/api/autonomous-worker-health"),
       backendFetch<DailySummary>("/api/autonomous-daily-summary"),
+      backendFetch<AutonomousControls>("/api/autonomous-controls"),
     ]);
     tradeLocker = parseTradeLockerStatus(statusResult);
     connections = connectionsResult.connections;
@@ -53,6 +60,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
     schedules = schedulesResult.schedules;
     workerHealth = workerResult;
     dailySummary = dailyResult;
+    autonomousControls = controlsResult;
   } catch {
     loadState = "unavailable";
   }
@@ -114,6 +122,7 @@ export default async function DashboardPage({ searchParams }: DashboardProps) {
         schedules={schedules}
         workerHealth={workerHealth}
         dailySummary={dailySummary}
+        autonomousControls={autonomousControls}
       />
     </main>
   );

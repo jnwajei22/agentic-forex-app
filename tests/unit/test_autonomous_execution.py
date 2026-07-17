@@ -252,11 +252,10 @@ def configured_service(tmp_path, monkeypatch, *, base_url="https://demo.tradeloc
 
 
 @pytest.mark.asyncio
-async def test_verified_demo_context_defaults_to_read_only(tmp_path, monkeypatch):
+async def test_legacy_read_only_profile_is_implicitly_manual(tmp_path, monkeypatch):
     service, _ = configured_service(tmp_path, monkeypatch)
-    with pytest.raises(AutonomousExecutionError) as error:
-        await service.context("user", service.test_profile_ref)
-    assert error.value.code == "execution_mode_read_only"
+    context = await service.context("user", service.test_profile_ref)
+    assert context.execution_mode == ExecutionMode.DEMO_MANUAL
 
 
 @pytest.mark.asyncio
@@ -438,6 +437,19 @@ async def test_manual_snapshot_maps_required_broker_components_and_uses_position
     assert result["market"]["pairs"]["EURUSD"]["instrument_metadata"]["tick_size"] == 0.00001
     assert "get_open_positions" in calls
     assert "provider_unavailable" in result["warnings"]
+    assert all(client.place_order_calls == 0 for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_global_autonomous_kill_switch_does_not_block_manual_demo_snapshot(tmp_path, monkeypatch):
+    service, profile, _, clients = snapshot_service(tmp_path, monkeypatch)
+    service.execution.update_autonomous_controls("user", {
+        "global_autonomous_kill_switch": True,
+    }, updated_by="test", source="test")
+
+    result = await service.snapshot("user", profile, "EURUSD", autonomous=False)
+
+    assert result["status"] == "ok"
     assert all(client.place_order_calls == 0 for client in clients)
 
 
@@ -699,6 +711,9 @@ def submission_service(tmp_path, monkeypatch, client, *, origin="autonomous"):
     monkeypatch.setattr(settings, "autonomous_broker_verification_max_attempts", 3)
     repository = ExecutionRepository(tmp_path / "submission.db")
     repository.get_or_create_settings("user", "connection-a", "account-a", "1001")
+    repository.update_autonomous_controls("user", {
+        "global_autonomous_kill_switch": False, "demo_autonomous_enabled": True,
+    }, updated_by="test", source="test")
     now = datetime.now(timezone.utc)
     repository.insert_snapshot({
         "id": "snap-submit", "user_sub": "user", "connection_id": "connection-a",
@@ -752,7 +767,7 @@ def submission_service(tmp_path, monkeypatch, client, *, origin="autonomous"):
                  "fred": {"available": True, "stale": False}}, [], {})
     service.context = bound_context
     service._provider_state = providers
-    service._kill_switch = lambda: False
+    service._kill_switch = lambda *_: False
     return service, repository, preview["id"], seen_client_args
 
 
@@ -770,6 +785,21 @@ async def test_autonomous_submission_uses_repaired_account_bound_verification(tm
     assert result["quantity_units"] == pytest.approx(119000)
     assert client.place_order_calls == 1
     assert seen[0]["account_id"] == "account-a" and seen[0]["account_number"] == "1001"
+
+
+@pytest.mark.asyncio
+async def test_global_autonomous_kill_switch_blocks_autonomous_submission_before_broker_write(tmp_path, monkeypatch):
+    client = SubmissionClient(visible_after_order_read=2)
+    service, repository, preview_id, _ = submission_service(tmp_path, monkeypatch, client)
+    repository.update_autonomous_controls("user", {
+        "global_autonomous_kill_switch": True,
+    }, updated_by="test", source="test")
+
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.submit("user", preview_id, "autonomous:blocked-key")
+
+    assert error.value.code == "global_autonomous_kill_switch_enabled"
+    assert client.place_order_calls == 0
 
 
 @pytest.mark.asyncio

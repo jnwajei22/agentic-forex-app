@@ -102,7 +102,7 @@ def _safe_account_output(item: dict[str,Any]) -> dict[str,Any]:
         "availability":"Active" if item.get("available") and item.get("locally_enabled") else "Unavailable",
         "is_default":bool(item.get("is_default_analysis")),
         "profiles":[{"profile_ref":p["public_id"],"name":p["name"],
-            "execution_mode":_display_value(p["execution_mode"]),"enabled":p["enabled"]} for p in item.get("profiles",[])],
+            "operating_state":"Manual","enabled":p["enabled"],"execution_mode_deprecated":True} for p in item.get("profiles",[])],
     }
 
 
@@ -641,9 +641,10 @@ def set_kill_switch(enabled: bool, reason: str) -> dict[str, Any]:
     if not reason.strip():
         raise ValueError("A reason is required to change the kill switch.")
     if not enabled:
-        ExecutionRepository().enable_kill_switch(_authenticated_user())
+        ExecutionRepository().enable_kill_switch(_authenticated_user(),source="mcp",reason=reason)
         return {"changed": False, "kill_switch_enabled": True, "reason": reason, "message": "Remote MCP callers cannot disable the kill switch."}
-    repository=ExecutionRepository();changed=not repository.kill_switch_enabled();repository.enable_kill_switch(_authenticated_user())
+    repository=ExecutionRepository();user=_authenticated_user()
+    changed=not repository.get_autonomous_controls(user)["global_autonomous_kill_switch"];repository.enable_kill_switch(user,source="mcp",reason=reason)
     return {"changed": changed, "kill_switch_enabled": True, "reason": reason, "message": "Kill switch enabled."}
 
 
@@ -657,7 +658,7 @@ def _authenticated_user() -> str:
 
 
 async def get_autonomous_demo_status(profile_ref: str) -> dict[str, Any]:
-    """Read autonomous arming and blocker state for one owned verified-demo profile."""
+    """Read durable autonomous-control and blocker state for one owned profile."""
     try:
         return await AutonomousDecisionRunner().status(_authenticated_user(), profile_ref)
     except AutonomousExecutionError as exc:
@@ -665,7 +666,7 @@ async def get_autonomous_demo_status(profile_ref: str) -> dict[str, Any]:
 
 
 async def get_autonomous_demo_snapshot(profile_ref: str) -> dict[str, Any]:
-    """Build a bounded multi-timeframe decision snapshot for one armed demo profile; never submits."""
+    """Build a bounded multi-timeframe decision snapshot for one enabled demo profile; never submits."""
     try:
         return await AutonomousDecisionRunner().snapshot(_authenticated_user(), profile_ref)
     except AutonomousExecutionError as exc:
@@ -685,7 +686,7 @@ async def review_autonomous_demo_order(
             entry=entry, stop_loss=stop_loss, take_profit=take_profit,
             reason_codes=reason_codes or [],
         )
-        return await AutonomousDemoService().review(_authenticated_user(), profile_ref, proposal)
+        return await AutonomousDemoService().review(_authenticated_user(), profile_ref, proposal, autonomous=True)
     except ValidationError as exc:
         return {"schema_version": "1.0", "status": "rejected", "error": "invalid_proposal", "message": "The order proposal schema is invalid.", "violations": [item["type"] for item in exc.errors()]}
     except AutonomousExecutionError as exc:
@@ -696,7 +697,10 @@ async def submit_autonomous_demo_order(preview_id: str, idempotency_key: str) ->
     """Submit one risk-approved order to the authenticated user's verified TradeLocker demo account. This consequential broker-side write cannot target a live account."""
     try:
         request = AutonomousSubmissionRequest(preview_id=preview_id, idempotency_key=idempotency_key)
-        return await AutonomousDemoService().submit(_authenticated_user(), request.preview_id, request.idempotency_key)
+        service=AutonomousDemoService();preview=service.execution.get_preview(request.preview_id)
+        if not preview or preview.get("execution_origin")!="autonomous":
+            raise AutonomousExecutionError("autonomous_preview_required","An autonomous-origin preview is required.",status="rejected")
+        return await service.submit(_authenticated_user(), request.preview_id, request.idempotency_key)
     except ValidationError:
         return {"schema_version": "1.0", "status": "rejected", "error": "invalid_submission", "message": "Only a valid preview ID and idempotency key are accepted."}
     except AutonomousExecutionError as exc:
@@ -715,7 +719,7 @@ async def record_autonomous_no_trade(profile_ref: str, snapshot_id: str, reason_
 
 
 async def run_autonomous_demo_profile(profile_ref:str,run_key:str,trigger_reason:str)->dict[str,Any]:
-    """Run one idempotent bounded decision cycle. It can submit only when dashboard-armed, demo-verified, and not in shadow mode."""
+    """Run one idempotent bounded decision cycle under durable environment controls and profile-bound safeguards."""
     try:return await AutonomousDecisionRunner().run(_authenticated_user(),profile_ref,run_key,trigger_reason)
     except AutonomousExecutionError as exc:return exc.as_dict()
 

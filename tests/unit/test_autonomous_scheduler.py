@@ -75,6 +75,17 @@ async def test_worker_runs_once_and_persists_exact_key(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_worker_records_control_block_as_skipped_not_failed(tmp_path):
+    repo=ScheduleRepository(tmp_path/"skipped.db");now=datetime.now(timezone.utc);_due(repo,now)
+    fake=FakeRunner({"status":"skipped","outcome":"BLOCKED","reason_codes":["demo_autonomous_disabled"],
+        "run_id":"r","preview_id":None,"execution_id":None})
+    counts=await AutonomousSchedulerWorker(worker_id="skip",schedules=repo,runner_factory=lambda:fake).run_once(now)
+    dispatch=repo.list_dispatches("u")[0]
+    assert counts["skipped"]==1 and counts["retrying"]==0
+    assert dispatch["state"]=="skipped" and dispatch["reason_code"]=="demo_autonomous_disabled"
+
+
+@pytest.mark.asyncio
 async def test_safe_retry_is_bounded_but_blocked_and_unknown_do_not_retry(tmp_path,monkeypatch):
     monkeypatch.setattr(settings,"autonomous_scheduler_max_retries",1)
     now=datetime.now(timezone.utc)
@@ -98,11 +109,12 @@ def _account(storage,user,environment):
     return storage.list_accounts(user)[0]
 
 
-def test_live_profile_cannot_be_scheduled_and_users_are_isolated(tmp_path):
+def test_live_profile_can_be_scheduled_while_users_remain_isolated(tmp_path):
     db=tmp_path/"app.db";brokers=BrokerRepository(db,"secret");schedules=ScheduleRepository(db)
     live=_account(brokers,"live","live");profile=brokers.create_profile("live",name="live",account_ref=live["public_id"])
     service=AutonomousScheduleService(schedules=schedules,brokers=brokers)
-    with pytest.raises(ScheduleStorageError,match="verified demo"):service.save("live",profile["public_id"])
+    saved=service.save("live",profile["public_id"])
+    assert saved["profile_ref"]==profile["public_id"]
     schedules.upsert_schedule("alice","p1",timezone_name="America/Chicago",local_times=["05:00"],enabled=False,next_run_at=None)
     schedules.upsert_schedule("bob","p2",timezone_name="America/Chicago",local_times=["05:00"],enabled=False,next_run_at=None)
     assert [item["profile_ref"] for item in schedules.list_schedules("alice")]==["p1"]
@@ -115,20 +127,23 @@ def test_worker_health_reports_heartbeat_and_stopped_state(tmp_path):
     assert repo.worker_health()["status"]=="unavailable"
 
 
-def test_scheduled_time_rechecks_arming_expiry_profile_and_kill_switch(monkeypatch):
+def test_scheduled_time_rechecks_durable_environment_controls(monkeypatch):
     runner=object.__new__(AutonomousDecisionRunner)
-    runner.execution=type("Controls",(),{"kill_switch_enabled":lambda self:settings.kill_switch_enabled})()
+    controls={"global_autonomous_kill_switch":False,"demo_autonomous_enabled":True,"live_autonomous_enabled":False}
+    runner.execution=type("Controls",(),{"kill_switch_enabled":lambda self:False,
+        "get_autonomous_controls":lambda self,user:controls})()
     now=datetime(2026,1,14,14,tzinfo=timezone.utc)
     profile={"enabled":True,"execution_mode":"demo_autonomous","autonomous_armed":True,
         "armed_until":(now+timedelta(hours=1)).isoformat(),"account_environment":"demo","is_demo":1,
         "allowed_sessions":["new_york"],"decision_provider":"no_trade"}
     monkeypatch.setattr(settings,"kill_switch_enabled",False)
-    assert runner._blocking_reasons(profile,now)==[]
-    assert "arming_expired" in runner._blocking_reasons({**profile,"armed_until":(now-timedelta(seconds=1)).isoformat()},now)
-    assert "profile_not_armed" in runner._blocking_reasons({**profile,"autonomous_armed":False},now)
+    assert runner._blocking_reasons(profile,now,"user")==[]
+    assert runner._blocking_reasons({**profile,"armed_until":(now-timedelta(seconds=1)).isoformat()},now,"user")==[]
+    assert runner._blocking_reasons({**profile,"autonomous_armed":False},now,"user")==[]
     assert "profile_disabled" in runner._blocking_reasons({**profile,"enabled":False},now)
     monkeypatch.setattr(settings,"kill_switch_enabled",True)
-    assert "kill_switch_enabled" in runner._blocking_reasons(profile,now)
+    controls["global_autonomous_kill_switch"]=True
+    assert "global_autonomous_kill_switch_enabled" in runner._blocking_reasons(profile,now,"user")
 
 
 def test_disabled_schedule_is_never_claimed(tmp_path):

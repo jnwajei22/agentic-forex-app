@@ -290,7 +290,8 @@ class AutonomousDemoService:
         self.account_status_service = account_status_service or TradeLockerAccountStatusService(repository=self.brokers, client_factory=client_factory)
         self.finnhub_factory, self.fred_factory = finnhub_factory, fred_factory
 
-    def _kill_switch(self)->bool:return self.execution.kill_switch_enabled()
+    def _kill_switch(self,user_sub:str)->bool:
+        return self.execution.get_autonomous_controls(user_sub)["global_autonomous_kill_switch"]
 
     @staticmethod
     def _provider_requirements(context: VerifiedDemoContext, autonomous: bool) -> tuple[bool, bool]:
@@ -321,11 +322,7 @@ class AutonomousDemoService:
         profile = next((item for item in self.brokers.list_profiles(user_sub) if item["public_id"] == resolved.profile_ref), None)
         if profile is None:
             raise AutonomousExecutionError("profile_not_found", "The execution profile is unavailable.")
-        profile_mode = profile["execution_mode"]
-        if profile_mode == "demo_autonomous" and not allow_autonomous:
-            raise AutonomousExecutionError("autonomous_profile_requires_runner", "Demo Autonomous profiles can execute only through the bounded autonomous runner.")
-        mode = (ExecutionMode.DEMO_AUTONOMOUS if profile_mode == "demo_autonomous" else
-                ExecutionMode.DEMO_MANUAL if profile_mode == "demo_manual" else ExecutionMode.READ_ONLY)
+        mode = ExecutionMode.DEMO_AUTONOMOUS if allow_autonomous else ExecutionMode.DEMO_MANUAL
         risk = self.execution.get_or_create_settings(user_sub, resolved.connection_id, resolved.account_id, resolved.account_number)
         risk.update(profile.get("risk") or {})
         if not 0 < float(risk["risk_per_trade_percent"]) <= 1.0:
@@ -360,8 +357,6 @@ class AutonomousDemoService:
         account = next((row for row in discovered.get("accounts", []) if isinstance(row, dict) and str(row.get("accountId")) == connection.account_id and str(row.get("accNum")) == connection.account_number), None) if isinstance(discovered, dict) else None
         if account is None:
             raise AutonomousExecutionError("demo_environment_verification_failed", "The profile-bound demo account could not be verified during account discovery.")
-        if require_mode and mode == ExecutionMode.READ_ONLY:
-            raise AutonomousExecutionError("execution_mode_read_only", "The execution profile is read-only.")
         return VerifiedDemoContext(
             user_sub=user_sub, connection_id=connection.connection_id,
             account_id=connection.account_id, acc_num=connection.account_number,
@@ -382,13 +377,13 @@ class AutonomousDemoService:
         context = None
         try:
             context = await self.context(user_sub, profile_ref, require_mode=False, allow_autonomous=True)
-            if context.execution_mode == ExecutionMode.READ_ONLY:
-                reasons.append("execution_mode_read_only")
         except AutonomousExecutionError as exc:
             reasons.extend(exc.reasons)
-        if self._kill_switch():
-            reasons.append("kill_switch_enabled")
-        finnhub_required, fred_required = self._provider_requirements(context, context.execution_mode == ExecutionMode.DEMO_AUTONOMOUS) if context else (False, False)
+        controls=self.execution.get_autonomous_controls(user_sub)
+        autonomous_reasons=list(reasons)
+        if controls["global_autonomous_kill_switch"]:autonomous_reasons.append("global_autonomous_kill_switch_enabled")
+        if not controls["demo_autonomous_enabled"]:autonomous_reasons.append("demo_autonomous_disabled")
+        finnhub_required, fred_required = self._provider_requirements(context, False) if context else (False, False)
         if finnhub_required and (not settings.finnhub_enabled or not settings.finnhub_api_key):
             reasons.append("provider_unavailable")
         if fred_required and (not settings.fred_enabled or not settings.fred_api_key):
@@ -400,17 +395,22 @@ class AutonomousDemoService:
                 if account.balance <= 0 or account.projected_balance <= 0 or account.available_funds <= 0:
                     reasons.append("account_funds_unavailable")
                 if account.positions_count >= context.risk["maximum_open_positions"]:
-                    reasons.append("maximum_open_positions")
+                    reasons.append("maximum_open_positions_reached")
                 if account.pending_orders_count >= context.risk["maximum_pending_orders"]:
-                    reasons.append("maximum_pending_orders")
+                    reasons.append("maximum_pending_orders_reached")
             except (AccountStatusUnavailable,TradeLockerError,TradeLockerMappingError):
                 reasons.append("account_status_unavailable")
+        autonomous_reasons=list(dict.fromkeys([*autonomous_reasons,*reasons]))
         return {
             "schema_version": "1.0", "status": "ready" if not reasons else "blocked",
             "account_environment": context.environment if context else None,
-            "execution_mode": context.execution_mode.value if context else ExecutionMode.READ_ONLY.value,
-            "kill_switch": self._kill_switch(), "strategy_enabled": True,
+            "execution_mode": "manual", "execution_mode_deprecated":True,
+            "kill_switch": controls["global_autonomous_kill_switch"], "global_kill_switch":controls["global_autonomous_kill_switch"],
+            "demo_autonomous_enabled":controls["demo_autonomous_enabled"],"profile_enabled":context is not None,
+            "account_available":account is not None,"autonomous_active":not autonomous_reasons,
+            "legacy_arming_deprecated":True,"armed":None,"armed_until":None,"shadow_mode":None,"strategy_enabled": True,
             "can_submit_demo_orders": not reasons, "blocking_reasons": list(dict.fromkeys(reasons)),
+            "autonomous_blocking_reasons":list(dict.fromkeys(autonomous_reasons)),
             "profile_ref":context.profile_ref if context else profile_ref,
             "account_alias":context.account_alias if context else None,
             "broker":context.connection_label if context else None,
@@ -467,8 +467,12 @@ class AutonomousDemoService:
 
     async def snapshot(self, user_sub: str, profile_ref: str, symbol: str | None = None, *, autonomous: bool=False) -> dict[str, Any]:
         context = await self.context(user_sub, profile_ref, allow_autonomous=autonomous)
-        if self._kill_switch():
-            raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks new snapshots.")
+        if autonomous:
+            controls=self.execution.get_autonomous_controls(user_sub)
+            if controls["global_autonomous_kill_switch"]:
+                raise AutonomousExecutionError("global_autonomous_kill_switch_enabled", "The global autonomous kill switch blocks new autonomous snapshots.")
+            if not controls["demo_autonomous_enabled"]:
+                raise AutonomousExecutionError("demo_autonomous_disabled", "Demo autonomous trading is disabled.")
         try:
             account = await self.account_status_service.retrieve(user_sub, context.account_alias)
         except (AccountStatusUnavailable, TradeLockerError, TradeLockerMappingError):
@@ -579,7 +583,7 @@ class AutonomousDemoService:
             "account": account_json, "positions": positions, "pending_orders": orders,
             "recent_order_history": order_history[-100:],
             "profile_ref":context.profile_ref,"account_ref":context.account_record_id,"connection_ref":context.connection_ref,
-            "account_alias":context.account_alias,"confirmed_demo":context.demo_classification=="demo","kill_switch":self._kill_switch(),
+            "account_alias":context.account_alias,"confirmed_demo":context.demo_classification=="demo","kill_switch":self._kill_switch(user_sub),
             "risk_state": risk_state, "strategy": {"name": context.risk["strategy_name"], "version": context.risk["strategy_version"]},
             "providers": providers, "news_blackouts": blackouts,
             "provider_context": provider_context, "warnings": list(dict.fromkeys(warnings)),
@@ -598,7 +602,7 @@ class AutonomousDemoService:
         logger.info(
             "autonomous_demo snapshot_created user_id=%s connection_ref=%s account_ref=%s account_alias=%s environment=demo mode=%s snapshot_id=%s kill_switch=%s finnhub_available=%s fred_available=%s",
             user_sub, context.connection_ref, context.account_record_id, context.account_alias,
-            context.execution_mode.value, snapshot_id, self._kill_switch(),
+            context.execution_mode.value, snapshot_id, self._kill_switch(user_sub),
             providers["finnhub"]["available"], providers["fred"]["available"],
         )
         return result
@@ -638,8 +642,12 @@ class AutonomousDemoService:
 
     async def review(self, user_sub: str, profile_ref: str, proposal: AutonomousOrderProposal, *, autonomous: bool=False) -> dict[str, Any]:
         context = await self.context(user_sub, profile_ref, allow_autonomous=autonomous)
-        if self._kill_switch():
-            raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks new previews.")
+        if autonomous:
+            controls=self.execution.get_autonomous_controls(user_sub)
+            if controls["global_autonomous_kill_switch"]:
+                raise AutonomousExecutionError("global_autonomous_kill_switch_enabled", "The global autonomous kill switch blocks new autonomous previews.")
+            if not controls["demo_autonomous_enabled"]:
+                raise AutonomousExecutionError("demo_autonomous_disabled", "Demo autonomous trading is disabled.")
         snapshot = self.execution.get_snapshot(proposal.snapshot_id)
         if not snapshot or snapshot["user_sub"] != user_sub:
             raise AutonomousExecutionError("snapshot_not_found", "The snapshot is unavailable.", status="rejected")
@@ -736,7 +744,7 @@ class AutonomousDemoService:
             "autonomous_demo preview_validated user_id=%s connection_ref=%s account_ref=%s account_alias=%s environment=demo mode=%s snapshot_id=%s preview_id=%s instrument=%s side=%s quantity=%s estimated_risk=%.6f result=approved kill_switch=%s",
             user_sub, context.connection_ref, context.account_record_id, context.account_alias,
             context.execution_mode.value, proposal.snapshot_id, preview_id, pair,
-            proposal.side, size["lot_size"], size["estimated_risk"], self._kill_switch(),
+            proposal.side, size["lot_size"], size["estimated_risk"], self._kill_switch(user_sub),
         )
         return {"schema_version": "1.0", "status": "approved", "preview_id": preview_id, "snapshot_id": proposal.snapshot_id, "pair": pair, "side": proposal.side, "order_type": proposal.order_type, "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit, **size, "estimated_reward": estimated_reward, "reward_risk": calculation["reward_risk"], "calculation": calculation, "warnings": list(dict.fromkeys(warnings)), "expires_at": record["expires_at"], "violations": []}
 
@@ -788,16 +796,20 @@ class AutonomousDemoService:
             "autonomous_demo submission_started user_id=%s connection_ref=%s account_ref=%s account_alias=%s environment=demo mode=%s preview_id=%s idempotency_key_hash=%s instrument=%s side=%s quantity=%s kill_switch=%s",
             user_sub, context.connection_ref, context.account_record_id, context.account_alias,
             context.execution_mode.value, preview_id, key_hash, preview["pair"],
-            preview["side"], preview["lot_size"], self._kill_switch(),
+            preview["side"], preview["lot_size"], self._kill_switch(user_sub),
         )
         # Forced fresh status and broker state are retrieved after the durable claim.
         dispatched = False
+        autonomous_origin = preview.get("execution_origin") == "autonomous"
         try:
             account = await self.account_status_service.retrieve(user_sub, context.account_alias)
-            if self._kill_switch():
-                raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks order submission.", status="rejected")
+            if autonomous_origin:
+                controls=self.execution.get_autonomous_controls(user_sub)
+                if controls["global_autonomous_kill_switch"]:
+                    raise AutonomousExecutionError("global_autonomous_kill_switch_enabled", "The global autonomous kill switch blocks order submission.", status="rejected")
+                if not controls["demo_autonomous_enabled"]:
+                    raise AutonomousExecutionError("demo_autonomous_disabled", "Demo autonomous trading is disabled.", status="rejected")
             providers, blackouts, _ = await self._provider_state()
-            autonomous_origin = preview.get("execution_origin") == "autonomous"
             finnhub_required, fred_required = self._provider_requirements(context, autonomous_origin)
             if finnhub_required and (
                 not providers["finnhub"]["available"] or providers["finnhub"]["stale"] or blackouts
@@ -807,8 +819,10 @@ class AutonomousDemoService:
                 not providers["fred"]["available"] or providers["fred"]["stale"]
             ):
                 raise AutonomousExecutionError("required_macro_provider_unavailable","Required macro validation failed closed.",status="rejected")
-            if account.positions_count >= context.risk["maximum_open_positions"] or account.pending_orders_count >= context.risk["maximum_pending_orders"]:
-                raise AutonomousExecutionError("position_or_order_limit", "The account position or pending-order limit was reached.", status="rejected")
+            if account.positions_count >= context.risk["maximum_open_positions"]:
+                raise AutonomousExecutionError("maximum_open_positions_reached", "The maximum open-position limit was reached.", status="rejected")
+            if account.pending_orders_count >= context.risk["maximum_pending_orders"]:
+                raise AutonomousExecutionError("maximum_pending_orders_reached", "The maximum pending-order limit was reached.", status="rejected")
             day_start=utcnow().replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
             if self.execution.new_entries_since(user_sub,context.account_id,day_start)>=context.risk["maximum_new_entries_per_day"]:
                 raise AutonomousExecutionError("daily_entry_limit","The profile's maximum new entries per day was reached.",status="rejected")
@@ -843,8 +857,12 @@ class AutonomousDemoService:
                 mapped_orders = map_configured_rows(config_response=config, data_response=before_orders, config_key="ordersConfig", data_key="orders")
                 if any(str(_find_value(row, ("tradableInstrumentId", "instrumentId"))) == preview["instrument_id"] for row in mapped_positions + mapped_orders):
                     raise AutonomousExecutionError("equivalent_order_exists", "An equivalent position or order already exists.", status="rejected")
-                if self._kill_switch():
-                    raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks order submission.", status="rejected")
+                if autonomous_origin:
+                    controls=self.execution.get_autonomous_controls(user_sub)
+                    if controls["global_autonomous_kill_switch"]:
+                        raise AutonomousExecutionError("global_autonomous_kill_switch_enabled", "The global autonomous kill switch blocks order submission.", status="rejected")
+                    if not controls["demo_autonomous_enabled"]:
+                        raise AutonomousExecutionError("demo_autonomous_disabled", "Demo autonomous trading is disabled.", status="rejected")
                 correlation_id = f"afd-{preview_id[-20:]}"
                 order_payload = {
                     "qty": preview["lot_size"], "routeId": preview["route_id"],
@@ -923,7 +941,7 @@ class AutonomousDemoService:
             logger.warning(
                 "autonomous_demo submission_blocked user_id=%s connection_ref=%s account_ref=%s account_alias=%s preview_id=%s idempotency_key_hash=%s failure_category=%s kill_switch=%s",
                 user_sub, context.connection_ref, context.account_record_id, context.account_alias,
-                preview_id, key_hash, exc.code, self._kill_switch(),
+                preview_id, key_hash, exc.code, self._kill_switch(user_sub),
             )
             raise
         except (AccountStatusUnavailable, TradeLockerError, TradeLockerMappingError) as exc:

@@ -56,6 +56,22 @@ class ExecutionRepository:
                 CREATE TABLE IF NOT EXISTS operational_controls(
                     key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL,updated_by TEXT
                 );
+                CREATE TABLE IF NOT EXISTS autonomous_controls(
+                    user_sub TEXT PRIMARY KEY,
+                    global_autonomous_kill_switch INTEGER NOT NULL DEFAULT 1,
+                    demo_autonomous_enabled INTEGER NOT NULL DEFAULT 0,
+                    live_autonomous_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,updated_by TEXT NOT NULL,
+                    last_change_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS autonomous_control_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,user_sub TEXT NOT NULL,
+                    control_name TEXT NOT NULL,old_value INTEGER NOT NULL,new_value INTEGER NOT NULL,
+                    changed_at TEXT NOT NULL,changed_by TEXT NOT NULL,source TEXT NOT NULL,
+                    reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS autonomous_control_audit_owner
+                    ON autonomous_control_audit(user_sub,changed_at DESC);
                 CREATE TABLE IF NOT EXISTS autonomous_snapshots (
                     id TEXT PRIMARY KEY, user_sub TEXT NOT NULL, connection_id TEXT NOT NULL,
                     account_id TEXT NOT NULL, acc_num TEXT NOT NULL, environment TEXT NOT NULL,
@@ -157,15 +173,93 @@ class ExecutionRepository:
             if "execution_json" not in decision_columns:
                 db.execute("ALTER TABLE autonomous_decision_runs ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{}'")
 
-    def kill_switch_enabled(self)->bool:
+    @staticmethod
+    def _safe_audit_text(value: str | None, limit: int) -> str | None:
+        if value is None:
+            return None
+        return " ".join(str(value).split())[:limit] or None
+
+    def _ensure_autonomous_controls(self, db: sqlite3.Connection, user_sub: str) -> None:
+        if db.execute("SELECT 1 FROM autonomous_controls WHERE user_sub=?", (user_sub,)).fetchone():
+            return
+        legacy = db.execute("SELECT value FROM operational_controls WHERE key='kill_switch'").fetchone()
+        kill_switch = settings.kill_switch_enabled if legacy is None else legacy["value"] == "enabled"
+        demo_enabled = False
+        tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if {"users", "execution_profiles"}.issubset(tables):
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(execution_profiles)")}
+            if "autonomous_armed" in columns:
+                demo_enabled = db.execute(
+                    """SELECT 1 FROM execution_profiles p JOIN users u ON u.id=p.user_id
+                       WHERE u.auth0_sub=? AND p.enabled=1 AND p.autonomous_armed=1
+                       AND p.execution_mode='demo_autonomous' LIMIT 1""", (user_sub,),
+                ).fetchone() is not None
+        now = utcnow().isoformat()
+        db.execute(
+            """INSERT INTO autonomous_controls(user_sub,global_autonomous_kill_switch,
+               demo_autonomous_enabled,live_autonomous_enabled,updated_at,updated_by,last_change_reason)
+               VALUES(?,?,?,?,?,?,?)""",
+            (user_sub, kill_switch, demo_enabled, False, now, "migration", "Legacy-safe control migration"),
+        )
+
+    def get_autonomous_controls(self, user_sub: str) -> dict[str, Any]:
+        with self._connect() as db:
+            self._ensure_autonomous_controls(db, user_sub)
+            row = db.execute("SELECT * FROM autonomous_controls WHERE user_sub=?", (user_sub,)).fetchone()
+        result = dict(row) if row else {}
+        for key in ("global_autonomous_kill_switch", "demo_autonomous_enabled", "live_autonomous_enabled"):
+            result[key] = bool(result.get(key))
+        result["live_execution_supported"] = False
+        result["effective"] = {
+            "demo": "blocked" if result["global_autonomous_kill_switch"] else "active" if result["demo_autonomous_enabled"] else "manual",
+            "live": "blocked" if result["global_autonomous_kill_switch"] else "unsupported" if result["live_autonomous_enabled"] else "manual",
+        }
+        return result
+
+    def update_autonomous_controls(
+        self, user_sub: str, changes: dict[str, bool], *, updated_by: str,
+        source: str = "dashboard", reason: str | None = None,
+    ) -> dict[str, Any]:
+        allowed = {"global_autonomous_kill_switch", "demo_autonomous_enabled", "live_autonomous_enabled"}
+        if not changes or set(changes) - allowed or any(not isinstance(value, bool) for value in changes.values()):
+            raise ValueError("Autonomous control update is invalid.")
+        now = utcnow().isoformat(); safe_reason = self._safe_audit_text(reason, 240)
+        safe_source = self._safe_audit_text(source, 40) or "unknown"
+        safe_actor = self._safe_audit_text(updated_by, 160) or user_sub
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._ensure_autonomous_controls(db, user_sub)
+            current = db.execute("SELECT * FROM autonomous_controls WHERE user_sub=?", (user_sub,)).fetchone()
+            for key, value in changes.items():
+                old = bool(current[key])
+                if old == value:
+                    continue
+                db.execute(f"UPDATE autonomous_controls SET {key}=?,updated_at=?,updated_by=?,last_change_reason=? WHERE user_sub=?",
+                    (value, now, safe_actor, safe_reason, user_sub))
+                db.execute("""INSERT INTO autonomous_control_audit(user_sub,control_name,old_value,new_value,
+                    changed_at,changed_by,source,reason) VALUES(?,?,?,?,?,?,?,?)""",
+                    (user_sub, key, old, value, now, safe_actor, safe_source, safe_reason))
+        return self.get_autonomous_controls(user_sub)
+
+    def autonomous_control_audit(self, user_sub: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute("SELECT * FROM autonomous_control_audit WHERE user_sub=? ORDER BY id DESC LIMIT ?",
+                              (user_sub, max(1, min(limit, 200)))).fetchall()
+        return [{**dict(row), "old_value": bool(row["old_value"]), "new_value": bool(row["new_value"])} for row in rows]
+
+    def kill_switch_enabled(self, user_sub: str | None = None)->bool:
+        if user_sub is not None:
+            return self.get_autonomous_controls(user_sub)["global_autonomous_kill_switch"]
         with self._connect() as db:row=db.execute("SELECT value FROM operational_controls WHERE key='kill_switch'").fetchone()
         return settings.kill_switch_enabled if row is None else row["value"]=="enabled"
 
-    def enable_kill_switch(self,updated_by:str)->None:
+    def enable_kill_switch(self,updated_by:str,*,source:str="compatibility",reason:str|None=None)->None:
         now=utcnow().isoformat()
         with self._connect() as db:db.execute("""INSERT INTO operational_controls(key,value,updated_at,updated_by)
             VALUES('kill_switch','enabled',?,?) ON CONFLICT(key) DO UPDATE SET value='enabled',updated_at=excluded.updated_at,
             updated_by=excluded.updated_by""",(now,updated_by))
+        self.update_autonomous_controls(updated_by, {"global_autonomous_kill_switch": True},
+            updated_by=updated_by, source=source, reason=reason)
 
     def get_or_create_settings(self, user_sub: str, connection_id: str, account_id: str, acc_num: str) -> dict[str, Any]:
         now = utcnow().isoformat()

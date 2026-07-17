@@ -14,7 +14,7 @@ from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository, utcnow
 
 
-FINAL_STATES={"trade","no_trade","blocked","error","shadow_trade"}
+FINAL_STATES={"trade","no_trade","blocked","error","skipped"}
 SAFE_PRE_SUBMIT_RETRY_REASONS={"provider_unavailable","market_snapshot_unavailable","broker_unreachable",
     "account_mapping_unavailable","account_status_unavailable","runner_internal_error"}
 logger=logging.getLogger(__name__)
@@ -40,18 +40,24 @@ class AutonomousDecisionRunner:
         if 12<=hour<16:active.add("overlap")
         return active
 
-    def _blocking_reasons(self,profile:dict[str,Any],now:datetime)->list[str]:
+    def _blocking_reasons(self,profile:dict[str,Any],now:datetime,user_sub:str|None=None)->list[str]:
         reasons=[]
         if not profile.get("enabled"):reasons.append("profile_disabled")
-        if profile.get("execution_mode")!="demo_autonomous":reasons.append("execution_mode_not_autonomous")
-        if not profile.get("autonomous_armed"):reasons.append("profile_not_armed")
-        try:
-            armed_until=datetime.fromisoformat(str(profile.get("armed_until") or ""))
-            if armed_until.tzinfo is None:armed_until=armed_until.replace(tzinfo=timezone.utc)
-            if armed_until<=now:reasons.append("arming_expired")
-        except ValueError:reasons.append("arming_expired")
-        if profile.get("account_environment")!="demo" or profile.get("is_demo")!=1:reasons.append("account_not_demo")
-        if self.execution.kill_switch_enabled():reasons.append("kill_switch_enabled")
+        if not profile.get("account_available",True) or not profile.get("broker_active",True) or not profile.get("locally_enabled",True):
+            reasons.append("account_unavailable")
+        controls=self.execution.get_autonomous_controls(user_sub) if user_sub else {
+            "global_autonomous_kill_switch":self.execution.kill_switch_enabled(),
+            "demo_autonomous_enabled":False,"live_autonomous_enabled":False}
+        if controls["global_autonomous_kill_switch"]:reasons.append("global_autonomous_kill_switch_enabled")
+        environment=profile.get("account_environment")
+        if environment=="demo":
+            if profile.get("is_demo")!=1:reasons.append("account_environment_unverified")
+            if not controls["demo_autonomous_enabled"]:reasons.append("demo_autonomous_disabled")
+        elif environment=="live":
+            if profile.get("is_demo")!=0:reasons.append("account_environment_unverified")
+            if not controls["live_autonomous_enabled"]:reasons.append("live_autonomous_disabled")
+            else:reasons.append("live_autonomous_execution_not_implemented")
+        else:reasons.append("account_environment_unverified")
         if now.weekday()>=5:reasons.append("weekend_blocked")
         allowed=set(profile.get("allowed_sessions") or [])
         if allowed and not allowed.intersection(self._session(now)):reasons.append("outside_allowed_session")
@@ -85,18 +91,25 @@ class AutonomousDecisionRunner:
         return False
 
     async def status(self,user_sub:str,profile_ref:str)->dict[str,Any]:
-        profile=self._profile(user_sub,profile_ref);now=utcnow();reasons=self._blocking_reasons(profile,now)
+        profile=self._profile(user_sub,profile_ref);now=utcnow();reasons=self._blocking_reasons(profile,now,user_sub)
         latest=self.execution.get_decision_run(user_sub,profile_ref=profile_ref)
+        controls=self.execution.get_autonomous_controls(user_sub)
+        environment=profile.get("account_environment")
         return {"schema_version":"1.0","status":"ready" if not reasons else "blocked","profile_ref":profile_ref,
             "account_alias":profile.get("account_alias"),"confirmed_demo":profile.get("is_demo")==1,
-            "execution_mode":profile.get("execution_mode"),"armed":profile.get("autonomous_armed",False),
-            "armed_until":profile.get("armed_until"),"shadow_mode":profile.get("autonomous_shadow_mode",True),
+            "environment":environment,"global_kill_switch":controls["global_autonomous_kill_switch"],
+            "demo_autonomous_enabled":controls["demo_autonomous_enabled"],
+            "live_autonomous_enabled":controls["live_autonomous_enabled"],
+            "profile_enabled":profile.get("enabled",False),"account_available":profile.get("account_available",False),
+            "autonomous_active":not reasons,
+            "execution_mode":profile.get("execution_mode"),"execution_mode_deprecated":True,
+            "armed":None,"armed_until":None,"shadow_mode":None,"legacy_controls_deprecated":True,
             "decision_provider":profile.get("decision_provider"),"model_identifier":profile.get("model_identifier"),
-            "minimum_confidence":profile.get("minimum_confidence"),"kill_switch":self.execution.kill_switch_enabled(),
+            "minimum_confidence":profile.get("minimum_confidence"),"kill_switch":controls["global_autonomous_kill_switch"],
             "blocking_reasons":reasons,"latest_run":self._public_run(latest) if latest else None}
 
     async def snapshot(self,user_sub:str,profile_ref:str)->dict[str,Any]:
-        profile=self._profile(user_sub,profile_ref);reasons=self._blocking_reasons(profile,utcnow())
+        profile=self._profile(user_sub,profile_ref);reasons=self._blocking_reasons(profile,utcnow(),user_sub)
         if reasons:raise AutonomousExecutionError("autonomous_profile_blocked","The autonomous profile is blocked.",reasons=reasons)
         raw=await self.demo.snapshot(user_sub,profile_ref,autonomous=True)
         context,digest=build_decision_context(raw,profile)
@@ -110,7 +123,7 @@ class AutonomousDecisionRunner:
         claimed,record=self.execution.claim_decision_run({"id":run_id,"run_key":run_key,"user_sub":user_sub,"profile_ref":profile_ref,
             "strategy_ref":profile.get("strategy_template_id") or "unknown","strategy_version":profile.get("strategy_version") or "unknown",
             "decision_provider":profile.get("decision_provider") or "no_trade","model_identifier":profile.get("model_identifier"),
-            "trigger_reason":trigger_reason,"state":"claimed","shadow_mode":bool(profile.get("autonomous_shadow_mode",True)),
+            "trigger_reason":trigger_reason,"state":"claimed","shadow_mode":False,
             "started_at":now.isoformat(),"created_at":now.isoformat(),"updated_at":now.isoformat()})
         if not claimed:
             state=record.get("state")
@@ -124,8 +137,8 @@ class AutonomousDecisionRunner:
             self.execution.update_decision_run(run_id,state="claimed",completed_at=None,reason_codes_json=[],
                 validation_json={},decision_json={})
         try:
-            reasons=self._blocking_reasons(profile,now)
-            if reasons:return self._finish(run_id,"blocked",reasons)
+            reasons=self._blocking_reasons(profile,now,user_sub)
+            if reasons:return self._finish(run_id,"skipped",reasons)
             self.execution.update_decision_run(run_id,state="snapshotting")
             snapshot=await self.demo.snapshot(user_sub,profile_ref,autonomous=True)
             if self._loss_cooldown_active(snapshot,int(profile.get("cooldown_minutes_after_loss") or 60),utcnow()):
@@ -154,9 +167,12 @@ class AutonomousDecisionRunner:
                 order_type=decision.order_type,entry=decision.entry,stop_loss=decision.stop_loss,take_profit=decision.take_profit,
                 reason_codes=decision.reason_codes)
             self.execution.update_decision_run(run_id,state="previewing",validation_json={"approved":True,"reasons":[]})
+            reasons=self._blocking_reasons(self._profile(user_sub,profile_ref),utcnow(),user_sub)
+            if reasons:return self._finish(run_id,"skipped",reasons)
             preview=await self.demo.review(user_sub,profile_ref,proposal,autonomous=True)
             self.execution.update_decision_run(run_id,preview_id=preview["preview_id"])
-            if profile.get("autonomous_shadow_mode",True):return self._finish(run_id,"shadow_trade",["shadow_mode"])
+            reasons=self._blocking_reasons(self._profile(user_sub,profile_ref),utcnow(),user_sub)
+            if reasons:return self._finish(run_id,"skipped",reasons)
             self.execution.update_decision_run(run_id,state="submitting")
             execution=await self.demo.submit(user_sub,preview["preview_id"],f"autonomous:{run_id}")
             return self._finish(run_id,"trade",[str(execution.get("status","submitted"))],execution_id=execution.get("execution_id"),execution_json=execution)
@@ -181,7 +197,7 @@ class AutonomousDecisionRunner:
     def _public_run(record:dict[str,Any],duplicate:bool=False)->dict[str,Any]:
         state=record.get("state","unknown")
         context=record.get("context") or {};decision=record.get("decision") or {};account=context.get("account") or {};risk=context.get("risk_state") or {}
-        outcome="TRADE" if state in {"trade","shadow_trade"} else "NO_TRADE" if state=="no_trade" else "BLOCKED" if state=="blocked" else "ERROR" if state=="error" else "RUNNING"
+        outcome="TRADE" if state=="trade" else "NO_TRADE" if state=="no_trade" else "BLOCKED" if state in {"blocked","skipped"} else "ERROR" if state=="error" else "RUNNING"
         return {"schema_version":"1.0","status":state,"outcome":outcome,"run_id":record.get("id"),"run_key":record.get("run_key"),
             "profile_ref":record.get("profile_ref"),"snapshot_id":record.get("snapshot_id"),"context_hash":record.get("context_hash"),
             "decision":decision,"symbol":decision.get("symbol"),"side":decision.get("side"),
@@ -189,6 +205,6 @@ class AutonomousDecisionRunner:
             "execution":record.get("execution",{}),
             "account_summary":{"balance":account.get("balance"),"equity":account.get("equity"),"available_funds":account.get("available_funds"),
                 "daily_pnl":risk.get("daily_realized_pnl"),"open_pnl":risk.get("open_pnl")},
-            "preview_id":record.get("preview_id"),"execution_id":record.get("execution_id"),"shadow_mode":bool(record.get("shadow_mode",True)),
+            "preview_id":record.get("preview_id"),"execution_id":record.get("execution_id"),"shadow_mode":None,
             "provider":record.get("decision_provider"),"model_identifier":record.get("model_identifier"),
             "started_at":record.get("started_at"),"completed_at":record.get("completed_at"),"duplicate":duplicate}
