@@ -16,7 +16,8 @@ from app.storage.execution import ExecutionRepository, utcnow
 
 FINAL_STATES={"trade","no_trade","blocked","error","skipped"}
 SAFE_PRE_SUBMIT_RETRY_REASONS={"provider_unavailable","market_snapshot_unavailable","broker_unreachable",
-    "account_mapping_unavailable","account_status_unavailable","runner_internal_error"}
+    "account_mapping_unavailable","account_status_unavailable","runner_internal_error",
+    "tradelocker_rate_limit_exhausted"}
 logger=logging.getLogger(__name__)
 
 
@@ -180,7 +181,13 @@ class AutonomousDecisionRunner:
             execution=await self.demo.submit(user_sub,preview["preview_id"],f"autonomous:{run_id}")
             return self._finish(run_id,"trade",[str(execution.get("status","submitted"))],execution_id=execution.get("execution_id"),execution_json=execution)
         except AutonomousExecutionError as exc:
-            return self._finish(run_id,"blocked",exc.reasons)
+            retry_at = None
+            for value in (exc.details.get("timeframes") or {}).values():
+                candidate = (value.get("metadata") or {}).get("suggested_retry_at")
+                if candidate and (retry_at is None or candidate > retry_at): retry_at = candidate
+            validation = {"retryable": "tradelocker_rate_limit_exhausted" in exc.reasons,
+                          "suggested_retry_at": retry_at}
+            return self._finish(run_id,"blocked",exc.reasons,validation_json=validation)
         except Exception:
             return self._finish(run_id,"error",["runner_internal_error"])
 

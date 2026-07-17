@@ -164,8 +164,13 @@ class AutonomousSchedulerWorker:
             if safe and retries<settings.autonomous_scheduler_max_retries:
                 retries+=1;delay=min(settings.autonomous_scheduler_retry_cap_seconds,
                     settings.autonomous_scheduler_retry_base_seconds*(2**(retries-1)))
+                next_retry=current+timedelta(seconds=delay)
+                suggested=(result.get("validation") or {}).get("suggested_retry_at")
+                if suggested:
+                    try: next_retry=max(next_retry,datetime.fromisoformat(suggested))
+                    except ValueError: pass
                 self.schedules.finish_dispatch(dispatch["id"],state="retry_wait",outcome=result.get("outcome"),run_id=result.get("run_id"),
-                    reason_code=reason,summary=result,safe_retry=True,next_retry_at=(current+timedelta(seconds=delay)).isoformat(),retry_count=retries)
+                    reason_code=reason,summary=result,safe_retry=True,next_retry_at=next_retry.isoformat(),retry_count=retries)
                 counts["retrying"]+=1
             elif result.get("status")=="skipped":
                 self.schedules.finish_dispatch(dispatch["id"],state="skipped",outcome=result.get("outcome"),run_id=result.get("run_id"),

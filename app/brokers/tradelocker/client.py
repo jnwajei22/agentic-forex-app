@@ -1,10 +1,15 @@
 import asyncio
+from copy import deepcopy
+import random
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 import jwt
+
+from app.config.settings import settings
 
 from app.services.market_data.history import (
     MAX_CANDLES,
@@ -17,6 +22,8 @@ from app.services.market_data.history import (
     normalize_timeframe,
     validate_candle_result,
 )
+from app.services.market_data.candle_cache import CandleCacheEntry, CandleCacheKey, DurableCandleCache, candle_cache
+from app.services.tradelocker.rate_limiter import TradeLockerRequestLimiter, tradelocker_request_limiter
 
 
 SUPPORTED_TIMEFRAMES = set(TIMEFRAME_DURATION_MS)
@@ -73,6 +80,11 @@ class TradeLockerClient:
         account_number: str | None,
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        cache_user_id: str | None = None,
+        cache_connection_id: str | None = None,
+        cache_account_record_id: str | None = None,
+        candle_cache_store: DurableCandleCache = candle_cache,
+        request_limiter: TradeLockerRequestLimiter = tradelocker_request_limiter,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -80,6 +92,11 @@ class TradeLockerClient:
         self.server = server
         self.account_id = account_id
         self.account_number = account_number
+        self.cache_user_id = cache_user_id
+        self.cache_connection_id = cache_connection_id
+        self.cache_account_record_id = cache_account_record_id
+        self.candle_cache = candle_cache_store
+        self.request_limiter = request_limiter
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
@@ -89,6 +106,12 @@ class TradeLockerClient:
         self._token_expires_at = 0.0
         self._login_lock = asyncio.Lock()
         self.token_refresh_count = 0
+        self._instrument_cache: dict[str, tuple[Any, Any]] = {}
+        self._history_attempts = 0
+        self._history_retries = 0
+        self._history_backoff_seconds = 0.0
+        self._history_cooldown_until: str | None = None
+        self._candle_inflight: dict[tuple[Any, ...], asyncio.Task[PaginatedCandleResult]] = {}
 
     async def __aenter__(self) -> "TradeLockerClient":
         return self
@@ -217,11 +240,25 @@ class TradeLockerClient:
                 operation, "TradeLocker request timed out.", code="timeout"
             ) from None
         except httpx.HTTPStatusError as exc:
+            retry_after: float | None = None
+            header = exc.response.headers.get("Retry-After")
+            if header:
+                try:
+                    retry_after = max(0.0, float(header))
+                except ValueError:
+                    try:
+                        retry_after = max(0.0, (
+                            parsedate_to_datetime(header).astimezone(timezone.utc)
+                            - datetime.now(timezone.utc)
+                        ).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        retry_after = None
             raise TradeLockerError(
                 operation,
                 "TradeLocker rejected the request.",
-                code="http_error",
+                code="rate_limited" if exc.response.status_code == 429 else "http_error",
                 status_code=exc.response.status_code,
+                details={"retry_after_seconds": retry_after} if retry_after is not None else {},
             ) from None
         except (httpx.RequestError, ValueError) as exc:
             raise TradeLockerError(
@@ -341,7 +378,11 @@ class TradeLockerClient:
         )
 
     async def _resolve_instrument(self, symbol: str) -> tuple[Any, Any]:
+        key = symbol.replace("/", "").upper()
+        if key in self._instrument_cache:
+            return self._instrument_cache[key]
         instrument_id, route_id, _ = await self.resolve_instrument(symbol)
+        self._instrument_cache[key] = (instrument_id, route_id)
         return instrument_id, route_id
 
     async def get_instrument_details(self, symbol: str) -> dict[str, Any]:
@@ -407,8 +448,15 @@ class TradeLockerClient:
         start_time_ms: int,
         end_time_ms: int,
     ) -> Any:
-        """Fetch one bounded page, retrying only transient provider failures."""
-        for attempt in range(3):
+        """Fetch one bounded page through the connection-wide durable limiter."""
+        connection_scope = self.cache_connection_id or ":".join((
+            self.base_url, self.server or "", self.account_id or "", self.account_number or ""
+        ))
+        maximum_attempts = settings.tradelocker_rate_limit_max_retries + 1
+        for attempt in range(maximum_attempts):
+            lease = await self.request_limiter.acquire(connection_scope)
+            self._history_backoff_seconds += lease.waited_seconds
+            self._history_attempts += 1
             try:
                 return await self._request(
                     "GET",
@@ -427,12 +475,154 @@ class TradeLockerClient:
                 transient = exc.code in {"timeout", "request_failed"} or exc.status_code in {
                     429, 500, 502, 503, 504
                 }
-                if not transient or attempt == 2:
+                if not transient:
                     raise
-                await asyncio.sleep(0.1 * (2**attempt))
+                if exc.status_code == 429:
+                    retry_after = float(exc.details.get("retry_after_seconds") or 0)
+                    exponential = min(
+                        settings.tradelocker_rate_limit_max_backoff_seconds,
+                        (2**attempt) + random.uniform(0, 0.25),
+                    )
+                    delay = max(retry_after, exponential)
+                    cooldown_epoch = self.request_limiter.set_cooldown(connection_scope, delay)
+                    self._history_cooldown_until = datetime.fromtimestamp(
+                        cooldown_epoch, timezone.utc
+                    ).isoformat()
+                else:
+                    delay = min(settings.tradelocker_rate_limit_max_backoff_seconds,
+                                0.25 * (2**attempt) + random.uniform(0, 0.1))
+                if attempt == maximum_attempts - 1:
+                    code = "tradelocker_rate_limit_exhausted" if exc.status_code == 429 else exc.code
+                    raise TradeLockerError(
+                        "get_candles", "TradeLocker candle retrieval is temporarily unavailable.",
+                        code=code, status_code=exc.status_code,
+                        details={"retryable": True, "suggested_retry_at": self._history_cooldown_until,
+                                 "attempts": self._history_attempts,
+                                 "total_backoff_seconds": round(self._history_backoff_seconds, 3)},
+                    ) from None
+                if exc.status_code == 429 and delay > settings.tradelocker_rate_limit_max_backoff_seconds:
+                    raise TradeLockerError(
+                        "get_candles", "TradeLocker requested a cooldown longer than the bounded retry window.",
+                        code="tradelocker_rate_limit_exhausted", status_code=429,
+                        details={"retryable": True, "suggested_retry_at": self._history_cooldown_until,
+                                 "attempts": self._history_attempts,
+                                 "total_backoff_seconds": round(self._history_backoff_seconds, 3)},
+                    ) from None
+                self._history_retries += 1
+                self._history_backoff_seconds += delay
+                await asyncio.sleep(delay)
+            finally:
+                self.request_limiter.release(lease)
         raise AssertionError("unreachable")
 
+    def _candle_cache_key(
+        self, *, instrument_id: Any, symbol: str, resolution: str
+    ) -> CandleCacheKey | None:
+        if not all((self.cache_user_id, self.cache_connection_id, self.account_id,
+                    self.account_number, self.cache_account_record_id)):
+            return None
+        return CandleCacheKey(
+            user_id=str(self.cache_user_id), connection_id=str(self.cache_connection_id),
+            account_id=str(self.account_id), account_number=str(self.account_number),
+            instrument_id=str(instrument_id), symbol=symbol, timeframe=resolution,
+        )
+
+    def _cached_candle_result(
+        self, entry: CandleCacheEntry, *, symbol: str, timeframe: str,
+        requested_count: int | None, minimum_usable: int, end_ms: int,
+        fresh: bool, rate_limited: bool = False,
+    ) -> PaginatedCandleResult:
+        result = PaginatedCandleResult(
+            instrument_id=entry.key.instrument_id, timeframe=entry.key.timeframe,
+            requested_start_ms=entry.candles[0].timestamp, requested_end_ms=end_ms,
+            estimated_candles=requested_count or len(entry.candles), candles=list(entry.candles),
+            batches_requested=0, complete=True, stop_reason="cache_hit",
+            requested_timeframe=timeframe, provider_timeframe_sent=entry.key.timeframe,
+            rows_received=len(entry.candles), raw_count=len(entry.candles), source=entry.source,
+            cache_hit=True, cache_fresh=fresh,
+            cache_age_seconds=round(entry.age_seconds(datetime.now(timezone.utc)), 3),
+            upstream_request_made=False,
+        )
+        result = validate_candle_result(
+            result, symbol=symbol, requested_timeframe=timeframe,
+            requested_count=requested_count, minimum_usable=minimum_usable, now_ms=end_ms,
+        )
+        if rate_limited:
+            result.warnings = list(dict.fromkeys(
+                [*result.warnings, "cached_candles_used_after_rate_limit"]
+            ))
+            result.status = "partial" if result.complete else "blocked"
+        return result
+
+    def _decorate_and_cache(
+        self, result: PaginatedCandleResult, key: CandleCacheKey | None
+    ) -> PaginatedCandleResult:
+        result.attempts = self._history_attempts
+        result.retry_count = self._history_retries
+        result.total_backoff_seconds = round(self._history_backoff_seconds, 3)
+        result.cooldown_until = self._history_cooldown_until
+        result.upstream_request_made = self._history_attempts > 0
+        if key is not None and result.complete and result.usable_candles:
+            metadata = result.canonical_dict()["metadata"]
+            self.candle_cache.put(
+                key, result.usable_candles, source=result.source, metadata=metadata
+            )
+        return result
+
+    def _rate_limit_cache_fallback(
+        self, exc: TradeLockerError, cached: CandleCacheEntry | None, *, symbol: str,
+        timeframe: str, requested_count: int | None, minimum_usable: int, end_ms: int,
+    ) -> PaginatedCandleResult | None:
+        if exc.code != "tradelocker_rate_limit_exhausted" or cached is None:
+            return None
+        age = cached.age_seconds(datetime.now(timezone.utc))
+        if age > settings.tradelocker_candle_cache_max_stale_seconds:
+            exc.details.update({"cache_available": True, "cache_age_seconds": round(age, 3),
+                                "cache_rejection_reason": "cache_exceeds_stale_tolerance"})
+            return None
+        result = self._cached_candle_result(
+            cached, symbol=symbol, timeframe=timeframe, requested_count=requested_count,
+            minimum_usable=minimum_usable, end_ms=end_ms, fresh=False, rate_limited=True,
+        )
+        if not result.complete:
+            exc.details.update({"cache_available": True, "cache_age_seconds": round(age, 3),
+                                "cache_rejection_reason": "cached_history_insufficient"})
+            return None
+        result.attempts = self._history_attempts
+        result.retry_count = self._history_retries
+        result.total_backoff_seconds = round(self._history_backoff_seconds, 3)
+        result.cooldown_until = self._history_cooldown_until
+        result.upstream_request_made = True
+        return result
+
     async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        lookback: int | None = 300,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        minimum_usable: int | None = None,
+    ) -> PaginatedCandleResult:
+        request_key = (symbol.replace("/", "").upper(), timeframe, lookback,
+                       start_time_ms, end_time_ms, minimum_usable)
+        existing = self._candle_inflight.get(request_key)
+        if existing is not None:
+            result = deepcopy(await existing)
+            result.coalesced_requests += 1
+            return result
+        task = asyncio.create_task(self._get_candles_impl(
+            symbol, timeframe, lookback, start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms, minimum_usable=minimum_usable,
+        ))
+        self._candle_inflight[request_key] = task
+        try:
+            return await task
+        finally:
+            self._candle_inflight.pop(request_key, None)
+
+    async def _get_candles_impl(
         self,
         symbol: str,
         timeframe: str,
@@ -458,6 +648,21 @@ class TradeLockerClient:
             )
         instrument_id, route_id = await self._resolve_instrument(symbol)
         end_ms = end_time_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+        self._history_attempts = self._history_retries = 0
+        self._history_backoff_seconds = 0.0
+        self._history_cooldown_until = None
+        cache_key = self._candle_cache_key(
+            instrument_id=instrument_id, symbol=symbol, resolution=resolution
+        )
+        cached = self.candle_cache.get(cache_key) if cache_key is not None else None
+        required = minimum_usable or lookback or 1
+        if cached is not None and cached.fresh(datetime.now(timezone.utc)):
+            candidate = self._cached_candle_result(
+                cached, symbol=symbol, timeframe=timeframe, requested_count=lookback,
+                minimum_usable=required, end_ms=end_ms, fresh=True,
+            )
+            if candidate.complete:
+                return candidate
         effective_count = lookback if start_time_ms is None else None
         if start_time_ms is None:
             effective_count = lookback or 300
@@ -466,6 +671,13 @@ class TradeLockerClient:
             # exactly the requested number of broker rows.
             range_count = effective_count * 2 if resolution == "1D" else effective_count
             start_time_ms = end_ms - TIMEFRAME_DURATION_MS[resolution] * range_count
+            if cached is not None and len(cached.candles) >= required:
+                # Include one overlap candle so incremental refresh can safely
+                # merge and deduplicate without downloading the full window.
+                start_time_ms = max(
+                    start_time_ms,
+                    cached.newest_completed_timestamp - TIMEFRAME_DURATION_MS[resolution],
+                )
         if start_time_ms >= end_ms:
             raise TradeLockerError(
                 "get_candles", "start_time must be earlier than end_time.", code="invalid_time_range"
@@ -484,6 +696,12 @@ class TradeLockerClient:
                 start_time_ms=start_time_ms, end_time_ms=end_ms,
                 requested_count=effective_count, fetch_page=fetch_page,
             )
+            if cached is not None:
+                direct.candles = sorted(
+                    {row.timestamp: row for row in [*cached.candles, *direct.candles]}.values(),
+                    key=lambda row: row.timestamp,
+                )[-(lookback or MAX_CANDLES):]
+                direct.duplicate_count += len(cached.candles) + direct.rows_received - len(direct.candles)
             direct.requested_timeframe = timeframe
             direct.provider_timeframe_sent = resolution
             required = minimum_usable or effective_count or 1
@@ -493,8 +711,19 @@ class TradeLockerClient:
                 now_ms=end_ms,
             )
             if direct.complete or resolution not in {"1D", "4H"} or effective_count is None:
-                return direct
+                return self._decorate_and_cache(direct, cache_key)
         except TradeLockerError as exc:
+            fallback = self._rate_limit_cache_fallback(
+                exc, cached, symbol=symbol, timeframe=timeframe,
+                requested_count=lookback, minimum_usable=required, end_ms=end_ms,
+            )
+            if fallback is not None:
+                return fallback
+            if exc.code == "tradelocker_rate_limit_exhausted":
+                exc.details.setdefault("cache_available", cached is not None)
+                exc.details.setdefault("cache_age_seconds", round(cached.age_seconds(datetime.now(timezone.utc)), 3) if cached else None)
+                exc.details.setdefault("cache_rejection_reason", "cache_missing" if cached is None else "cached_history_insufficient")
+                raise
             if resolution not in {"1D", "4H"} or effective_count is None:
                 raise
             direct_error = exc
@@ -575,11 +804,12 @@ class TradeLockerClient:
                 aggregation_source_timeframe="1H",
                 incomplete_days_excluded=incomplete_days,
             )
-            return validate_candle_result(
+            aggregated = validate_candle_result(
                 aggregated, symbol=symbol, requested_timeframe=timeframe,
                 requested_count=effective_count, minimum_usable=minimum_usable or effective_count,
                 now_ms=end_ms,
             )
+            return self._decorate_and_cache(aggregated, cache_key)
 
         incomplete = PaginatedCandleResult(
             instrument_id=str(instrument_id), timeframe=resolution,
@@ -596,8 +826,9 @@ class TradeLockerClient:
             aggregation_source_timeframe="1H",
             incomplete_days_excluded=fallback_diagnostics.get("incomplete_utc_days", []),
         )
-        return validate_candle_result(
+        incomplete = validate_candle_result(
             incomplete, symbol=symbol, requested_timeframe=timeframe,
             requested_count=effective_count, minimum_usable=minimum_usable or effective_count,
             now_ms=end_ms,
         )
+        return self._decorate_and_cache(incomplete, cache_key)

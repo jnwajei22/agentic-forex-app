@@ -129,6 +129,16 @@ class PaginatedCandleResult:
     warnings: list[str] = field(default_factory=list)
     incomplete_days_excluded: list[str] = field(default_factory=list)
     aggregation_source_timeframe: str | None = None
+    cache_hit: bool = False
+    cache_fresh: bool = False
+    cache_age_seconds: float | None = None
+    upstream_request_made: bool = True
+    attempts: int = 0
+    retry_count: int = 0
+    total_backoff_seconds: float = 0.0
+    cooldown_until: str | None = None
+    cache_rejection_reason: str | None = None
+    coalesced_requests: int = 0
 
     def diagnostics(self) -> dict[str, Any]:
         result = {
@@ -169,6 +179,7 @@ class PaginatedCandleResult:
                 "forming_candle_excluded": self.forming_candle_excluded,
                 "oldest_timestamp": self.usable_candles[0].timestamp if self.usable_candles else None,
                 "newest_timestamp": self.latest_raw_timestamp,
+                "newest_completed_timestamp": self.latest_complete_timestamp,
                 "latest_complete_timestamp": self.latest_complete_timestamp,
                 "requests_made": self.batches_requested,
                 "rows_received_raw": self.raw_count,
@@ -177,6 +188,16 @@ class PaginatedCandleResult:
                 "termination_reason": self.stop_reason,
                 "is_sufficient": self.complete,
                 "incomplete_days_excluded": self.incomplete_days_excluded,
+                "cache_hit": self.cache_hit,
+                "cache_fresh": self.cache_fresh,
+                "cache_age_seconds": self.cache_age_seconds,
+                "upstream_request_made": self.upstream_request_made,
+                "attempts": self.attempts,
+                "retry_count": self.retry_count,
+                "total_backoff_seconds": self.total_backoff_seconds,
+                "cooldown_until": self.cooldown_until,
+                "cache_rejection_reason": self.cache_rejection_reason,
+                "coalesced_requests": self.coalesced_requests,
             },
             "blocking_reasons": self.blocking_reasons,
             "warnings": self.warnings,
@@ -200,6 +221,16 @@ def _latest_expected_complete_start(now_ms: int, duration: int) -> int:
     while _market_closed(candidate):
         candidate -= duration
     return candidate
+
+
+def next_completed_candle_due_ms(newest_completed_timestamp: int, timeframe: str) -> int:
+    """Return when the next completed broker candle should be publishable."""
+    resolution = normalize_timeframe(timeframe)
+    duration = TIMEFRAME_DURATION_MS[resolution]
+    next_start = newest_completed_timestamp + duration
+    while _market_closed(next_start):
+        next_start += duration
+    return next_start + duration
 
 
 def validate_candle_result(

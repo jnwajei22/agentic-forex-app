@@ -33,6 +33,8 @@ async def verify(alias: str, symbol: str) -> dict:
         base_url=connection.base_url, username=connection.username, password=connection.password,
         server=connection.server, account_id=str(account["broker_account_id"]),
         account_number=str(account["acc_num"]),
+        cache_user_id=user_sub, cache_connection_id=str(account["connection_ref"]),
+        cache_account_record_id=str(account["public_id"]),
     )
     results = {}
     try:

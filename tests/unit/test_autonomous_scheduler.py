@@ -103,6 +103,22 @@ async def test_safe_retry_is_bounded_but_blocked_and_unknown_do_not_retry(tmp_pa
     assert repo3.list_dispatches("u")[0]["state"]=="completed" and repo3.list_dispatches("u")[0]["retry_count"]==0
 
 
+@pytest.mark.asyncio
+async def test_rate_limited_schedule_honors_suggested_retry_without_tight_loop(tmp_path,monkeypatch):
+    monkeypatch.setattr(settings,"autonomous_scheduler_max_retries",2)
+    now=datetime.now(timezone.utc);suggested=(now+timedelta(minutes=4)).isoformat()
+    repo=ScheduleRepository(tmp_path/"rate-limited.db");_due(repo,now)
+    runner=FakeRunner({"status":"blocked","outcome":"BLOCKED",
+        "reason_codes":["tradelocker_rate_limit_exhausted"],"run_id":"r",
+        "preview_id":None,"execution_id":None,
+        "validation":{"retryable":True,"suggested_retry_at":suggested}})
+    counts=await AutonomousSchedulerWorker(worker_id="rate",schedules=repo,
+        runner_factory=lambda:runner).run_once(now)
+    dispatch=repo.list_dispatches("u")[0]
+    assert counts["retrying"]==1 and dispatch["state"]=="retry_wait"
+    assert datetime.fromisoformat(dispatch["next_retry_at"])>=datetime.fromisoformat(suggested)
+
+
 def _account(storage,user,environment):
     connection=storage.save_connection(user,base_url=f"https://{environment}.tradelocker.test/backend-api",username="u",password="p",server="s",environment=environment)
     storage.sync_accounts(user,connection.connection_ref,{"accounts":[{"accountId":"1","accNum":"2"}]})

@@ -194,7 +194,9 @@ async def get_market_candles(
         if source == "tradelocker" and owner_id:
             context = BrokerAccountResolver().resolve(owner_id, account_alias=account_alias, account_ref=account_ref)
             adapter = TradeLockerAdapter(TradeLockerClient(base_url=context.base_url,username=context.username,
-                password=context.password,server=context.server,account_id=context.account_id,account_number=context.account_number))
+                password=context.password,server=context.server,account_id=context.account_id,account_number=context.account_number,
+                cache_user_id=owner_id,cache_connection_id=getattr(context,"connection_ref",None),
+                cache_account_record_id=getattr(context,"account_record_id",None)))
         result = await get_market_series(
             symbol=symbol, timeframe=timeframe, source=source, lookback=lookback,
             start_time=start_time, end_time=end_time, max_candles=max_candles,

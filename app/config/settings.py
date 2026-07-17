@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     tradelocker_account_id: str | None = None
     tradelocker_account_number: str | None = None
     tradelocker_config_cache_ttl_seconds: int = 900
+    tradelocker_candle_cache_grace_seconds: int = Field(default=30, ge=0, le=300)
+    tradelocker_candle_cache_max_stale_seconds: int = Field(default=86400, ge=0)
+    tradelocker_candle_cache_max_entries: int = Field(default=1000, ge=10)
+    tradelocker_rate_limit_max_retries: int = Field(default=2, ge=0, le=5)
+    tradelocker_rate_limit_max_backoff_seconds: float = Field(default=8.0, ge=0.1, le=60)
+    tradelocker_rate_limit_min_interval_seconds: float = Field(default=0.35, ge=0, le=10)
 
     autonomous_snapshot_ttl_seconds: int = 60
     autonomous_preview_ttl_seconds: int = 60

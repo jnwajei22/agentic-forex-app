@@ -372,8 +372,20 @@ class AutonomousDemoService:
             demo_classification=resolved.demo_classification,
         )
 
-    def _client(self, connection: BrokerConnection) -> TradeLockerClient:
-        return self.client_factory(base_url=connection.base_url, username=connection.username, password=connection.password, server=connection.server, account_id=connection.account_id, account_number=connection.account_number)
+    def _client(
+        self, connection: BrokerConnection, context: VerifiedDemoContext | None = None
+    ) -> TradeLockerClient:
+        cache_scope = ({
+            "cache_user_id": context.user_sub,
+            "cache_connection_id": context.connection_ref,
+            "cache_account_record_id": context.account_record_id,
+        } if context is not None else {})
+        return self.client_factory(
+            base_url=connection.base_url, username=connection.username,
+            password=connection.password, server=connection.server,
+            account_id=connection.account_id, account_number=connection.account_number,
+            **cache_scope,
+        )
 
     async def status(self, user_sub: str, profile_ref: str) -> dict[str, Any]:
         reasons = []
@@ -494,7 +506,7 @@ class AutonomousDemoService:
             warnings.append("required_macro_provider_unavailable" if fred_required else "macro_provider_unavailable")
         if blackouts:
             warnings.append("news_blackout")
-        client = self._client(context.connection)
+        client = self._client(context.connection, context)
         market: dict[str, Any] = {}
         try:
             try:
@@ -546,6 +558,7 @@ class AutonomousDemoService:
                     raise self._snapshot_failure(f"{pair.lower()}_instrument_metadata") from None
                 d1 = h4 = h1 = m15 = None
                 timeframe_results: dict[str, dict[str, Any]] = {}
+                timeframe_candles: dict[str, list[dict[str, Any]]] = {}
                 timeframe_failures: list[str] = []
                 if autonomous:
                     for timeframe, count in (("1d", 190), ("4h", 250), ("1h", 200), ("15m", 200)):
@@ -564,19 +577,22 @@ class AutonomousDemoService:
                             }
                             diagnostics.update(exc.details)
                             reason = exc.code if exc.code in {
-                                "unsupported_timeframe", "no_candles_returned"
+                                "unsupported_timeframe", "no_candles_returned",
+                                "tradelocker_rate_limit_exhausted",
                             } else "provider_request_failed"
                             timeframe_results[timeframe] = {
                                 "status": "blocked", "symbol": pair,
                                 "requested_timeframe": timeframe,
                                 "provider_timeframe": normalize_timeframe(timeframe),
-                                "source": "direct", "candles": [],
+                                "source": "direct",
                                 "metadata": diagnostics,
                                 "blocking_reasons": [reason], "warnings": [],
                             }
                             timeframe_failures.append(
                                 f"{pair.lower()}_candles_{timeframe}_{reason}"
                             )
+                            if reason == "tradelocker_rate_limit_exhausted":
+                                timeframe_failures.append(reason)
                             continue
                         canonical = series.canonical_dict() if hasattr(series, "canonical_dict") else {
                             "status": "ok" if series.complete else "blocked",
@@ -589,6 +605,8 @@ class AutonomousDemoService:
                             "blocking_reasons": [] if series.complete else ["insufficient_usable_candles"],
                             "warnings": [],
                         }
+                        timeframe_candles[timeframe] = canonical.pop("candles", [])
+                        canonical.pop("forming_candle", None)
                         timeframe_results[timeframe] = canonical
                         if canonical["blocking_reasons"]:
                             timeframe_failures.extend(
@@ -611,10 +629,10 @@ class AutonomousDemoService:
                         )
                 market[pair] = {"quote": quote,"bid":bid,"ask":ask,"spread":ask-bid,"quote_retrieved_at":utcnow().isoformat(),
                     "instrument_metadata":instrument.__dict__,
-                    "candles_1d": timeframe_results.get("1d", {}).get("candles", []),
-                    "candles_4h": timeframe_results.get("4h", {}).get("candles", []),
-                    "candles_1h": timeframe_results.get("1h", {}).get("candles", []),
-                    "candles_15m": timeframe_results.get("15m", {}).get("candles", []),
+                    "candles_1d": timeframe_candles.get("1d", []),
+                    "candles_4h": timeframe_candles.get("4h", []),
+                    "candles_1h": timeframe_candles.get("1h", []),
+                    "candles_15m": timeframe_candles.get("15m", []),
                     "timeframes": timeframe_results,
                     "complete": True}
         finally:
@@ -636,6 +654,18 @@ class AutonomousDemoService:
                 + (["maximum_pending_orders_reached"]
                 if account.pending_orders_count >= context.risk["maximum_pending_orders"] else []),
         }
+        candle_metadata = [value.get("metadata", {}) for pair_data in market.values()
+                           for value in pair_data.get("timeframes", {}).values()]
+        candle_request_summary = {
+            "upstream_requests": sum(int(item.get("attempts") or 0) for item in candle_metadata),
+            "cache_hits": sum(bool(item.get("cache_hit")) for item in candle_metadata),
+            "coalesced_requests": sum(int(item.get("coalesced_requests") or 0) for item in candle_metadata),
+            "rate_limit_retries": sum(int(item.get("retry_count") or 0) for item in candle_metadata),
+            "total_backoff_seconds": round(sum(float(item.get("total_backoff_seconds") or 0)
+                                                   for item in candle_metadata), 3),
+            "cooldown_until": max((str(item["cooldown_until"]) for item in candle_metadata
+                                   if item.get("cooldown_until")), default=None),
+        }
         result = {
             "schema_version": "1.0", "status": "ok", "snapshot_id": snapshot_id,
             "retrieved_at": now.isoformat(), "expires_at": (now + timedelta(seconds=settings.autonomous_snapshot_ttl_seconds)).isoformat(),
@@ -646,6 +676,7 @@ class AutonomousDemoService:
             "risk_state": risk_state, "strategy": {"name": context.risk["strategy_name"], "version": context.risk["strategy_version"]},
             "providers": providers, "news_blackouts": blackouts,
             "provider_context": provider_context, "warnings": list(dict.fromkeys(warnings)),
+            "candle_requests": candle_request_summary,
             "market": {"pairs": market}, "execution_eligibility":
                 (not finnhub_required or (not blackouts and providers["finnhub"]["available"] and not providers["finnhub"]["stale"]))
                 and (not fred_required or (providers["fred"]["available"] and not providers["fred"]["stale"]))
@@ -739,7 +770,7 @@ class AutonomousDemoService:
             violations.append("market_data_incomplete")
         if violations:
             raise AutonomousExecutionError("risk_validation_failed", "The proposed order failed deterministic risk validation.", status="rejected", reasons=violations)
-        client = self._client(context.connection)
+        client = self._client(context.connection, context)
         try:
             instrument_payload = await client.get_instrument_details(pair)
         except TradeLockerError:
@@ -895,7 +926,7 @@ class AutonomousDemoService:
             drawdown = max(0.0, (high_watermark - account.projected_balance) / high_watermark * 100) if high_watermark > 0 else 100.0
             if drawdown >= context.risk["drawdown_cutoff_percent"]:
                 raise AutonomousExecutionError("drawdown_cutoff", "The account drawdown cutoff was reached.", status="rejected")
-            client = self._client(context.connection)
+            client = self._client(context.connection, context)
             try:
                 quote = await client.get_quote(preview["pair"])
                 bid, ask = self._quote(quote)
@@ -1257,7 +1288,7 @@ class AutonomousDemoService:
         if action_type not in {"cancel_order","close_position"}:
             raise AutonomousExecutionError("invalid_action","Unsupported demo risk-reduction action.",status="rejected")
         context=await self.context(user_sub,profile_ref)
-        client=self._client(context.connection)
+        client=self._client(context.connection, context)
         try:
             config=await client.get_config()
             payload=await (client.get_orders() if action_type=="cancel_order" else client.get_open_positions())
@@ -1294,7 +1325,7 @@ class AutonomousDemoService:
         execution_id=f"exec_{uuid4().hex}"
         claimed,existing=self.execution.claim_action(execution_id,preview_id,user_sub,idempotency_key,preview["action_type"],preview["target_id"])
         if not claimed:return self._action_result(existing)
-        client=self._client(context.connection);dispatched=False
+        client=self._client(context.connection, context);dispatched=False
         try:
             config=await client.get_config()
             before=await (client.get_orders() if preview["action_type"]=="cancel_order" else client.get_open_positions())
@@ -1349,7 +1380,7 @@ class AutonomousDemoService:
         if immutable != stored:
             logger.warning("execution_reconciliation_routing_mismatch user_ref=%s execution_id=%s", user_sub, run["id"])
             return run
-        client = self._client(context.connection)
+        client = self._client(context.connection, context)
         try:
             config = await client.get_config()
             correlation_id = f"afd-{preview['id'][-20:]}"
