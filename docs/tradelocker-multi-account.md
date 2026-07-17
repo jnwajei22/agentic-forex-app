@@ -41,7 +41,7 @@ The safe account-facing tools are:
 
 Aliases and safe account references are the only account selectors accepted by read tools. Profile creation and mutation are intentionally limited to the authenticated web API and dashboard. This refactor adds no live broker-write capability; the existing demo-only execution safety boundary is unchanged.
 
-The current demo execution tools require an execution-profile reference for status, snapshot, review, and no-trade recording. Submission derives the profile exclusively from the immutable preview. `Demo Autonomous` remains unavailable, live and unknown accounts remain read-only, and no scheduler is present.
+The demo execution tools require an execution-profile reference for status, snapshot, review, and no-trade recording. Submission derives the profile exclusively from the immutable preview. Demo autonomy can be armed only through the authenticated dashboard/API for a bounded period, and the durable scheduler dispatches only armed, verified demo profiles. Live and unknown accounts remain read-only.
 
 ## Demo Manual execution
 

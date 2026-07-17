@@ -116,7 +116,9 @@ def test_worker_health_reports_heartbeat_and_stopped_state(tmp_path):
 
 
 def test_scheduled_time_rechecks_arming_expiry_profile_and_kill_switch(monkeypatch):
-    runner=object.__new__(AutonomousDecisionRunner);now=datetime(2026,1,14,14,tzinfo=timezone.utc)
+    runner=object.__new__(AutonomousDecisionRunner)
+    runner.execution=type("Controls",(),{"kill_switch_enabled":lambda self:settings.kill_switch_enabled})()
+    now=datetime(2026,1,14,14,tzinfo=timezone.utc)
     profile={"enabled":True,"execution_mode":"demo_autonomous","autonomous_armed":True,
         "armed_until":(now+timedelta(hours=1)).isoformat(),"account_environment":"demo","is_demo":1,
         "allowed_sessions":["new_york"],"decision_provider":"no_trade"}

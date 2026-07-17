@@ -111,7 +111,7 @@ class AutonomousScheduleService:
         profiles=self.brokers.list_profiles(user_sub)
         entry_count=sum(1 for item in runs if item.get("state")=="trade" and item.get("execution_id"))
         return {"schema_version":"1.0","date":target.isoformat(),"timezone":"UTC","outcomes":outcomes,
-            "daily_entry_count":entry_count,"kill_switch":settings.kill_switch_enabled,
+            "daily_entry_count":entry_count,"kill_switch":self.execution.kill_switch_enabled(),
             "armed_profiles":sum(1 for item in profiles if item.get("autonomous_armed")),"runs":details}
 
     @staticmethod

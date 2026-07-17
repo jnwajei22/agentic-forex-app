@@ -271,6 +271,16 @@ def test_insufficient_scope_is_rejected(monkeypatch):
     assert 'scope="forex:preview"' in response.headers["www-authenticate"]
 
 
+def test_read_scope_cannot_trigger_autonomous_execution(monkeypatch):
+    _enable_test_oauth(monkeypatch,scopes="forex:read")
+    with TestClient(app) as client:
+        response=client.post("/mcp",json={"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"run_autonomous_demo_profile","arguments":{"profile_ref":"p","run_key":"scheduled-key","trigger_reason":"test"}}},
+            headers={**MCP_HEADERS,"Authorization":"Bearer read-only-jwt"})
+    assert response.status_code==403
+    assert 'scope="forex:execute"' in response.headers["www-authenticate"]
+
+
 def test_shared_secret_remains_available_for_explicit_manual_mode(monkeypatch):
     monkeypatch.setattr(settings, "mcp_require_oauth", False)
     monkeypatch.setattr(settings, "mcp_shared_secret", "test-mcp-secret")
@@ -290,6 +300,14 @@ async def test_mcp_server_registers_expected_tools():
     listed_tools = await mcp.list_tools()
     registered = {tool.name for tool in listed_tools}
     assert registered == EXPECTED_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_every_registered_tool_has_an_explicit_oauth_scope():
+    from app.mcp.auth import TOOL_SCOPES
+    registered={tool.name for tool in await mcp.list_tools()}
+    assert registered==set(TOOL_SCOPES)
+    assert TOOL_SCOPES["run_autonomous_demo_profile"]=="forex:execute"
     assert "get_tradelocker_connection_status" in registered
 
 
@@ -480,6 +498,7 @@ def test_mcp_order_review_is_rejected_without_live_submission(monkeypatch):
 
 def test_remote_mcp_cannot_disable_kill_switch(monkeypatch):
     monkeypatch.setattr(settings, "kill_switch_enabled", True)
+    monkeypatch.setattr(tools, "get_current_user_sub", lambda: "test-user")
     result = tools.set_kill_switch(False, "remote request")
 
     assert result["changed"] is False

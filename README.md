@@ -85,4 +85,4 @@ LIVE_TRADING_ENABLED=false
 KILL_SWITCH_ENABLED=true
 ```
 
-The backend implements only the explicitly enabled, account-scoped TradeLocker **demo** execution workflow documented above. It does not implement live autonomous execution, scheduling, a Pine interpreter, strategy optimization, or a backtester.
+The backend implements only explicitly enabled, profile-bound TradeLocker **demo** execution, including the durable demo scheduler documented under `docs/`. It does not implement live execution, a Pine interpreter, strategy optimization, or a backtester.

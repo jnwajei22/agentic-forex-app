@@ -222,6 +222,25 @@ async def test_demo_mode_can_be_enabled_only_for_scoped_account(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_required_macro_policy_is_loaded_from_bound_strategy(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "tradelocker_demo_base_url", "https://demo.tradelocker.test/backend-api")
+    brokers = BrokerRepository(tmp_path / "broker.db", secret="test-secret")
+    connection = brokers.save_connection("user", base_url=settings.tradelocker_demo_base_url,
+        username="u", password="p", server="s", environment="demo")
+    brokers.sync_accounts("user", connection.connection_ref,
+        {"accounts": [{"accountId": "a1", "accNum": "7", "currency": "USD"}]})
+    account = brokers.list_accounts("user")[0]
+    profile = brokers.create_profile("user", name="AI demo", account_ref=account["public_id"],
+        strategy_template_id="strategy_ai_forex_confluence_v1", execution_mode="demo_manual")
+    service = AutonomousDemoService(broker_repository=brokers,
+        execution_repository=ExecutionRepository(tmp_path / "broker.db"), client_factory=DiscoveryClient)
+
+    context = await service.context("user", profile["public_id"])
+
+    assert context.risk["strategy_config"]["required_macro_series"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "base_url,environment",
     [

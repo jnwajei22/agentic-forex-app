@@ -455,13 +455,14 @@ class BrokerRepository:
                 p.decision_provider,p.model_identifier,p.minimum_confidence,p.allowed_sessions_json,p.schedule_ref,
                 p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,
                 a.account_alias,a.public_id account_id,a.environment account_environment,a.is_demo,
-                t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version
+                t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version,t.config_json strategy_config_json
                 FROM execution_profiles p JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
                 JOIN strategy_templates t ON t.id=p.strategy_template_id WHERE u.auth0_sub=? ORDER BY p.name COLLATE NOCASE""",(auth0_sub,)).fetchall()
         return [{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),
             "autonomous_armed":bool(r["autonomous_armed"]),"autonomous_shadow_mode":bool(r["autonomous_shadow_mode"]),
             "risk":json.loads(r["risk_json"]),"allowed_instruments":json.loads(r["allowed_instruments_json"]),
-            "session_rules":json.loads(r["session_rules_json"]),"allowed_sessions":json.loads(r["allowed_sessions_json"])} for r in rows]
+            "session_rules":json.loads(r["session_rules_json"]),"allowed_sessions":json.loads(r["allowed_sessions_json"]),
+            "strategy_config":json.loads(r["strategy_config_json"])} for r in rows]
 
     def arm_autonomous_profile(self, auth0_sub: str, profile_ref: str, *, armed_until: str,
                                decision_provider: str="no_trade", model_identifier: str|None=None,

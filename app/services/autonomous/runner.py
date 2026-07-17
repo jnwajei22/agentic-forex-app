@@ -51,7 +51,7 @@ class AutonomousDecisionRunner:
             if armed_until<=now:reasons.append("arming_expired")
         except ValueError:reasons.append("arming_expired")
         if profile.get("account_environment")!="demo" or profile.get("is_demo")!=1:reasons.append("account_not_demo")
-        if settings.kill_switch_enabled:reasons.append("kill_switch_enabled")
+        if self.execution.kill_switch_enabled():reasons.append("kill_switch_enabled")
         if now.weekday()>=5:reasons.append("weekend_blocked")
         allowed=set(profile.get("allowed_sessions") or [])
         if allowed and not allowed.intersection(self._session(now)):reasons.append("outside_allowed_session")
@@ -92,7 +92,7 @@ class AutonomousDecisionRunner:
             "execution_mode":profile.get("execution_mode"),"armed":profile.get("autonomous_armed",False),
             "armed_until":profile.get("armed_until"),"shadow_mode":profile.get("autonomous_shadow_mode",True),
             "decision_provider":profile.get("decision_provider"),"model_identifier":profile.get("model_identifier"),
-            "minimum_confidence":profile.get("minimum_confidence"),"kill_switch":settings.kill_switch_enabled,
+            "minimum_confidence":profile.get("minimum_confidence"),"kill_switch":self.execution.kill_switch_enabled(),
             "blocking_reasons":reasons,"latest_run":self._public_run(latest) if latest else None}
 
     async def snapshot(self,user_sub:str,profile_ref:str)->dict[str,Any]:

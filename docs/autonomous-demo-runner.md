@@ -10,7 +10,7 @@ The runner is deliberately profile-bound and demo-only. It cannot choose or over
 4. Configure `OPENAI_API_KEY` only on the backend and select the `openai` provider when arming. `no_trade` is the fail-closed default.
 5. Disable the global kill switch only through the existing protected operator configuration. MCP callers can enable it, but cannot disable it or arm/reconfigure a profile.
 
-There is no built-in scheduler. An authenticated caller may trigger one idempotent run with `run_autonomous_demo_profile(profile_ref, run_key, trigger_reason)`. Reusing a run key returns the existing result, and the database permits only one active run per user/profile.
+The durable scheduler uses the configured IANA timezone and local times to trigger the same idempotent runner. An authenticated caller may also trigger one run with `run_autonomous_demo_profile(profile_ref, run_key, trigger_reason)`. Reusing a run key returns the existing result, and the database permits only one active run per user/profile.
 
 ## Safety gates
 

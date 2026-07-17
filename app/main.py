@@ -13,11 +13,16 @@ from app.config.settings import settings
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.storage.brokers import BrokerStorageError
+from app.storage.brokers import BrokerRepository
+from app.storage.execution import ExecutionRepository
+from app.storage.schedules import ScheduleRepository
 from app.jobs.autonomous_scheduler import AutonomousSchedulerWorker
 
 
 @asynccontextmanager
 async def lifespan(app_instance):
+    # Ordered, idempotent additive migrations run before either API or embedded worker accepts traffic.
+    BrokerRepository();ExecutionRepository();ScheduleRepository()
     worker=AutonomousSchedulerWorker() if settings.autonomous_scheduler_embedded else None
     task=None
     async with mcp_app.lifespan(app_instance):

@@ -174,13 +174,13 @@ class TradeLockerAccountStatusService:
         finally:
             refresh_occurred = bool(getattr(client, "token_refresh_count", 0))
             logger.info(
-                "TradeLocker account_status user_id=%s connection_id=%s account_id=%s "
-                "acc_num=%s environment=%s config_cache_hit=%s config_fields=%s "
+                "TradeLocker account_status user_id=%s connection_record=%s account_ref=%s "
+                "account_alias=%s environment=%s config_cache_hit=%s config_fields=%s "
                 "state_values=%s mapping_success=%s latency_ms=%.2f token_refresh=%s",
                 auth0_user_id,
                 context.connection_id if context else None,
-                context.account_id if context else None,
-                context.account_number if context else None,
+                context.account_record_id if context else None,
+                context.account_alias if context else None,
                 context.environment if context else None,
                 config_from_cache, config_fields, state_values, mapping_success,
                 (perf_counter() - started) * 1000, refresh_occurred,

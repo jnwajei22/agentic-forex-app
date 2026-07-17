@@ -1,12 +1,12 @@
 # TradeLocker demo execution
 
-This workflow performs consequential broker-side writes only against the authenticated user's selected, verified TradeLocker demo account. It does not implement live autonomous trading or scheduling. Internal paper trading remains separate.
+This workflow performs consequential broker-side writes only against the authenticated user's profile-bound, verified TradeLocker demo account. It does not implement live execution. Internal paper trading remains separate.
 
 ## Safety architecture
 
 Execution settings are keyed by authenticated user, connection, account ID, and account number. New account records default to `read_only`; `demo_manual` and `demo_autonomous` can be selected only through the authenticated settings API/UI. MCP tools cannot change this setting. The existing MCP kill-switch operation remains one-way: it can enable the switch but cannot disable it.
 
-Every snapshot, preview, and submission resolves the selected connection internally. Demo execution requires all of the following to agree:
+Every snapshot, preview, and submission resolves the profile-bound connection internally. Demo execution requires all of the following to agree:
 
 - the stored connection environment is `demo`;
 - its normalized base URL exactly equals `TRADELOCKER_DEMO_BASE_URL`;
@@ -21,13 +21,13 @@ OAuth additionally requires `forex:execute` for submission; read or preview perm
 ## MCP workflow
 
 1. `get_autonomous_demo_status` checks readiness without mutation.
-2. `get_autonomous_demo_snapshot` stores an immutable, five-minute normalized account/market/provider snapshot.
+2. `get_autonomous_demo_snapshot` stores an immutable, short-lived normalized account/market/provider snapshot.
 3. `review_autonomous_demo_order` accepts a setup but calculates final size on the server and stores an immutable, short-lived preview.
 4. `submit_autonomous_demo_order` claims that preview durably, refreshes account/provider/quote/order state, then submits at most once.
 5. `record_autonomous_no_trade` records a deliberate no-trade decision without calling a broker order endpoint.
 6. `get_autonomous_run_result` reads the latest or requested owned result.
 
-Allowed pairs are initially `EURUSD`, `GBPUSD`, `AUDUSD`, `NZDUSD`, and `USDCAD`. Stop loss and take profit are mandatory, reward/risk must be at least 1.5, risk is capped at 1%, and only one open position and one pending order are permitted. The 3% daily-loss and 10% drawdown cutoffs are rechecked immediately before submission. Finnhub calendar availability/freshness is required and fails closed; FRED is optional and its health is reported.
+Allowed pairs are initially `EURUSD`, `GBPUSD`, `AUDUSD`, `NZDUSD`, and `USDCAD`. Stop loss and take profit are mandatory, reward/risk must be at least 1.5, risk is capped at 1%, and only one open position and one pending order are permitted. The 3% daily-loss and 10% drawdown cutoffs are rechecked immediately before submission. Finnhub calendar availability/freshness is required and fails closed. FRED also fails closed when the bound strategy template declares required macro series.
 
 ## Position sizing
 
@@ -84,4 +84,4 @@ Do not perform this procedure on a live account.
 
 ## Current limitations
 
-Only market and limit entries are supported. There are no stop entries, trailing stops, partial closes, multiple targets, autonomous modifications, multiple simultaneous positions, scheduling, or live autonomous execution. Currency combinations without an available direct or inverse TradeLocker conversion symbol fail closed. Manual broker verification remains required for an `unknown` submission.
+There are no trailing stops, partial closes, multiple targets, autonomous modifications, multiple simultaneous positions, or live execution. Currency combinations without an available direct or inverse TradeLocker conversion symbol fail closed. Manual broker verification remains required for an `unknown` submission. Scheduling is demo-only and subject to the same profile, arming, risk, idempotency, and reconciliation gates.

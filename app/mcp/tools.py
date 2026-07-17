@@ -40,6 +40,7 @@ from app.services.autonomous.execution import AutonomousDemoService, AutonomousE
 from app.services.autonomous.runner import AutonomousDecisionRunner
 from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleStorageError
+from app.storage.execution import ExecutionRepository
 from app.services.tradelocker.account_status import (
     AccountStatusUnavailable,
     TradeLockerAccountStatusService,
@@ -601,10 +602,9 @@ def set_kill_switch(enabled: bool, reason: str) -> dict[str, Any]:
     if not reason.strip():
         raise ValueError("A reason is required to change the kill switch.")
     if not enabled:
-        settings.kill_switch_enabled = True
+        ExecutionRepository().enable_kill_switch(_authenticated_user())
         return {"changed": False, "kill_switch_enabled": True, "reason": reason, "message": "Remote MCP callers cannot disable the kill switch."}
-    changed = not settings.kill_switch_enabled
-    settings.kill_switch_enabled = True
+    repository=ExecutionRepository();changed=not repository.kill_switch_enabled();repository.enable_kill_switch(_authenticated_user())
     return {"changed": changed, "kill_switch_enabled": True, "reason": reason, "message": "Kill switch enabled."}
 
 

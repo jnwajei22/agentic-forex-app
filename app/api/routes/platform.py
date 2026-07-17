@@ -508,7 +508,7 @@ async def autonomous_worker_health_api(claims:dict=Depends(current_claims))->dic
 
 @router.post("/operations/kill-switch/enable")
 async def enable_kill_switch_api(claims:dict=Depends(current_claims))->dict:
-    settings.kill_switch_enabled=True
+    ExecutionRepository().enable_kill_switch(claims["sub"])
     logger.warning("kill_switch_enabled user_id=%s source=dashboard",claims["sub"])
     return {"status":"enabled","kill_switch":True}
 
@@ -539,8 +539,7 @@ async def update_execution_settings(
     if not changed:
         raise HTTPException(status_code=404, detail="Execution profile not found.")
     logger.info(
-        "TradeLocker execution_mode_changed user_id=%s connection_id=%s account_id=%s acc_num=%s environment=demo mode=%s",
-        claims["sub"], None, None, None,
-        payload.execution_mode.value,
+        "TradeLocker execution_mode_changed user_id=%s profile_ref=%s mode=%s",
+        claims["sub"], payload.profile_ref, payload.execution_mode.value,
     )
     return {"status": "updated", "execution_mode": payload.execution_mode.value, "profile_ref": payload.profile_ref}

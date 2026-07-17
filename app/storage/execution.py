@@ -53,6 +53,9 @@ class ExecutionRepository:
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     UNIQUE(user_sub, connection_id, account_id, acc_num)
                 );
+                CREATE TABLE IF NOT EXISTS operational_controls(
+                    key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL,updated_by TEXT
+                );
                 CREATE TABLE IF NOT EXISTS autonomous_snapshots (
                     id TEXT PRIMARY KEY, user_sub TEXT NOT NULL, connection_id TEXT NOT NULL,
                     account_id TEXT NOT NULL, acc_num TEXT NOT NULL, environment TEXT NOT NULL,
@@ -153,6 +156,16 @@ class ExecutionRepository:
             decision_columns={row["name"] for row in db.execute("PRAGMA table_info(autonomous_decision_runs)")}
             if "execution_json" not in decision_columns:
                 db.execute("ALTER TABLE autonomous_decision_runs ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{}'")
+
+    def kill_switch_enabled(self)->bool:
+        with self._connect() as db:row=db.execute("SELECT value FROM operational_controls WHERE key='kill_switch'").fetchone()
+        return settings.kill_switch_enabled if row is None else row["value"]=="enabled"
+
+    def enable_kill_switch(self,updated_by:str)->None:
+        now=utcnow().isoformat()
+        with self._connect() as db:db.execute("""INSERT INTO operational_controls(key,value,updated_at,updated_by)
+            VALUES('kill_switch','enabled',?,?) ON CONFLICT(key) DO UPDATE SET value='enabled',updated_at=excluded.updated_at,
+            updated_by=excluded.updated_by""",(now,updated_by))
 
     def get_or_create_settings(self, user_sub: str, connection_id: str, account_id: str, acc_num: str) -> dict[str, Any]:
         now = utcnow().isoformat()
