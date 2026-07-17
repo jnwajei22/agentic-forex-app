@@ -12,8 +12,10 @@ from app.services.market_data.history import (
     PaginatedCandleResult,
     TIMEFRAME_DURATION_MS,
     aggregate_hourly_candles_to_utc_days,
+    aggregate_complete_candles,
     get_candles_paginated,
     normalize_timeframe,
+    validate_candle_result,
 )
 
 
@@ -149,12 +151,14 @@ def test_normalizes_abbreviated_expanded_seconds_missing_volume_and_rejects_malf
     assert abbreviated.timestamp == END and abbreviated.volume == 0
     assert expanded.model_dump() == raw(END, abbreviated=False)
     for bad in (
-        {"t": END, "o": "1", "h": 2, "l": 1, "c": 1.5},
+        {"t": END, "o": "not-a-number", "h": 2, "l": 1, "c": 1.5},
         {"t": END, "o": 1, "h": 0, "l": 1, "c": 1.5},
         {"o": 1, "h": 2, "l": 1, "c": 1.5},
     ):
         with pytest.raises(ValueError):
             normalize_candle(bad)
+    numeric = normalize_candle({"t": str(seconds), "o": "0", "h": "2", "l": "0", "c": "1.5", "v": "0"})
+    assert numeric.timestamp == END and numeric.open == numeric.low == numeric.volume == 0
 
 
 def test_malformed_history_rows_are_discarded_at_boundary():
@@ -166,6 +170,14 @@ def test_malformed_history_rows_are_discarded_at_boundary():
 @pytest.mark.parametrize("alias", ["1D", "1d", "D", "day", "daily", "1440"])
 def test_daily_timeframe_aliases_send_documented_resolution(alias):
     assert normalize_timeframe(alias) == "1D"
+
+
+@pytest.mark.parametrize(("internal", "provider"), [
+    ("1d", "1D"), ("4h", "4H"), ("1h", "1H"), ("15m", "15m"),
+    ("30m", "30m"), ("5m", "5m"), ("1m", "1m"), ("1w", "1W"),
+])
+def test_all_canonical_timeframes_use_exact_tradelocker_values(internal, provider):
+    assert normalize_timeframe(internal) == provider
 
 
 def test_complete_hourly_broker_rows_aggregate_to_utc_daily_ohlcv():
@@ -188,6 +200,79 @@ def test_incomplete_utc_day_is_rejected_from_aggregation():
     daily, incomplete = aggregate_hourly_candles_to_utc_days(rows, required_count=1)
     assert daily == []
     assert incomplete == [datetime.fromtimestamp(day / 1000, timezone.utc).date().isoformat()]
+
+
+def _validated(timeframe, timestamps, *, requested, minimum, now):
+    resolution = normalize_timeframe(timeframe)
+    result = PaginatedCandleResult(
+        instrument_id="77", timeframe=resolution, requested_start_ms=timestamps[0],
+        requested_end_ms=now, estimated_candles=requested,
+        candles=[Candle(timestamp=stamp, open=1, high=2, low=.5, close=1.5, volume=0)
+                 for stamp in timestamps],
+        batches_requested=2, rows_received=len(timestamps), raw_count=len(timestamps),
+        stop_reason="provider_no_older_history",
+    )
+    return validate_candle_result(
+        result, symbol="EURUSD", requested_timeframe=timeframe,
+        requested_count=requested, minimum_usable=minimum, now_ms=now,
+    )
+
+
+def test_184_valid_four_hour_candles_are_partial_but_strategy_sufficient():
+    duration = TIMEFRAME_DURATION_MS["4H"]
+    start = int(datetime(2026, 1, 5, tzinfo=timezone.utc).timestamp() * 1000)
+    timestamps = [start + duration * index for index in range(184)]
+    result = _validated("4h", timestamps, requested=250, minimum=50,
+                        now=timestamps[-1] + duration)
+    assert result.complete and result.status == "partial"
+    assert result.usable_count == 184
+    assert result.warnings == ["partial_usable_history"]
+    assert "provider_request_failed" not in result.blocking_reasons
+
+
+def test_forming_candle_is_preserved_but_excluded_from_analysis():
+    duration = TIMEFRAME_DURATION_MS["1H"]
+    start = int(datetime(2026, 7, 13, tzinfo=timezone.utc).timestamp() * 1000)
+    timestamps = [start + duration * index for index in range(51)]
+    result = _validated("1h", timestamps, requested=51, minimum=50,
+                        now=timestamps[-1] + duration // 2)
+    assert result.complete and result.forming_candle_excluded
+    assert result.forming_candle.timestamp == timestamps[-1]
+    assert result.usable_count == 50
+
+
+def test_weekend_gaps_are_accepted_but_active_session_gaps_block():
+    duration = TIMEFRAME_DURATION_MS["4H"]
+    friday = int(datetime(2026, 7, 17, 20, tzinfo=timezone.utc).timestamp() * 1000)
+    monday = int(datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000)
+    weekend = _validated("4h", [friday, monday], requested=2, minimum=2,
+                         now=monday + duration)
+    assert weekend.complete and weekend.accepted_market_closure_gaps > 0
+    assert weekend.unexpected_gap_count == 0
+
+    monday_start = int(datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000)
+    active_gap = _validated("4h", [monday_start, monday_start + duration * 2],
+                            requested=2, minimum=2, now=monday_start + duration * 3)
+    assert not active_gap.complete
+    assert active_gap.blocking_reasons == ["missing_recent_intervals"]
+    assert active_gap.unexpected_gap_count == 1
+
+
+def test_one_hour_to_four_hour_aggregation_requires_all_constituents():
+    hour = TIMEFRAME_DURATION_MS["1H"]
+    start = int(datetime(2026, 7, 13, tzinfo=timezone.utc).timestamp() * 1000)
+    rows = [Candle(timestamp=start + hour * index, open=1 + index, high=2 + index,
+                   low=.5 + index, close=1.5 + index, volume=1) for index in range(8)]
+    aggregated, incomplete = aggregate_complete_candles(
+        rows, source_timeframe="1h", target_timeframe="4h", required_count=2
+    )
+    assert len(aggregated) == 2 and incomplete == []
+    assert aggregated[0].open == 1 and aggregated[0].close == 4.5
+    assert aggregated[0].volume == 4
+    rejected, incomplete = aggregate_complete_candles(
+        rows[:-1], source_timeframe="1h", target_timeframe="4h", required_count=2
+    )
+    assert len(rejected) == 1 and incomplete
 
 
 @pytest.mark.asyncio

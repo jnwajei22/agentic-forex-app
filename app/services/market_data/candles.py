@@ -21,8 +21,20 @@ def normalize_candle(candle: Mapping[str, Any]) -> Candle:
     }
     if values["volume"] is None:
         values["volume"] = 0.0
+    timestamp = values["timestamp"]
+    if isinstance(timestamp, str):
+        try:
+            values["timestamp"] = float(timestamp)
+        except ValueError:
+            pass
     for field in ("open", "high", "low", "close", "volume"):
         value = values[field]
+        if isinstance(value, str):
+            try:
+                value = float(value)
+                values[field] = value
+            except ValueError:
+                pass
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
             raise ValueError(f"Candle {field} must be numeric.")
     try:

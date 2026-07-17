@@ -14,6 +14,7 @@ from app.services.market_data.history import (
     estimate_candles,
     normalize_timeframe,
     parse_utc_timestamp,
+    validate_candle_result,
 )
 
 
@@ -74,6 +75,13 @@ async def get_candle_history(
             raise TradeLockerError(
                 "get_candles", "TradeLocker returned no usable candle data.", code="no_data"
             )
+        if result.symbol is None:
+            result = validate_candle_result(
+                result, symbol=pair, requested_timeframe=timeframe,
+                requested_count=count if explicit_start is None else None,
+                minimum_usable=count if explicit_start is None else 1,
+                now_ms=explicit_end,
+            )
         return result
     if provider == "mock":
         available = load_mock_candles(DEFAULT_MOCK_CANDLE_PATH).get(pair, [])
@@ -96,7 +104,7 @@ async def get_candle_history(
                 else len(candles) >= count
             )
         )
-        return PaginatedCandleResult(
+        result = PaginatedCandleResult(
             instrument_id=pair.replace("/", ""), timeframe=resolution,
             requested_start_ms=start_ms, requested_end_ms=end_ms,
             estimated_candles=estimate_candles(start_ms, end_ms, resolution),
@@ -107,6 +115,12 @@ async def get_candle_history(
                 f"Mock provider returned {len(candles)} of approximately "
                 f"{estimate_candles(start_ms, end_ms, resolution)} candles."
             ),
+        )
+        return validate_candle_result(
+            result, symbol=pair, requested_timeframe=timeframe,
+            requested_count=count if explicit_start is None else None,
+            minimum_usable=count if explicit_start is None else 1,
+            now_ms=end_ms,
         )
     raise ValueError("MARKET_DATA_PROVIDER must be 'mock' or 'tradelocker'.")
 

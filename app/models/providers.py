@@ -66,6 +66,7 @@ class MarketSeries(BaseModel):
     client_usage: ClientUsage = Field(default_factory=ClientUsage)
     series_id: str | None = None
     series_expires_at: datetime | None = None
+    candle_result: dict[str, Any] | None = None
 
 
 class EconomicEvent(BaseModel):

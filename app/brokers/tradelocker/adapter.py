@@ -36,9 +36,11 @@ class TradeLockerAdapter(BrokerAdapter):
     async def get_candles(
         self, pair: str, timeframe: str, lookback: int | None = 300, *,
         start_time_ms: int | None = None, end_time_ms: int | None = None,
+        minimum_usable: int | None = None,
     ) -> PaginatedCandleResult:
         return await self.client.get_candles(
-            pair, timeframe, lookback, start_time_ms=start_time_ms, end_time_ms=end_time_ms
+            pair, timeframe, lookback, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
+            minimum_usable=minimum_usable,
         )
 
     async def submit_order(self, preview: OrderPreview) -> dict:

@@ -545,10 +545,14 @@ class AutonomousDemoService:
                 except (TradeLockerError, AutonomousExecutionError):
                     raise self._snapshot_failure(f"{pair.lower()}_instrument_metadata") from None
                 d1 = h4 = h1 = m15 = None
+                timeframe_results: dict[str, dict[str, Any]] = {}
+                timeframe_failures: list[str] = []
                 if autonomous:
                     for timeframe, count in (("1d", 190), ("4h", 250), ("1h", 200), ("15m", 200)):
                         try:
-                            series = await client.get_candles(pair, timeframe, count)
+                            series = await client.get_candles(
+                                pair, timeframe, count, minimum_usable=50
+                            )
                         except TradeLockerError as exc:
                             diagnostics = {
                                 "requested_timeframe": timeframe,
@@ -559,23 +563,59 @@ class AutonomousDemoService:
                                 "mapping_failure": exc.details.get("mapping_failure"),
                             }
                             diagnostics.update(exc.details)
-                            raise self._snapshot_failure(
-                                f"{pair.lower()}_candles_{timeframe}", diagnostics
-                            ) from None
-                        if not series.complete:
-                            raise self._snapshot_failure(
-                                f"{pair.lower()}_candles_{timeframe}", series.diagnostics()
+                            reason = exc.code if exc.code in {
+                                "unsupported_timeframe", "no_candles_returned"
+                            } else "provider_request_failed"
+                            timeframe_results[timeframe] = {
+                                "status": "blocked", "symbol": pair,
+                                "requested_timeframe": timeframe,
+                                "provider_timeframe": normalize_timeframe(timeframe),
+                                "source": "direct", "candles": [],
+                                "metadata": diagnostics,
+                                "blocking_reasons": [reason], "warnings": [],
+                            }
+                            timeframe_failures.append(
+                                f"{pair.lower()}_candles_{timeframe}_{reason}"
+                            )
+                            continue
+                        canonical = series.canonical_dict() if hasattr(series, "canonical_dict") else {
+                            "status": "ok" if series.complete else "blocked",
+                            "symbol": pair, "requested_timeframe": timeframe,
+                            "provider_timeframe": normalize_timeframe(timeframe),
+                            "source": "direct",
+                            "candles": [c.model_dump(mode="json") for c in series.candles],
+                            "metadata": {"usable_count": len(series.candles),
+                                         "is_sufficient": series.complete},
+                            "blocking_reasons": [] if series.complete else ["insufficient_usable_candles"],
+                            "warnings": [],
+                        }
+                        timeframe_results[timeframe] = canonical
+                        if canonical["blocking_reasons"]:
+                            timeframe_failures.extend(
+                                f"{pair.lower()}_candles_{timeframe}_{reason}"
+                                for reason in canonical["blocking_reasons"]
                             )
                         if timeframe == "1d": d1 = series
                         elif timeframe == "4h": h4 = series
                         elif timeframe == "1h": h1 = series
                         else: m15 = series
+                    if timeframe_failures:
+                        raise AutonomousExecutionError(
+                            "market_snapshot_unavailable",
+                            "One or more required TradeLocker candle timeframes failed validation.",
+                            reasons=timeframe_failures,
+                            details={"missing_component": "candle_history",
+                                     "failing_timeframes": [key for key, value in timeframe_results.items()
+                                                            if value["blocking_reasons"]],
+                                     "timeframes": timeframe_results},
+                        )
                 market[pair] = {"quote": quote,"bid":bid,"ask":ask,"spread":ask-bid,"quote_retrieved_at":utcnow().isoformat(),
                     "instrument_metadata":instrument.__dict__,
-                    "candles_1d": [c.model_dump(mode="json") for c in d1.candles] if d1 else [],
-                    "candles_4h": [c.model_dump(mode="json") for c in h4.candles] if h4 else [],
-                    "candles_1h": [c.model_dump(mode="json") for c in h1.candles] if h1 else [],
-                    "candles_15m": [c.model_dump(mode="json") for c in m15.candles] if m15 else [],
+                    "candles_1d": timeframe_results.get("1d", {}).get("candles", []),
+                    "candles_4h": timeframe_results.get("4h", {}).get("candles", []),
+                    "candles_1h": timeframe_results.get("1h", {}).get("candles", []),
+                    "candles_15m": timeframe_results.get("15m", {}).get("candles", []),
+                    "timeframes": timeframe_results,
                     "complete": True}
         finally:
             await client.aclose()

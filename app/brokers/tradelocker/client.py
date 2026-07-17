@@ -8,11 +8,14 @@ import jwt
 
 from app.services.market_data.history import (
     MAX_CANDLES,
+    CANONICAL_TIMEFRAMES,
     TIMEFRAME_DURATION_MS,
     PaginatedCandleResult,
     aggregate_hourly_candles_to_utc_days,
+    aggregate_complete_candles,
     get_candles_paginated,
     normalize_timeframe,
+    validate_candle_result,
 )
 
 
@@ -437,12 +440,17 @@ class TradeLockerClient:
         *,
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
+        minimum_usable: int | None = None,
     ) -> PaginatedCandleResult:
         try:
             resolution = normalize_timeframe(timeframe)
         except ValueError:
             raise TradeLockerError(
-                "get_candles", "Unsupported TradeLocker timeframe.", code="invalid_timeframe"
+                "get_candles", "Unsupported TradeLocker timeframe.", code="unsupported_timeframe",
+                details={"requested_timeframe": timeframe,
+                         "supported_internal_values": list(CANONICAL_TIMEFRAMES),
+                         "provider_value_attempted": None,
+                         "error_category": "unsupported_timeframe"},
             ) from None
         if lookback is not None and not 1 <= lookback <= MAX_CANDLES:
             raise TradeLockerError(
@@ -478,10 +486,16 @@ class TradeLockerClient:
             )
             direct.requested_timeframe = timeframe
             direct.provider_timeframe_sent = resolution
-            if direct.complete or resolution != "1D" or effective_count is None:
+            required = minimum_usable or effective_count or 1
+            direct = validate_candle_result(
+                direct, symbol=symbol, requested_timeframe=timeframe,
+                requested_count=effective_count, minimum_usable=required,
+                now_ms=end_ms,
+            )
+            if direct.complete or resolution not in {"1D", "4H"} or effective_count is None:
                 return direct
         except TradeLockerError as exc:
-            if resolution != "1D" or effective_count is None:
+            if resolution not in {"1D", "4H"} or effective_count is None:
                 raise
             direct_error = exc
         except ValueError as exc:
@@ -491,7 +505,7 @@ class TradeLockerClient:
         # enough direct daily rows. Fall back only to the same account,
         # instrument and INFO route, and aggregate verified 1H broker bars.
         assert effective_count is not None
-        fallback_span = effective_count * 2 * TIMEFRAME_DURATION_MS["1D"]
+        fallback_span = effective_count * 2 * TIMEFRAME_DURATION_MS[resolution]
         fallback_start = end_ms - fallback_span
         fallback_diagnostics: dict[str, Any]
 
@@ -509,12 +523,20 @@ class TradeLockerClient:
             )
             hourly.requested_timeframe = timeframe
             hourly.provider_timeframe_sent = "1H"
-            daily, incomplete_days = aggregate_hourly_candles_to_utc_days(
-                hourly.candles, required_count=effective_count
-            )
+            if resolution == "1D":
+                aggregated_rows, incomplete_days = aggregate_hourly_candles_to_utc_days(
+                    hourly.candles, required_count=effective_count
+                )
+            else:
+                aggregated_rows, incomplete_days = aggregate_complete_candles(
+                    hourly.candles, source_timeframe="1H", target_timeframe="4H",
+                    required_count=effective_count,
+                )
             fallback_diagnostics = hourly.diagnostics()
             fallback_diagnostics["incomplete_utc_days"] = incomplete_days
-            fallback_diagnostics["complete_daily_rows"] = len(daily)
+            fallback_diagnostics["complete_aggregate_rows"] = len(aggregated_rows)
+            if resolution == "1D":
+                fallback_diagnostics["complete_daily_rows"] = len(aggregated_rows)
         except (TradeLockerError, ValueError) as exc:
             fallback_diagnostics = {
                 "requested_timeframe": timeframe,
@@ -525,12 +547,12 @@ class TradeLockerClient:
                 "mapping_failure": None,
                 "candle_source": "aggregated_1H",
             }
-            daily = []
+            aggregated_rows = []
 
         if direct_error is not None:
             direct_diagnostics = {
                 "requested_timeframe": timeframe,
-                "provider_timeframe_sent": "1D",
+                "provider_timeframe_sent": resolution,
                 "http_status": direct_error.status_code,
                 "broker_error_category": direct_error.code,
                 "rows_received": 0,
@@ -540,27 +562,42 @@ class TradeLockerClient:
         else:
             direct_diagnostics = direct.diagnostics()
 
-        if len(daily) >= effective_count:
-            return PaginatedCandleResult(
-                instrument_id=str(instrument_id), timeframe="1D",
+        required = minimum_usable or effective_count
+        if len(aggregated_rows) >= required:
+            aggregated = PaginatedCandleResult(
+                instrument_id=str(instrument_id), timeframe=resolution,
                 requested_start_ms=fallback_start, requested_end_ms=end_ms,
-                estimated_candles=effective_count, candles=daily,
+                estimated_candles=effective_count, candles=aggregated_rows,
                 batches_requested=hourly.batches_requested, complete=True,
                 stop_reason="aggregated_complete_utc_days", requested_timeframe=timeframe,
-                provider_timeframe_sent="1H", rows_received=len(daily),
+                provider_timeframe_sent="1H", rows_received=len(aggregated_rows),
                 source="aggregated_1H", fallback_diagnostics=direct_diagnostics,
+                aggregation_source_timeframe="1H",
+                incomplete_days_excluded=incomplete_days,
+            )
+            return validate_candle_result(
+                aggregated, symbol=symbol, requested_timeframe=timeframe,
+                requested_count=effective_count, minimum_usable=minimum_usable or effective_count,
+                now_ms=end_ms,
             )
 
-        return PaginatedCandleResult(
-            instrument_id=str(instrument_id), timeframe="1D",
+        incomplete = PaginatedCandleResult(
+            instrument_id=str(instrument_id), timeframe=resolution,
             requested_start_ms=fallback_start, requested_end_ms=end_ms,
-            estimated_candles=effective_count, candles=daily,
+            estimated_candles=effective_count, candles=aggregated_rows,
             batches_requested=hourly.batches_requested if "hourly" in locals() else 0,
-            complete=False, warning="Complete daily TradeLocker candles are unavailable.",
-            stop_reason="incomplete_daily_aggregation", requested_timeframe=timeframe,
-            provider_timeframe_sent="1D", http_status=direct_diagnostics["http_status"],
+            complete=False, warning="Complete TradeLocker candles are unavailable.",
+            stop_reason="incomplete_aggregation", requested_timeframe=timeframe,
+            provider_timeframe_sent=resolution, http_status=direct_diagnostics["http_status"],
             broker_error_category=direct_diagnostics["broker_error_category"] or "incomplete_history",
             rows_received=direct_diagnostics["rows_received"],
             mapping_failure=direct_diagnostics["mapping_failure"], source="direct",
             fallback_diagnostics=fallback_diagnostics,
+            aggregation_source_timeframe="1H",
+            incomplete_days_excluded=fallback_diagnostics.get("incomplete_utc_days", []),
+        )
+        return validate_candle_result(
+            incomplete, symbol=symbol, requested_timeframe=timeframe,
+            requested_count=effective_count, minimum_usable=minimum_usable or effective_count,
+            now_ms=end_ms,
         )

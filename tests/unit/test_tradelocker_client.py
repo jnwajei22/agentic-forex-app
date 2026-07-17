@@ -297,7 +297,7 @@ async def test_submit_order_remains_unimplemented():
 
 @pytest.mark.asyncio
 async def test_direct_daily_candles_use_documented_resolution_and_map_abbreviations():
-    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
+    end = int(datetime(2026, 7, 18, tzinfo=timezone.utc).timestamp() * 1000)
     day = 86_400_000
     seen = []
     client = _client(lambda request: httpx.Response(500))
@@ -310,7 +310,7 @@ async def test_direct_daily_candles_use_documented_resolution_and_map_abbreviati
         seen.append(kwargs)
         assert kwargs["instrument_id"] == 77 and kwargs["route_id"] == 9
         assert kwargs["resolution"] == "1D"
-        timestamps = [end - day, end]
+        timestamps = [end - day * 2, end - day]
         return {"t": timestamps, "o": [1.0, 2.0], "h": [1.2, 2.2],
                 "l": [.9, 1.9], "c": [1.1, 2.1], "v": [0, 5]}
 
@@ -329,8 +329,8 @@ async def test_direct_daily_candles_use_documented_resolution_and_map_abbreviati
 @pytest.mark.asyncio
 async def test_daily_fallback_aggregates_only_same_account_symbol_and_info_route():
     hour, day = 3_600_000, 86_400_000
-    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
-    first_day = end - (end % day) - day
+    end = int(datetime(2026, 7, 18, tzinfo=timezone.utc).timestamp() * 1000)
+    first_day = end - (end % day) - day * 2
     hourly_rows = [
         {"t": first_day + hour * index, "o": 1 + index, "h": 2 + index,
          "l": .5 + index, "c": 1.5 + index, "v": 1}
@@ -368,8 +368,8 @@ async def test_daily_fallback_aggregates_only_same_account_symbol_and_info_route
 @pytest.mark.asyncio
 async def test_incomplete_hourly_fallback_blocks_with_exact_diagnostics():
     hour, day = 3_600_000, 86_400_000
-    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
-    first_day = end - (end % day) - day
+    end = int(datetime(2026, 7, 18, tzinfo=timezone.utc).timestamp() * 1000)
+    first_day = end - (end % day) - day * 2
     hourly_rows = [{"t": first_day + hour * index, "o": 1, "h": 2,
                     "l": .5, "c": 1.5, "v": 0} for index in range(47)]
     client = _client(lambda request: httpx.Response(500))
@@ -388,7 +388,7 @@ async def test_incomplete_hourly_fallback_blocks_with_exact_diagnostics():
 
     assert not result.complete
     diagnostics = result.diagnostics()
-    assert diagnostics["requested_timeframe"] == "1440"
+    assert diagnostics["requested_timeframe"] == "1d"
     assert diagnostics["provider_timeframe_sent"] == "1D"
     assert diagnostics["http_status"] == 200
     assert diagnostics["broker_error_category"] == "incomplete_history"
@@ -400,7 +400,7 @@ async def test_incomplete_hourly_fallback_blocks_with_exact_diagnostics():
 
 @pytest.mark.asyncio
 async def test_daily_candles_cannot_cross_account_or_symbol_context():
-    end = int(datetime(2026, 7, 17, tzinfo=timezone.utc).timestamp() * 1000)
+    end = int(datetime(2026, 7, 18, tzinfo=timezone.utc).timestamp() * 1000)
 
     async def retrieve(account_id, account_number, symbol, instrument_id, close):
         client = _client(lambda request: httpx.Response(500),
@@ -413,7 +413,7 @@ async def test_daily_candles_cannot_cross_account_or_symbol_context():
         async def history(**kwargs):
             assert client.account_id == account_id and client.account_number == account_number
             assert kwargs["instrument_id"] == instrument_id
-            return [{"t": end, "o": close, "h": close, "l": close,
+            return [{"t": end - 86_400_000, "o": close, "h": close, "l": close,
                      "c": close, "v": 0}]
 
         client._resolve_instrument = resolve
@@ -426,3 +426,52 @@ async def test_daily_candles_cannot_cross_account_or_symbol_context():
     gbpusd = await retrieve("account-b", "8", "GBPUSD", 88, 1.3)
     assert eurusd.close == 1.1
     assert gbpusd.close == 1.3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("timeframe", "provider", "duration"), [
+    ("4h", "4H", 14_400_000), ("1h", "1H", 3_600_000), ("15m", "15m", 900_000),
+])
+async def test_strategy_timeframes_use_direct_normalized_history(timeframe, provider, duration):
+    start = int(datetime(2026, 7, 13, tzinfo=timezone.utc).timestamp() * 1000)
+    rows = [{"t": start + duration * index, "o": "0", "h": "2",
+             "l": "0", "c": "1.5", "v": "0"} for index in range(50)]
+    end = rows[-1]["t"] + duration
+    client = _client(lambda request: httpx.Response(500))
+
+    async def resolve(symbol):
+        assert symbol == "EURUSD"
+        return 77, 9
+
+    async def history(**kwargs):
+        assert kwargs["resolution"] == provider
+        return [row for row in rows
+                if kwargs["start_time_ms"] <= row["t"] <= kwargs["end_time_ms"]]
+
+    client._resolve_instrument = resolve
+    client._history_page = history
+    result = await client.get_candles(
+        "EURUSD", timeframe, 50, end_time_ms=end, minimum_usable=50
+    )
+    await client.aclose()
+
+    assert result.complete and result.source == "direct"
+    assert result.provider_timeframe_sent == provider
+    assert result.usable_count == 50
+    assert result.candles[0].open == result.candles[0].low == result.candles[0].volume == 0
+    canonical = result.canonical_dict()
+    assert canonical["metadata"]["is_sufficient"] is True
+    assert canonical["blocking_reasons"] == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_timeframe_returns_canonical_diagnostics_without_network():
+    client = _client(lambda request: (_ for _ in ()).throw(AssertionError("network called")))
+    with pytest.raises(TradeLockerError) as error:
+        await client.get_candles("EURUSD", "2h", 50)
+    await client.aclose()
+    assert error.value.code == "unsupported_timeframe"
+    assert error.value.details["requested_timeframe"] == "2h"
+    assert "4h" in error.value.details["supported_internal_values"]
+    assert error.value.details["provider_value_attempted"] is None
+    assert error.value.details["error_category"] == "unsupported_timeframe"

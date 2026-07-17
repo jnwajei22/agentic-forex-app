@@ -385,7 +385,7 @@ class SnapshotClient:
                 "minOrderQty": 0.01, "maxOrderQty": 10, "quoteCurrency": "USD",
                 "minStopLossDistance": 0.0001, "commissionPerLot": 0, "leverage": 100}}}
 
-    async def get_candles(self, symbol, timeframe, count):
+    async def get_candles(self, symbol, timeframe, count, **kwargs):
         self.calls.append(f"candles:{symbol}:{timeframe}:{count}")
         self._fail(f"candles_{timeframe}")
         return SimpleNamespace(complete=True, candles=[])
@@ -490,6 +490,7 @@ async def test_autonomous_snapshot_succeeds_when_required_daily_candles_are_avai
     assert result["status"] == "ok"
     assert "candles:EURUSD:1d:190" in calls
     assert result["market"]["pairs"]["EURUSD"]["complete"] is True
+    assert set(result["market"]["pairs"]["EURUSD"]["timeframes"]) == {"1d", "4h", "1h", "15m"}
     assert all(client.place_order_calls == 0 for client in clients)
 
 
@@ -501,11 +502,13 @@ async def test_autonomous_daily_candle_failure_exposes_request_diagnostics(tmp_p
     with pytest.raises(AutonomousExecutionError) as error:
         await service.snapshot("user", profile, "EURUSD", autonomous=True)
     payload = error.value.as_dict()
-    assert payload["missing_component"] == "eurusd_candles_1d"
-    assert payload["requested_timeframe"] == "1d"
-    assert payload["provider_timeframe_sent"] == "1D"
-    assert payload["rows_received"] == 0
-    assert payload["mapping_failure"] is None
+    assert payload["missing_component"] == "candle_history"
+    assert payload["failing_timeframes"] == ["1d"]
+    daily = payload["timeframes"]["1d"]
+    assert daily["provider_timeframe"] == "1D"
+    assert daily["metadata"]["rows_received"] == 0
+    assert daily["metadata"]["mapping_failure"] is None
+    assert "eurusd_candles_1d_provider_request_failed" in payload["blocking_reasons"]
     assert all(client.place_order_calls == 0 for client in clients)
 
 

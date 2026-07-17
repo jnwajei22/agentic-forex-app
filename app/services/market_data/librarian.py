@@ -84,7 +84,8 @@ async def get_market_series(
             normalized, resolution, None if start_ms is not None else count,
             start_time_ms=start_ms, end_time_ms=end_ms,
         )
-        candles = _market_candles(history.candles, volume_type="tick")
+        analysis_rows = history.usable_candles if history.symbol is not None else history.candles
+        candles = _market_candles(analysis_rows, volume_type="tick")
         if len(candles) > response_limit:
             raise ProviderError(
                 "tradelocker", "response_too_large",
@@ -101,6 +102,7 @@ async def get_market_series(
             warning=history.warning, stop_reason=history.stop_reason,
             malformed_candles_discarded=history.malformed_discarded,
             retrieved_at=datetime.now(timezone.utc), candles=candles,
+            candle_result=history.canonical_dict(),
         )
     if source == "finnhub":
         duration = TIMEFRAME_DURATION_MS[resolution]
