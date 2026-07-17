@@ -815,7 +815,8 @@ async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short
             user,profile_id,normalize_pair(symbol),exc.code,",".join(exc.reasons))
         return _demo_review_error(exc.code,
             "The demo order preview was blocked by deterministic server validation.",exc.reasons,
-            symbol=symbol,order_type=order_type)
+            symbol=symbol,order_type=order_type,calculation=exc.details.get("calculation"),
+            warnings=exc.details.get("warnings"))
     except Exception:
         logger.error("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=internal_review_error",
             user,profile_id,normalize_pair(symbol))
@@ -824,16 +825,17 @@ async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short
 
 
 def _demo_review_error(category:str,message:str,reasons:list[str]|None=None,*,
-                       symbol:str|None=None,order_type:str|None=None)->dict[str,Any]:
+                       symbol:str|None=None,order_type:str|None=None,
+                       calculation:dict[str,Any]|None=None,warnings:list[str]|None=None)->dict[str,Any]:
     codes=reasons or [category]
     blockers=[{"code":code,"message":DEMO_BLOCKING_MESSAGES.get(code,
         "A required server-side validation did not pass.")} for code in codes]
     return {"schema_version":"1.0","status":"blocked","error":category,
         "error_category":category,"message":message,"blocking_reasons":blockers,
         "preview_id":None,"expires_at":None,"submission_allowed":False,
-        "calculation":{"requested_symbol":normalize_pair(symbol) if symbol else None,
+        "calculation":calculation or {"requested_symbol":normalize_pair(symbol) if symbol else None,
             "order_type":order_type,"quantity":None,"estimated_risk":None,"estimated_margin":None},
-        "quantity":None,"estimated_risk":None,"estimated_margin":None}
+        "warnings":warnings or [],"quantity":None,"estimated_risk":None,"estimated_margin":None}
 
 
 async def submit_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:

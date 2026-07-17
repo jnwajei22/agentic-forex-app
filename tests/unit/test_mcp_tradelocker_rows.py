@@ -195,6 +195,10 @@ async def test_risk_validation_failure_exposes_exact_safe_blockers(monkeypatch, 
                 "internal validation context must not be returned",
                 status="rejected",
                 reasons=["provider_unavailable", "reward_risk_too_low"],
+                details={"calculation": {"requested_symbol": "EURUSD",
+                    "risk_distance": 0.0022, "reward_distance": 0.0028,
+                    "spread_adjustment": 0.0002, "reward_risk": 1.272727},
+                    "warnings": ["provider_unavailable"]},
             )
 
     monkeypatch.setattr(tools, "AutonomousDemoService", RiskRejectedService)
@@ -219,6 +223,32 @@ async def test_risk_validation_failure_exposes_exact_safe_blockers(monkeypatch, 
     assert result["preview_id"] is None
     assert result["submission_allowed"] is False
     assert result["calculation"]["requested_symbol"] == "EURUSD"
+    assert result["calculation"]["spread_adjustment"] == 0.0002
+    assert result["calculation"]["reward_risk"] == 1.272727
+    assert result["warnings"] == ["provider_unavailable"]
     assert "blocking_codes=provider_unavailable,reward_risk_too_low" in caplog.text
     assert "internal validation context" not in str(result)
     assert "internal validation context" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_snapshot_tool_returns_exact_missing_component(monkeypatch):
+    class MissingInstrumentService:
+        async def snapshot(self, user, profile, symbol):
+            raise AutonomousExecutionError(
+                "market_snapshot_unavailable",
+                "The required TradeLocker instrument metadata component is unavailable or unmappable.",
+                reasons=["eurusd_instrument_metadata_unavailable"],
+                details={"missing_component": "eurusd_instrument_metadata"},
+            )
+
+    monkeypatch.setattr(tools, "AutonomousDemoService", MissingInstrumentService)
+    token = set_current_claims({"sub": "user"})
+    try:
+        result = await tools.get_demo_trading_snapshot("profile-safe", "EURUSD")
+    finally:
+        reset_current_claims(token)
+
+    assert result["error"] == "market_snapshot_unavailable"
+    assert result["missing_component"] == "eurusd_instrument_metadata"
+    assert result["blocking_reasons"] == ["eurusd_instrument_metadata_unavailable"]

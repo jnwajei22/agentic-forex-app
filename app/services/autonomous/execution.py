@@ -6,7 +6,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -29,12 +29,15 @@ ALLOWED_PAIRS = ("EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD")
 
 
 class AutonomousExecutionError(RuntimeError):
-    def __init__(self, code: str, message: str, *, status: str = "blocked", reasons: list[str] | None = None) -> None:
+    def __init__(self, code: str, message: str, *, status: str = "blocked",
+                 reasons: list[str] | None = None, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code, self.status, self.reasons = code, status, reasons or [code]
+        self.details = details or {}
 
     def as_dict(self) -> dict[str, Any]:
-        return {"schema_version": "1.0", "status": self.status, "error": self.code, "message": str(self), "blocking_reasons": self.reasons}
+        return {"schema_version": "1.0", "status": self.status, "error": self.code,
+            "message": str(self), "blocking_reasons": self.reasons, **self.details}
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,8 @@ class InstrumentMetadata:
     minimum_stop_distance: float
     commission_per_lot: float
     leverage: float | None = None
+    tick_size: float | None = None
+    price_precision: int | None = None
 
 
 def normalize_pair(pair: str) -> str:
@@ -87,7 +92,7 @@ def _find_value(value: Any, aliases: tuple[str, ...]) -> Any:
     targets = {alias.lower() for alias in aliases}
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.lower() in targets and item is not None:
+            if key.lower() in targets and item is not None and not isinstance(item, (dict, list)):
                 return item
         for item in value.values():
             found = _find_value(item, aliases)
@@ -131,18 +136,35 @@ def parse_instrument_metadata(payload: dict[str, Any], pair: str) -> InstrumentM
     route_id = trade_route or _find_value(details, ("tradeRouteId", "routeId"))
     instrument_id = payload.get("instrument_id")
     quote = _find_value(combined, ("quoteCurrency", "quotingCurrency", "currency")) or pair[3:]
-    max_value = _find_value(combined, ("maxOrderQty", "maxQuantity", "maxLots"))
+    max_value = _find_value(combined, ("maxOrderQty", "maxQuantity", "maxLots", "maxLot"))
+    precision_value = _find_value(combined, ("pricePrecision", "digits", "decimalPlaces"))
+    precision = int(precision_value) if isinstance(precision_value, (int, float)) and 0 <= int(precision_value) <= 10 else None
+    tick_value = _find_value(combined, ("tickSize", "minPriceIncrement", "priceIncrement"))
+    explicit_pip = _find_value(combined, ("pipSize", "pipValue"))
+    tick_size = (_positive(tick_value, "tick size") if tick_value is not None
+        else 10 ** -precision if precision is not None else None)
+    if explicit_pip is not None:
+        pip_size = _positive(explicit_pip, "pip size")
+    elif tick_size is not None and len(pair) == 6:
+        # TradeLocker exposes fractional-pip tick tiers for these non-JPY forex pairs.
+        pip_size = tick_size * 10 if pair[3:] != "JPY" else tick_size
+    else:
+        raise AutonomousExecutionError("position_size_unverifiable", "Broker pip size is unverifiable.", status="rejected")
+    if tick_size is None:
+        tick_size = pip_size
+    if precision is None:
+        precision = max(0, -Decimal(str(tick_size)).normalize().as_tuple().exponent)
     return InstrumentMetadata(
         instrument_id=str(instrument_id) if instrument_id is not None else "",
         route_id=str(route_id) if route_id is not None else "",
         contract_size=_positive(_find_value(combined, ("contractSize", "lotSize", "unitsPerLot")), "contract size"),
-        pip_size=_positive(_find_value(combined, ("pipSize", "pipValue", "priceIncrement")), "pip size"),
+        pip_size=pip_size,
         lot_step=_positive(_find_value(combined, ("lotStep", "qtyStep", "quantityStep", "minOrderQtyIncrement")), "quantity increment"),
-        min_lots=_positive(_find_value(combined, ("minOrderQty", "minQuantity", "minLots")), "minimum quantity"),
+        min_lots=_positive(_find_value(combined, ("minOrderQty", "minQuantity", "minLots", "minLot")), "minimum quantity"),
         max_lots=_positive(max_value, "maximum quantity") if max_value is not None else None,
         quote_currency=str(quote).upper(),
         minimum_stop_distance=_nonnegative(
-            _find_value(combined, ("minStopLossDistance", "stopLossDistance", "stopsLevel")),
+            _find_value(combined, ("minStopLossDistance", "stopLossDistance", "stopsLevel")) or tick_size,
             "minimum stop distance",
         ),
         commission_per_lot=_nonnegative(
@@ -150,7 +172,41 @@ def parse_instrument_metadata(payload: dict[str, Any], pair: str) -> InstrumentM
             "commission",
         ),
         leverage=_positive(_find_value(combined,("leverage","effectiveLeverage")),"leverage") if _find_value(combined,("leverage","effectiveLeverage")) is not None else None,
+        tick_size=tick_size, price_precision=precision,
     )
+
+
+def calculate_reward_risk(
+    *, entry: float, stop_loss: float, take_profit: float, bid: float, ask: float,
+    metadata: InstrumentMetadata, minimum_reward_risk: float, side: str,
+    order_type: str,
+) -> dict[str, Any]:
+    """Return conservative broker-rounded reward/risk with one spread cost."""
+    tick = Decimal(str(metadata.tick_size or metadata.pip_size))
+
+    def rounded(value: float) -> Decimal:
+        return (Decimal(str(value)) / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+
+    rounded_entry, rounded_stop, rounded_target = map(rounded, (entry, stop_loss, take_profit))
+    rounded_bid, rounded_ask = rounded(bid), rounded(ask)
+    gross_risk = abs(rounded_entry - rounded_stop)
+    gross_reward = abs(rounded_target - rounded_entry)
+    spread = max(Decimal("0"), rounded_ask - rounded_bid)
+    adjusted_risk = gross_risk + spread
+    adjusted_reward = max(Decimal("0"), gross_reward - spread)
+    reward_risk = adjusted_reward / adjusted_risk if adjusted_risk else Decimal("0")
+    return {
+        "rounded_entry": float(rounded_entry), "rounded_stop_loss": float(rounded_stop),
+        "rounded_take_profit": float(rounded_target), "quote_bid": float(rounded_bid),
+        "quote_ask": float(rounded_ask), "tick_size": float(tick),
+        "price_precision": metadata.price_precision,
+        "entry_price_basis": "requested_limit" if order_type == "limit" else "ask" if side == "long" else "bid",
+        "gross_risk_distance": float(gross_risk), "gross_reward_distance": float(gross_reward),
+        "spread_adjustment": float(spread), "risk_distance": float(adjusted_risk),
+        "reward_distance": float(adjusted_reward), "reward_risk": float(reward_risk),
+        "minimum_reward_risk": float(Decimal(str(minimum_reward_risk))),
+        "comparison_tolerance": 0.0,
+    }
 
 
 def calculate_broker_position_size(
@@ -204,6 +260,25 @@ class AutonomousDemoService:
         self.finnhub_factory, self.fred_factory = finnhub_factory, fred_factory
 
     def _kill_switch(self)->bool:return self.execution.kill_switch_enabled()
+
+    @staticmethod
+    def _provider_requirements(context: VerifiedDemoContext, autonomous: bool) -> tuple[bool, bool]:
+        config = context.risk.get("strategy_config", {})
+        finnhub_required = autonomous or bool(
+            config.get("require_finnhub_for_manual") or config.get("required_market_events")
+        )
+        fred_required = bool(config.get("required_macro_series"))
+        return finnhub_required, fred_required
+
+    @staticmethod
+    def _snapshot_failure(component: str) -> AutonomousExecutionError:
+        safe_component = component.replace("-", "_")
+        return AutonomousExecutionError(
+            "market_snapshot_unavailable",
+            f"The required TradeLocker {safe_component.replace('_', ' ')} component is unavailable or unmappable.",
+            reasons=[f"{safe_component}_unavailable"],
+            details={"missing_component": safe_component},
+        )
 
     async def context(self, user_sub: str, profile_ref: str, *, require_mode: bool = True,
                       allow_autonomous: bool = False) -> VerifiedDemoContext:
@@ -275,18 +350,17 @@ class AutonomousDemoService:
         reasons = []
         context = None
         try:
-            context = await self.context(user_sub, profile_ref, require_mode=False)
+            context = await self.context(user_sub, profile_ref, require_mode=False, allow_autonomous=True)
             if context.execution_mode == ExecutionMode.READ_ONLY:
                 reasons.append("execution_mode_read_only")
         except AutonomousExecutionError as exc:
             reasons.extend(exc.reasons)
         if self._kill_switch():
             reasons.append("kill_switch_enabled")
-        if not settings.finnhub_enabled or not settings.finnhub_api_key:
+        finnhub_required, fred_required = self._provider_requirements(context, context.execution_mode == ExecutionMode.DEMO_AUTONOMOUS) if context else (False, False)
+        if finnhub_required and (not settings.finnhub_enabled or not settings.finnhub_api_key):
             reasons.append("provider_unavailable")
-        if context and context.risk.get("strategy_config",{}).get("required_macro_series") and (
-            not settings.fred_enabled or not settings.fred_api_key
-        ):
+        if fred_required and (not settings.fred_enabled or not settings.fred_api_key):
             reasons.append("required_macro_provider_unavailable")
         account = None
         if context:
@@ -367,51 +441,91 @@ class AutonomousDemoService:
         try:
             account = await self.account_status_service.retrieve(user_sub, context.account_alias)
         except (AccountStatusUnavailable, TradeLockerError, TradeLockerMappingError):
-            raise AutonomousExecutionError("account_mapping_unavailable", "Normalized TradeLocker account state is unavailable.") from None
+            raise self._snapshot_failure("account_status") from None
         account_json = account.model_dump(mode="json")
         if account.account.account_alias != context.account_alias:
             raise AutonomousExecutionError("profile_account_context_mismatch", "The profile-bound account changed during snapshot retrieval.")
         providers, blackouts, provider_context = await self._provider_state()
-        fred_required=bool(context.risk.get("strategy_config",{}).get("required_macro_series"))
-        providers["fred"]["required"]=fred_required
+        finnhub_required, fred_required = self._provider_requirements(context, autonomous)
+        providers["finnhub"]["required"] = finnhub_required
+        providers["fred"]["required"] = fred_required
+        warnings = []
+        if not providers["finnhub"]["available"] or providers["finnhub"]["stale"]:
+            warnings.append("provider_unavailable")
+        if not providers["fred"]["available"] or providers["fred"]["stale"]:
+            warnings.append("required_macro_provider_unavailable" if fred_required else "macro_provider_unavailable")
+        if blackouts:
+            warnings.append("news_blackout")
         client = self._client(context.connection)
         market: dict[str, Any] = {}
         try:
-            config = await client.get_config()
-            raw_positions, raw_orders = await client.get_open_positions(), await client.get_orders()
-            raw_history = await client.get_orders_history()
-            positions = map_configured_rows(
-                config_response=config, data_response=raw_positions,
-                config_key="positionsConfig", data_key="positions",
-            )
-            orders = map_configured_rows(
-                config_response=config, data_response=raw_orders,
-                config_key="ordersConfig", data_key="orders",
-            )
-            order_history = map_configured_rows(
-                config_response=config,data_response=raw_history,
-                config_key="ordersHistoryConfig",data_key="ordersHistory",
-            )
+            try:
+                config = await client.get_config()
+            except TradeLockerError:
+                raise self._snapshot_failure("trade_config") from None
+            try:
+                raw_positions = await client.get_open_positions()
+            except TradeLockerError:
+                raise self._snapshot_failure("positions") from None
+            try:
+                positions = map_configured_rows(config_response=config, data_response=raw_positions,
+                    config_key="positionsConfig", data_key="positions")
+            except TradeLockerMappingError:
+                raise self._snapshot_failure("positions_mapping") from None
+            try:
+                raw_orders = await client.get_orders()
+            except TradeLockerError:
+                raise self._snapshot_failure("pending_orders") from None
+            try:
+                orders = map_configured_rows(config_response=config, data_response=raw_orders,
+                    config_key="ordersConfig", data_key="orders")
+            except TradeLockerMappingError:
+                raise self._snapshot_failure("pending_orders_mapping") from None
+            order_history = []
+            try:
+                raw_history = await client.get_orders_history()
+                order_history = map_configured_rows(config_response=config, data_response=raw_history,
+                    config_key="ordersHistoryConfig", data_key="ordersHistory")
+            except (TradeLockerError, TradeLockerMappingError):
+                if autonomous:
+                    raise self._snapshot_failure("order_history") from None
+                warnings.append("order_history_unavailable")
             requested_pair=normalize_pair(symbol) if symbol else None
             if requested_pair and requested_pair not in context.risk["allowed_pairs"]:
                 raise AutonomousExecutionError("pair_not_allowed","The symbol is not allowed by this execution profile.")
             for pair in [requested_pair] if requested_pair else context.risk["allowed_pairs"]:
-                quote = await client.get_quote(pair)
-                instrument=await client.get_instrument_details(pair)
-                d1 = await client.get_candles(pair, "1d", 190) if autonomous else None
-                h4 = await client.get_candles(pair, "4h", 250) if autonomous else None
-                h1 = await client.get_candles(pair, "1h", 200 if autonomous else 100)
-                m15 = await client.get_candles(pair, "15m", 200 if autonomous else 100)
-                bid,ask=self._quote(quote)
+                try:
+                    quote = await client.get_quote(pair)
+                    bid, ask = self._quote(quote)
+                    if ask < bid:
+                        raise ValueError
+                except (TradeLockerError, AutonomousExecutionError, ValueError):
+                    raise self._snapshot_failure(f"{pair.lower()}_quote") from None
+                try:
+                    instrument_payload = await client.get_instrument_details(pair)
+                    instrument = parse_instrument_metadata(instrument_payload, pair)
+                except (TradeLockerError, AutonomousExecutionError):
+                    raise self._snapshot_failure(f"{pair.lower()}_instrument_metadata") from None
+                d1 = h4 = h1 = m15 = None
+                if autonomous:
+                    for timeframe, count in (("1d", 190), ("4h", 250), ("1h", 200), ("15m", 200)):
+                        try:
+                            series = await client.get_candles(pair, timeframe, count)
+                        except TradeLockerError:
+                            raise self._snapshot_failure(f"{pair.lower()}_candles_{timeframe}") from None
+                        if not series.complete:
+                            raise self._snapshot_failure(f"{pair.lower()}_candles_{timeframe}")
+                        if timeframe == "1d": d1 = series
+                        elif timeframe == "4h": h4 = series
+                        elif timeframe == "1h": h1 = series
+                        else: m15 = series
                 market[pair] = {"quote": quote,"bid":bid,"ask":ask,"spread":ask-bid,"quote_retrieved_at":utcnow().isoformat(),
-                    "instrument_metadata":instrument,
+                    "instrument_metadata":instrument.__dict__,
                     "candles_1d": [c.model_dump(mode="json") for c in d1.candles] if d1 else [],
                     "candles_4h": [c.model_dump(mode="json") for c in h4.candles] if h4 else [],
-                    "candles_1h": [c.model_dump(mode="json") for c in h1.candles],
-                    "candles_15m": [c.model_dump(mode="json") for c in m15.candles],
-                    "complete": h1.complete and m15.complete and (not autonomous or bool(d1 and h4 and d1.complete and h4.complete))}
-        except (TradeLockerError, TradeLockerMappingError):
-            raise AutonomousExecutionError("market_snapshot_unavailable", "A complete mapped TradeLocker snapshot is unavailable.") from None
+                    "candles_1h": [c.model_dump(mode="json") for c in h1.candles] if h1 else [],
+                    "candles_15m": [c.model_dump(mode="json") for c in m15.candles] if m15 else [],
+                    "complete": True}
         finally:
             await client.aclose()
         now, snapshot_id = utcnow(), f"snap_{uuid4().hex}"
@@ -437,9 +551,11 @@ class AutonomousDemoService:
             "account_alias":context.account_alias,"confirmed_demo":context.demo_classification=="demo","kill_switch":self._kill_switch(),
             "risk_state": risk_state, "strategy": {"name": context.risk["strategy_name"], "version": context.risk["strategy_version"]},
             "providers": providers, "news_blackouts": blackouts,
-            "provider_context": provider_context,
-            "market": {"pairs": market}, "execution_eligibility": not blackouts and providers["finnhub"]["available"]
-                and (providers["fred"]["available"] or not fred_required) and risk_state["can_open_position"],
+            "provider_context": provider_context, "warnings": list(dict.fromkeys(warnings)),
+            "market": {"pairs": market}, "execution_eligibility":
+                (not finnhub_required or (not blackouts and providers["finnhub"]["available"] and not providers["finnhub"]["stale"]))
+                and (not fred_required or (providers["fred"]["available"] and not providers["fred"]["stale"]))
+                and risk_state["can_open_position"],
         }
         self.execution.insert_snapshot({
             "id": snapshot_id, "user_sub": user_sub, "connection_id": context.connection_id,
@@ -506,18 +622,17 @@ class AutonomousDemoService:
             violations.append("pair_not_allowed")
         if self.execution.has_active_preview(user_sub, context.account_id, context.acc_num, pair, utcnow().isoformat()):
             violations.append("duplicate_setup")
-        risk_distance, reward_distance = abs(proposal.entry - proposal.stop_loss), abs(proposal.take_profit - proposal.entry)
         if (proposal.side == "long" and not (proposal.stop_loss < proposal.entry < proposal.take_profit)) or (proposal.side == "short" and not (proposal.take_profit < proposal.entry < proposal.stop_loss)):
             violations.append("invalid_protective_prices")
-        rr = reward_distance / risk_distance if risk_distance else 0
-        if rr < context.risk["minimum_reward_risk"]:
-            violations.append("reward_risk_too_low")
         normalized = snapshot["normalized_snapshot"]
-        if not normalized["providers"]["finnhub"]["available"] or normalized["providers"]["finnhub"]["stale"]:
+        warnings = list(normalized.get("warnings", []))
+        finnhub = normalized.get("providers", {}).get("finnhub", {})
+        fred = normalized.get("providers", {}).get("fred", {})
+        if (not finnhub.get("available") or finnhub.get("stale")) and finnhub.get("required"):
             violations.append("provider_unavailable")
-        if normalized["providers"]["fred"].get("required") and (not normalized["providers"]["fred"]["available"] or normalized["providers"]["fred"]["stale"]):
+        if (not fred.get("available") or fred.get("stale")) and fred.get("required"):
             violations.append("required_macro_provider_unavailable")
-        if normalized["news_blackouts"]:
+        if normalized.get("news_blackouts") and finnhub.get("required"):
             violations.append("news_blackout")
         if not normalized["risk_state"]["can_open_position"]:
             violations.append("position_or_order_limit")
@@ -534,12 +649,26 @@ class AutonomousDemoService:
         finally:
             await client.aclose()
         metadata = parse_instrument_metadata(instrument_payload, pair)
-        if risk_distance < metadata.minimum_stop_distance:
-            raise AutonomousExecutionError("broker_stop_distance_invalid", "The stop distance is below the broker minimum.", status="rejected")
         bid, ask = self._quote(market["quote"])
+        calculation = calculate_reward_risk(
+            entry=proposal.entry, stop_loss=proposal.stop_loss, take_profit=proposal.take_profit,
+            bid=bid, ask=ask, metadata=metadata,
+            minimum_reward_risk=context.risk["minimum_reward_risk"], side=proposal.side,
+            order_type=proposal.order_type,
+        )
+        if Decimal(str(calculation["reward_risk"])) < Decimal(str(context.risk["minimum_reward_risk"])):
+            violations.append("reward_risk_too_low")
+        if Decimal(str(calculation["gross_risk_distance"])) < Decimal(str(metadata.minimum_stop_distance)):
+            raise AutonomousExecutionError("broker_stop_distance_invalid", "The stop distance is below the broker minimum.", status="rejected")
         spread = ask - bid
         if spread / metadata.pip_size > settings.autonomous_max_spread_pips:
             raise AutonomousExecutionError("spread_too_wide", "The snapshot spread exceeds the configured maximum.", status="rejected")
+        if violations:
+            raise AutonomousExecutionError(
+                "risk_validation_failed", "The proposed order failed deterministic risk validation.",
+                status="rejected", reasons=violations,
+                details={"calculation": calculation, "warnings": list(dict.fromkeys(warnings))},
+            )
         account_currency = (context.currency or normalized["account"]["account"].get("currency") or "").upper()
         quote_to_account = self._conversion_rate(
             metadata.quote_currency, account_currency,
@@ -553,7 +682,7 @@ class AutonomousDemoService:
             commission_per_lot=metadata.commission_per_lot,
         )
         preview_id, now = f"preview_{uuid4().hex}", utcnow()
-        estimated_reward = size["lot_size"] * reward_distance * metadata.contract_size * quote_to_account
+        estimated_reward = size["lot_size"] * float(calculation["reward_distance"]) * metadata.contract_size * quote_to_account
         record = {
             "id": preview_id, "snapshot_id": proposal.snapshot_id, "user_sub": user_sub,
             "connection_id": context.connection_id, "account_id": context.account_id, "acc_num": context.acc_num,
@@ -565,7 +694,7 @@ class AutonomousDemoService:
             "route_id": metadata.route_id, "side": proposal.side, "order_type": proposal.order_type,
             "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit,
             "quantity": size["quantity"], "lot_size": size["lot_size"], "estimated_risk": size["estimated_risk"],
-            "risk_percent": size["risk_percent"], "estimated_reward": estimated_reward, "reward_risk": rr,
+            "risk_percent": size["risk_percent"], "estimated_reward": estimated_reward, "reward_risk": calculation["reward_risk"],
             "broker_metadata_json": json.dumps(metadata.__dict__, separators=(",", ":"), sort_keys=True),
             "status": "approved", "violations_json": "[]",
             "execution_origin": "autonomous" if autonomous else "manual",
@@ -578,7 +707,7 @@ class AutonomousDemoService:
             context.execution_mode.value, proposal.snapshot_id, preview_id, pair,
             proposal.side, size["lot_size"], size["estimated_risk"], self._kill_switch(),
         )
-        return {"schema_version": "1.0", "status": "approved", "preview_id": preview_id, "snapshot_id": proposal.snapshot_id, "pair": pair, "side": proposal.side, "order_type": proposal.order_type, "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit, **size, "estimated_reward": estimated_reward, "reward_risk": rr, "expires_at": record["expires_at"], "violations": []}
+        return {"schema_version": "1.0", "status": "approved", "preview_id": preview_id, "snapshot_id": proposal.snapshot_id, "pair": pair, "side": proposal.side, "order_type": proposal.order_type, "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit, **size, "estimated_reward": estimated_reward, "reward_risk": calculation["reward_risk"], "calculation": calculation, "warnings": list(dict.fromkeys(warnings)), "expires_at": record["expires_at"], "violations": []}
 
     async def submit(self, user_sub: str, preview_id: str, idempotency_key: str) -> dict[str, Any]:
         preview = self.execution.get_preview(preview_id)
@@ -618,9 +747,13 @@ class AutonomousDemoService:
             if self._kill_switch():
                 raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks order submission.", status="rejected")
             providers, blackouts, _ = await self._provider_state()
-            if not providers["finnhub"]["available"] or providers["finnhub"]["stale"] or blackouts:
+            autonomous_origin = preview.get("execution_origin") == "autonomous"
+            finnhub_required, fred_required = self._provider_requirements(context, autonomous_origin)
+            if finnhub_required and (
+                not providers["finnhub"]["available"] or providers["finnhub"]["stale"] or blackouts
+            ):
                 raise AutonomousExecutionError("news_validation_unavailable", "Required news-blackout validation failed closed.", status="rejected")
-            if context.risk.get("strategy_config",{}).get("required_macro_series") and (
+            if fred_required and (
                 not providers["fred"]["available"] or providers["fred"]["stale"]
             ):
                 raise AutonomousExecutionError("required_macro_provider_unavailable","Required macro validation failed closed.",status="rejected")

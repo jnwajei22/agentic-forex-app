@@ -1,17 +1,27 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from app.config.settings import settings
-from app.models.autonomous import ExecutionMode
+from app.models.autonomous import AutonomousOrderProposal, ExecutionMode
 from app.services.autonomous.execution import (
     AutonomousDemoService,
     AutonomousExecutionError,
     InstrumentMetadata,
+    calculate_reward_risk,
     calculate_broker_position_size,
     normalize_pair,
     parse_instrument_metadata,
 )
+from app.brokers.tradelocker.client import TradeLockerError
+from app.models.tradelocker import (
+    TradeLockerAccountIdentity, TradeLockerAccountStatus, TradeLockerMarginStatus,
+    TradeLockerTodayStatus,
+)
+from app.services.providers.errors import ProviderError
+from app.services.tradelocker.account_status import AccountStatusUnavailable
 from app.storage.execution import ExecutionRepository
 from app.storage.brokers import BrokerRepository
 
@@ -115,8 +125,43 @@ def test_instrument_metadata_fails_closed_when_contract_missing():
     assert error.value.code == "position_size_unverifiable"
 
 
+def test_instrument_metadata_maps_herofx_tiered_tick_schema():
+    payload = {
+        "instrument_id": 42,
+        "listing": {"routes": [{"type": "TRADE", "id": "r1"}]},
+        "details": {"d": {
+            "lotSize": 100_000, "lotStep": 0.01, "minLot": 0.01, "maxLot": 50,
+            "quotingCurrency": "USD", "leverage": "100.00",
+            "tickSize": [{"leftRangeLimit": None, "tickSize": 0.00001}],
+        }},
+    }
+    result = parse_instrument_metadata(payload, "EURUSD")
+    assert result.contract_size == 100_000
+    assert result.min_lots == 0.01 and result.max_lots == 50
+    assert result.tick_size == 0.00001 and result.price_precision == 5
+    assert result.pip_size == 0.0001
+    assert result.minimum_stop_distance == 0.00001
+
+
 def test_official_quote_abbreviations_are_supported():
     assert AutonomousDemoService._quote({"d": {"bp": 1.1, "ap": 1.1002}}) == (1.1, 1.1002)
+
+
+def test_reward_risk_uses_broker_rounding_and_exposes_spread_adjustment():
+    result = calculate_reward_risk(
+        entry=1.14300, stop_loss=1.14100, take_profit=1.14600,
+        bid=1.14280, ask=1.14300,
+        metadata=metadata(tick_size=0.00001, price_precision=5),
+        minimum_reward_risk=1.5, side="long", order_type="limit",
+    )
+    assert result["entry_price_basis"] == "requested_limit"
+    assert result["gross_risk_distance"] == pytest.approx(0.002)
+    assert result["gross_reward_distance"] == pytest.approx(0.003)
+    assert result["spread_adjustment"] == pytest.approx(0.0002)
+    assert result["risk_distance"] == pytest.approx(0.0022)
+    assert result["reward_distance"] == pytest.approx(0.0028)
+    assert result["reward_risk"] == pytest.approx(0.0028 / 0.0022)
+    assert result["comparison_tolerance"] == 0
 
 
 def test_cross_currency_conversion_uses_direct_or_inverse_snapshot_quote():
@@ -254,6 +299,217 @@ async def test_environment_conflicts_fail_closed(tmp_path, monkeypatch, base_url
     with pytest.raises(AutonomousExecutionError) as error:
         await service.context("user", service.test_profile_ref, require_mode=False)
     assert error.value.code == "demo_environment_verification_failed"
+
+
+class SnapshotAccountService:
+    async def retrieve(self, user_sub, account_alias):
+        return TradeLockerAccountStatus(
+            retrieved_at=datetime.now(timezone.utc),
+            account=TradeLockerAccountIdentity(account_id="a1", account_number="7",
+                account_alias=account_alias, name="Demo", currency="USD",
+                environment="demo", active=True),
+            balance=10_000, projected_balance=10_000, available_funds=9_000,
+            blocked_balance=0, cash_balance=10_000, withdrawal_available=9_000,
+            open_gross_pnl=0, open_net_pnl=0, positions_count=0, pending_orders_count=0,
+            today=TradeLockerTodayStatus(gross=0, net=0, fees=0, volume=0, trades_count=0),
+            margin=TradeLockerMarginStatus(initial_requirement=0, maintenance_requirement=0,
+                warning_level=100, stop_out_level=50, warning_requirement=0,
+                margin_before_warning=9_000),
+        )
+
+
+class MissingSnapshotAccountService:
+    async def retrieve(self, user_sub, account_alias):
+        raise AccountStatusUnavailable("account_state_unavailable", "unavailable")
+
+
+class UnavailableFinnhub:
+    async def economic_calendar(self, *args):
+        raise ProviderError("finnhub", "upstream_failure", "unavailable")
+    async def market_news(self, *args):
+        raise AssertionError("calendar failure should short-circuit news")
+    async def aclose(self): pass
+
+
+class UnavailableFred:
+    async def release_dates(self, *args):
+        raise ProviderError("fred", "upstream_failure", "unavailable")
+    async def aclose(self): pass
+
+
+class SnapshotClient:
+    def __init__(self, *, fail_component=None, calls=None, **kwargs):
+        self.fail_component = fail_component
+        self.calls = calls if calls is not None else []
+        self.place_order_calls = 0
+
+    def _fail(self, component):
+        if self.fail_component == component:
+            raise TradeLockerError(component, "sanitized failure")
+
+    async def get_accounts(self):
+        return {"accounts": [{"accountId": "a1", "accNum": "7", "name": "Demo", "currency": "USD"}]}
+
+    async def get_config(self):
+        self._fail("trade_config")
+        return {"d": {
+            "positionsConfig": {"columns": [{"id": "id"}, {"id": "qty"}, {"id": "openPnl"}]},
+            "ordersConfig": {"columns": [{"id": "id"}, {"id": "qty"}, {"id": "price"}]},
+            "ordersHistoryConfig": {"columns": [{"id": "id"}]},
+        }}
+
+    async def get_open_positions(self):
+        self.calls.append("get_open_positions")
+        self._fail("positions")
+        return {"d": [["position-1", 0]] if self.fail_component == "positions_mapping"
+            else [["position-1", 0, 0]]}
+
+    async def get_orders(self):
+        self._fail("pending_orders")
+        return {"d": [["bad-row"]] if self.fail_component == "pending_orders_mapping" else []}
+
+    async def get_orders_history(self):
+        self._fail("order_history")
+        return {"d": []}
+
+    async def get_quote(self, symbol):
+        self._fail("quote")
+        return {"d": {"bp": 1.14280, "ap": 1.14300}}
+
+    async def get_instrument_details(self, symbol):
+        self._fail("instrument_metadata")
+        return {"instrument_id": "42", "listing": {"routes": [{"type": "TRADE", "id": "route-1"}]},
+            "details": {"d": {"contractSize": 100_000, "pipSize": 0.0001,
+                "tickSize": 0.00001, "pricePrecision": 5, "lotStep": 0.01,
+                "minOrderQty": 0.01, "maxOrderQty": 10, "quoteCurrency": "USD",
+                "minStopLossDistance": 0.0001, "commissionPerLot": 0, "leverage": 100}}}
+
+    async def get_candles(self, symbol, timeframe, count):
+        self._fail(f"candles_{timeframe}")
+        return SimpleNamespace(complete=True, candles=[])
+
+    async def place_order(self, order):
+        self.place_order_calls += 1
+        raise AssertionError("tests must not submit an order")
+
+    async def aclose(self): pass
+
+
+def snapshot_service(tmp_path, monkeypatch, *, fail_component=None, mode="demo_manual",
+                     missing_account=False):
+    monkeypatch.setattr(settings, "tradelocker_demo_base_url", "https://demo.tradelocker.test/backend-api")
+    monkeypatch.setattr(settings, "kill_switch_enabled", False)
+    brokers = BrokerRepository(tmp_path / "snapshot.db", "secret")
+    connection = brokers.save_connection("user", base_url=settings.tradelocker_demo_base_url,
+        username="u", password="p", server="HeroFX", environment="demo")
+    brokers.sync_accounts("user", connection.connection_ref,
+        {"accounts": [{"accountId": "a1", "accNum": "7", "currency": "USD"}]})
+    account = brokers.list_accounts("user")[0]
+    profile = brokers.create_profile("user", name="Manual", account_ref=account["public_id"],
+        execution_mode="demo_manual")
+    if mode == "demo_autonomous":
+        profile = brokers.arm_autonomous_profile("user", profile["public_id"],
+            armed_until=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            shadow_mode=True)
+    calls = []
+    clients = []
+    def factory(**kwargs):
+        client = SnapshotClient(fail_component=fail_component, calls=calls, **kwargs)
+        clients.append(client)
+        return client
+    service = AutonomousDemoService(broker_repository=brokers,
+        execution_repository=ExecutionRepository(tmp_path / "snapshot.db"),
+        client_factory=factory, account_status_service=MissingSnapshotAccountService() if missing_account else SnapshotAccountService(),
+        finnhub_factory=UnavailableFinnhub, fred_factory=UnavailableFred)
+    return service, profile["public_id"], calls, clients
+
+
+@pytest.mark.asyncio
+async def test_manual_snapshot_maps_required_broker_components_and_uses_positions_method(tmp_path, monkeypatch):
+    service, profile, calls, clients = snapshot_service(tmp_path, monkeypatch)
+    result = await service.snapshot("user", profile, "EURUSD")
+    assert result["status"] == "ok"
+    assert result["positions"] == [{"id": "position-1", "qty": 0, "openPnl": 0}]
+    assert result["pending_orders"] == []
+    assert result["market"]["pairs"]["EURUSD"]["bid"] == pytest.approx(1.1428)
+    assert result["market"]["pairs"]["EURUSD"]["spread"] == pytest.approx(0.0002)
+    assert result["market"]["pairs"]["EURUSD"]["instrument_metadata"]["tick_size"] == 0.00001
+    assert "get_open_positions" in calls
+    assert "provider_unavailable" in result["warnings"]
+    assert all(client.place_order_calls == 0 for client in clients)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("failure", "missing"), [
+    ("trade_config", "trade_config"), ("positions", "positions"),
+    ("positions_mapping", "positions_mapping"), ("pending_orders", "pending_orders"),
+    ("pending_orders_mapping", "pending_orders_mapping"), ("quote", "eurusd_quote"),
+    ("instrument_metadata", "eurusd_instrument_metadata"),
+])
+async def test_snapshot_failure_names_exact_missing_component(tmp_path, monkeypatch, failure, missing):
+    service, profile, _, _ = snapshot_service(tmp_path, monkeypatch, fail_component=failure)
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.snapshot("user", profile, "EURUSD")
+    assert error.value.code == "market_snapshot_unavailable"
+    assert error.value.reasons == [f"{missing}_unavailable"]
+    assert error.value.as_dict()["missing_component"] == missing
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_names_account_status_component(tmp_path, monkeypatch):
+    service, profile, _, _ = snapshot_service(tmp_path, monkeypatch, missing_account=True)
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.snapshot("user", profile, "EURUSD")
+    assert error.value.as_dict()["missing_component"] == "account_status"
+    assert error.value.reasons == ["account_status_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_manual_preview_warns_on_finnhub_and_exposes_broker_calculation(tmp_path, monkeypatch):
+    service, profile, _, clients = snapshot_service(tmp_path, monkeypatch)
+    snapshot = await service.snapshot("user", profile, "EURUSD")
+    proposal = AutonomousOrderProposal(
+        snapshot_id=snapshot["snapshot_id"], pair="EURUSD", side="long", order_type="limit",
+        entry=1.14300, stop_loss=1.14100, take_profit=1.14700,
+    )
+    preview = await service.review("user", profile, proposal)
+    assert preview["status"] == "approved" and preview["preview_id"]
+    assert "provider_unavailable" in preview["warnings"]
+    assert preview["calculation"]["spread_adjustment"] == pytest.approx(0.0002)
+    assert preview["calculation"]["risk_distance"] == pytest.approx(0.0022)
+    assert preview["calculation"]["reward_distance"] == pytest.approx(0.0038)
+    assert preview["reward_risk"] > 1.5
+    assert all(client.place_order_calls == 0 for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_nominal_one_point_five_is_blocked_by_disclosed_spread_adjustment(tmp_path, monkeypatch):
+    service, profile, _, _ = snapshot_service(tmp_path, monkeypatch)
+    snapshot = await service.snapshot("user", profile, "EURUSD")
+    proposal = AutonomousOrderProposal(
+        snapshot_id=snapshot["snapshot_id"], pair="EURUSD", side="long", order_type="limit",
+        entry=1.14300, stop_loss=1.14100, take_profit=1.14600,
+    )
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.review("user", profile, proposal)
+    assert error.value.reasons == ["reward_risk_too_low"]
+    calculation = error.value.details["calculation"]
+    assert calculation["gross_reward_distance"] / calculation["gross_risk_distance"] == pytest.approx(1.5)
+    assert calculation["reward_risk"] == pytest.approx(0.0028 / 0.0022)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_preview_still_fails_closed_on_finnhub(tmp_path, monkeypatch):
+    service, profile, _, clients = snapshot_service(tmp_path, monkeypatch, mode="demo_autonomous")
+    snapshot = await service.snapshot("user", profile, "EURUSD", autonomous=True)
+    proposal = AutonomousOrderProposal(
+        snapshot_id=snapshot["snapshot_id"], pair="EURUSD", side="long", order_type="limit",
+        entry=1.14300, stop_loss=1.14100, take_profit=1.14700,
+    )
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.review("user", profile, proposal, autonomous=True)
+    assert "provider_unavailable" in error.value.reasons
+    assert all(client.place_order_calls == 0 for client in clients)
 
 
 def reconciliation_payloads(*, quantity=0.01, side="buy", stop=1.09, target=1.12):
