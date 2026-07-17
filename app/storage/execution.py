@@ -276,6 +276,11 @@ class ExecutionRepository:
             row = db.execute(f"SELECT * FROM broker_submissions WHERE {key}=?", (value,)).fetchone()
         return self._decode(row) if row else None
 
+    def get_submission_by_execution(self, execution_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM broker_submissions WHERE execution_id=?", (execution_id,)).fetchone()
+        return self._decode(row) if row else None
+
     def update_submission(self, submission_id: str, **updates: Any) -> None:
         updates["updated_at"] = utcnow().isoformat()
         encoded = {key: json.dumps(value, separators=(",", ":"), sort_keys=True) if key.endswith("_json") else value for key, value in updates.items()}
@@ -343,6 +348,16 @@ class ExecutionRepository:
             else:
                 row = db.execute("SELECT * FROM autonomous_runs WHERE user_sub=? ORDER BY created_at DESC LIMIT 1", (user_sub,)).fetchone()
         return self._decode(row) if row else None
+
+    def update_run(self, run_id: str, **updates: Any) -> None:
+        encoded = {
+            key: json.dumps(value, separators=(",", ":"), sort_keys=True)
+            if key.endswith("_json") else value
+            for key, value in updates.items()
+        }
+        assignments = ",".join(f"{key}=:{key}" for key in encoded)
+        with self._connect() as db:
+            db.execute(f"UPDATE autonomous_runs SET {assignments} WHERE id=:id", {**encoded, "id": run_id})
 
     def insert_action_preview(self, record: dict[str,Any]) -> None:
         encoded={**record,"target_json":json.dumps(record["target_json"],separators=(",",":"),sort_keys=True)}

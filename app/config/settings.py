@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     autonomous_quote_max_age_seconds: int = 30
     autonomous_price_tolerance_percent: float = 0.25
     autonomous_max_spread_pips: float = 3.0
+    autonomous_broker_verification_max_attempts: int = Field(default=6, ge=1, le=20)
+    autonomous_broker_verification_timeout_seconds: float = Field(default=12.0, ge=1, le=30)
+    autonomous_broker_verification_initial_delay_seconds: float = Field(default=0.75, ge=0, le=5)
+    autonomous_broker_verification_max_delay_seconds: float = Field(default=2.0, ge=0, le=10)
     autonomous_news_blackout_minutes: int = 30
     autonomous_decision_provider: str = "no_trade"
     autonomous_decision_model: str = "gpt-5.6"

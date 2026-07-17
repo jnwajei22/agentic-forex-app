@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -81,6 +82,36 @@ class InstrumentMetadata:
 
 def normalize_pair(pair: str) -> str:
     return pair.replace("/", "").replace("_", "").upper().strip()
+
+
+def _decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _normalized_side(value: Any) -> str:
+    side = str(value or "").strip().lower()
+    return {"long": "buy", "short": "sell"}.get(side, side)
+
+
+def _normalized_order_type(value: Any) -> str:
+    order_type = str(value or "").strip().lower().replace("_", "").replace("-", "")
+    return {"stoplimit": "stop", "stopmarket": "stop"}.get(order_type, order_type)
+
+
+def _string_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    return None
 
 
 def _normalized_url(url: str) -> str:
@@ -713,6 +744,26 @@ class AutonomousDemoService:
         preview = self.execution.get_preview(preview_id)
         if not preview or preview["user_sub"] != user_sub:
             raise AutonomousExecutionError("preview_not_found", "The approved preview is unavailable.", status="rejected")
+        fingerprint = hashlib.sha256(json.dumps({key: preview[key] for key in ("id", "account_id", "acc_num", "pair", "side", "order_type", "entry", "stop_loss", "take_profit", "lot_size")}, sort_keys=True).encode()).hexdigest()
+        existing_submission = (
+            self.execution.get_submission(preview_id=preview_id)
+            or self.execution.get_submission(idempotency_key=idempotency_key)
+        )
+        if existing_submission:
+            if (existing_submission.get("preview_id") != preview_id
+                    or existing_submission.get("idempotency_key") != idempotency_key
+                    or existing_submission.get("request_fingerprint") != fingerprint):
+                raise AutonomousExecutionError("idempotency_conflict", "The idempotency key belongs to another request.", status="rejected")
+            return {
+                **self._submission_result(existing_submission),
+                "account_alias": preview.get("account_alias"), "confirmed_demo": True,
+                "symbol": preview["pair"],
+                "side": "buy" if preview["side"] == "long" else "sell",
+                "order_type": preview["order_type"], "quantity": preview["lot_size"],
+                "quantity_lots": preview["lot_size"], "quantity_units": preview["quantity"],
+                "entry": preview["entry"], "stop_loss": preview["stop_loss"],
+                "take_profit": preview["take_profit"],
+            }
         context = await self.context(user_sub, preview.get("profile_ref") or "",allow_autonomous=preview.get("execution_origin")=="autonomous")
         routing_fields = ("connection_id","account_id","acc_num","environment","profile_ref","account_record_id","connection_ref","account_alias","server","base_url","demo_classification")
         current = {"connection_id":context.connection_id,"account_id":context.account_id,"acc_num":context.acc_num,"environment":context.environment,
@@ -726,7 +777,6 @@ class AutonomousDemoService:
         snapshot = self.execution.get_snapshot(preview["snapshot_id"])
         if not snapshot or datetime.fromisoformat(snapshot["expires_at"]) <= utcnow():
             raise AutonomousExecutionError("snapshot_expired", "The preview snapshot has expired.", status="rejected")
-        fingerprint = hashlib.sha256(json.dumps({key: preview[key] for key in ("id", "account_id", "acc_num", "pair", "side", "order_type", "entry", "stop_loss", "take_profit", "lot_size")}, sort_keys=True).encode()).hexdigest()
         submission_id = f"submission_{uuid4().hex}"
         claimed, existing = self.execution.claim_submission(submission_id, preview_id, idempotency_key, fingerprint)
         key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]
@@ -795,6 +845,7 @@ class AutonomousDemoService:
                     raise AutonomousExecutionError("equivalent_order_exists", "An equivalent position or order already exists.", status="rejected")
                 if self._kill_switch():
                     raise AutonomousExecutionError("kill_switch_enabled", "The kill switch blocks order submission.", status="rejected")
+                correlation_id = f"afd-{preview_id[-20:]}"
                 order_payload = {
                     "qty": preview["lot_size"], "routeId": preview["route_id"],
                     "side": "buy" if preview["side"] == "long" else "sell",
@@ -803,17 +854,31 @@ class AutonomousDemoService:
                     "price": 0 if preview["order_type"] == "market" else preview["entry"],
                     "stopLoss": preview["stop_loss"], "stopLossType": "absolute",
                     "takeProfit": preview["take_profit"], "takeProfitType": "absolute",
-                    "strategyId": f"afd-{preview_id[-20:]}",
+                    "strategyId": correlation_id,
                 }
                 if preview["order_type"] == "stop":
                     order_payload["stopPrice"] = preview["entry"]
                     order_payload["price"] = 0
-                response = await client.place_order(order_payload)
-                dispatched = True
-                after_orders = await client.get_orders()
-                history = await client.get_orders_history()
-                after_positions = await client.get_open_positions()
-                reconciliation = self._reconcile(config, after_orders, history, after_positions, preview, response)
+                response: Any = None
+                ambiguous_submit_error: TradeLockerError | None = None
+                try:
+                    # The durable claim already exists. Never call place_order again for this preview/key.
+                    response = await client.place_order(order_payload)
+                    dispatched = True
+                except TradeLockerError as exc:
+                    ambiguous = (
+                        exc.code in {"timeout", "request_failed"}
+                        or (exc.code == "http_error" and (exc.status_code or 0) >= 500)
+                    )
+                    if exc.operation != "place_order" or not ambiguous:
+                        raise
+                    dispatched = True
+                    ambiguous_submit_error = exc
+                reconciliation = await self._poll_reconciliation(
+                    client, config, preview, response, correlation_id,
+                )
+                if ambiguous_submit_error is not None and not reconciliation["verified"]:
+                    reconciliation["submit_error"] = ambiguous_submit_error.code
                 if reconciliation.get("position_found") and not (reconciliation.get("stop_loss_matches") and reconciliation.get("take_profit_matches")):
                     position_id=reconciliation.get("broker_position_id")
                     emergency={"attempted":False,"verified_flat":False}
@@ -826,12 +891,15 @@ class AutonomousDemoService:
                     reconciliation["protection_failure"]=True;reconciliation["emergency_close"]=emergency
             finally:
                 await client.aclose()
-            broker_order_id = str(_find_value(response, ("orderId", "id")) or reconciliation.get("broker_order_id") or "") or None
+            broker_order_id = str(reconciliation.get("broker_order_id") or _find_value(response, ("orderId", "id")) or "") or None
             state = "protection_failure" if reconciliation.get("protection_failure") else "verified" if reconciliation["verified"] else "unknown"
             self.execution.update_submission(
                 submission_id, submission_state=state, broker_order_id=broker_order_id,
                 broker_position_id=reconciliation.get("broker_position_id"),
-                broker_response_sanitized_json={"order_id": broker_order_id, "accepted": True},
+                broker_response_sanitized_json={
+                    "order_id": broker_order_id, "accepted": bool(reconciliation["verified"]),
+                    "dispatch_uncertain": response is None,
+                },
                 reconciliation_json=reconciliation, submitted_at=utcnow().isoformat(),
                 verified_at=utcnow().isoformat() if reconciliation["verified"] else None,
             )
@@ -846,7 +914,9 @@ class AutonomousDemoService:
                 reconciliation["verified"], state,
             )
             return {**self._submission_result(result),"execution_id":execution_id,"account_alias":context.account_alias,"confirmed_demo":True,
-                "symbol":preview["pair"],"side":preview["side"],"order_type":preview["order_type"],"quantity":preview["lot_size"],
+                "symbol":preview["pair"],"side":reconciliation.get("side") or ("buy" if preview["side"]=="long" else "sell"),
+                "order_type":preview["order_type"],"quantity":preview["lot_size"],
+                "quantity_lots":preview["lot_size"],"quantity_units":preview["quantity"],
                 "entry":preview["entry"],"stop_loss":preview["stop_loss"],"take_profit":preview["take_profit"]}
         except AutonomousExecutionError as exc:
             self.execution.update_submission(submission_id, submission_state="rejected", reconciliation_json=exc.as_dict())
@@ -868,47 +938,238 @@ class AutonomousDemoService:
                 preview_id, key_hash, code, state,
             )
             if state == "unknown":
-                return {"schema_version": "1.0", "status": "unknown", "error": "broker_result_unverified", "message": "TradeLocker accepted or may have accepted the order, but the resulting broker state could not be verified.", "manual_review_required": True}
+                self.execution.mark_preview_submitted(preview_id)
+                stored = self.execution.get_submission(preview_id=preview_id) or {}
+                execution_id = stored.get("execution_id")
+                if not execution_id:
+                    execution_id = self._record_run(
+                        context, preview, "unknown", stored.get("broker_order_id"),
+                        self._submission_result(stored),
+                    )
+                    self.execution.update_submission(submission_id, execution_id=execution_id)
+                return {
+                    **self._submission_result(self.execution.get_submission(preview_id=preview_id) or stored),
+                    "execution_id": execution_id, "error": "broker_result_unverified",
+                    "message": "TradeLocker accepted or may have accepted the order, but the resulting broker state could not be verified.",
+                    "account_alias": context.account_alias, "symbol": preview["pair"],
+                }
             raise AutonomousExecutionError("broker_rejected", "TradeLocker rejected the demo order.", status="rejected") from None
 
+    async def _poll_reconciliation(
+        self, client: TradeLockerClient, config: Any, preview: dict[str, Any],
+        response: Any, correlation_id: str,
+    ) -> dict[str, Any]:
+        """Read broker state with bounded backoff; this method never submits an order."""
+        attempts = settings.autonomous_broker_verification_max_attempts
+        delay = settings.autonomous_broker_verification_initial_delay_seconds
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settings.autonomous_broker_verification_timeout_seconds
+        attempts_completed = 0
+        latest: dict[str, Any] = {
+            "verified": False, "order_found": False, "position_found": False,
+            "mapping_verified": False, "correlation_id": correlation_id,
+        }
+        errors: list[str] = []
+        for attempt in range(1, attempts + 1):
+            attempts_completed = attempt
+            payloads: dict[str, Any] = {}
+            for name, read in (
+                ("orders", client.get_orders),
+                ("positions", client.get_open_positions),
+                ("history", client.get_orders_history),
+            ):
+                try:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    payloads[name] = await asyncio.wait_for(read(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    errors.append(f"{name}:verification_timeout")
+                    payloads[name] = {"d": []}
+                except TradeLockerError as exc:
+                    errors.append(f"{name}:{exc.code}")
+                    payloads[name] = {"d": []}
+            try:
+                latest = self._reconcile(
+                    config, payloads["orders"], payloads["history"], payloads["positions"],
+                    preview, response,
+                    correlation_id=correlation_id,
+                )
+                latest["verification_attempts"] = attempt
+                if latest["verified"]:
+                    return latest
+            except TradeLockerMappingError as exc:
+                errors.append(getattr(exc, "code", "mapping_unavailable"))
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            if attempt < attempts and delay > 0:
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, settings.autonomous_broker_verification_max_delay_seconds)
+        latest["verification_attempts"] = attempts_completed
+        if errors:
+            latest["verification_errors"] = list(dict.fromkeys(errors))
+        return latest
+
     @staticmethod
-    def _reconcile(config: Any, orders: Any, history: Any, positions: Any, preview: dict[str, Any], response: Any) -> dict[str, Any]:
+    def _reconcile(
+        config: Any, orders: Any, history: Any, positions: Any,
+        preview: dict[str, Any], response: Any, *, correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         mapped_orders: list[dict[str, Any]] = []
         mapped_history: list[dict[str, Any]] = []
         mapped_positions: list[dict[str, Any]] = []
-        try:
-            if isinstance(config, dict) and isinstance(orders, dict):
+        mapping_failures: list[str] = []
+        if isinstance(config, dict) and isinstance(orders, dict):
+            try:
                 mapped_orders = map_configured_rows(config_response=config, data_response=orders, config_key="ordersConfig", data_key="orders")
-            if isinstance(config, dict) and isinstance(history, dict):
+            except TradeLockerMappingError:
+                mapping_failures.append("orders")
+        if isinstance(config, dict) and isinstance(history, dict):
+            try:
                 mapped_history = map_configured_rows(config_response=config, data_response=history, config_key="ordersHistoryConfig", data_key="ordersHistory")
-            if isinstance(config, dict) and isinstance(positions, dict):
+            except TradeLockerMappingError:
+                mapping_failures.append("history")
+        if isinstance(config, dict) and isinstance(positions, dict):
+            try:
                 mapped_positions = map_configured_rows(config_response=config, data_response=positions, config_key="positionsConfig", data_key="positions")
-        except TradeLockerMappingError:
-            return {"verified": False, "order_found": False, "position_found": False, "mapping_verified": False}
-        order_id = _find_value(response, ("orderId", "id"))
-        candidates = mapped_orders + mapped_history
-        order = next((row for row in candidates if order_id is not None and str(_find_value(row, ("orderId", "id"))) == str(order_id)), None)
-        if order is None:
-            order = next((row for row in candidates if str(_find_value(row, ("tradableInstrumentId", "instrumentId"))) == preview["instrument_id"]), None)
+            except TradeLockerMappingError:
+                mapping_failures.append("positions")
+        response_order_id = _find_value(response, ("orderId", "id"))
+        correlation_id = correlation_id or f"afd-{preview.get('id', '')[-20:]}"
+        order_candidates = [(row, "pending") for row in mapped_orders] + [(row, "history") for row in mapped_history]
+        position_candidates = [(row, "position") for row in mapped_positions]
+        candidates = order_candidates + position_candidates
+        metadata = preview.get("broker_metadata") or {}
+        tick = _decimal(metadata.get("tick_size") or metadata.get("pip_size")) or Decimal("0.00000001")
+        lot_step = _decimal(metadata.get("lot_step")) or Decimal("0.00000001")
+        contract_size = _decimal(metadata.get("contract_size")) or Decimal("100000")
+
+        def numeric_matches(actual: Any, expected: Any, increment: Decimal) -> bool:
+            left, right = _decimal(actual), _decimal(expected)
+            if left is None or right is None or increment <= 0:
+                return False
+            return (left / increment).quantize(Decimal("1"), rounding=ROUND_HALF_UP) == (
+                right / increment
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+        def instrument_matches(row: dict[str, Any]) -> bool:
+            instrument = _find_value(row, ("tradableInstrumentId", "instrumentId"))
+            symbol = _find_value(row, ("symbol", "instrument", "name"))
+            return ((instrument is not None and str(instrument) == str(preview["instrument_id"])) or
+                    (symbol is not None and normalize_pair(str(symbol)) == normalize_pair(preview["pair"])))
+
+        def account_matches(row: dict[str, Any]) -> bool:
+            row_account = _find_value(row, ("accountId",))
+            row_number = _find_value(row, ("accNum", "accountNumber"))
+            return (
+                (row_account is None or str(row_account) == str(preview.get("account_id")))
+                and (row_number is None or str(row_number) == str(preview.get("acc_num")))
+            )
+
+        def quantity_values(row: dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+            lots = _decimal(_find_value(row, ("qty", "quantityLots", "lots")))
+            units = _decimal(_find_value(row, ("quantityUnits", "units")))
+            if lots is None and units is not None and contract_size > 0:
+                lots = units / contract_size
+            if units is None and lots is not None:
+                units = lots * contract_size
+            return lots, units
+
+        expected_side = "buy" if preview["side"] == "long" else "sell"
+        expected_type = _normalized_order_type(preview.get("order_type"))
+
+        def composite_matches(row: dict[str, Any]) -> bool:
+            lots, _ = quantity_values(row)
+            actual_type = _normalized_order_type(_find_value(row, ("type", "orderType")))
+            entry = _find_value(row, ("stopPrice",)) if expected_type == "stop" else _find_value(row, ("price", "entryPrice", "openPrice"))
+            return (
+                account_matches(row)
+                and instrument_matches(row)
+                and _normalized_side(_find_value(row, ("side",))) == expected_side
+                and actual_type == expected_type
+                and numeric_matches(lots, preview["lot_size"], lot_step)
+                and numeric_matches(entry, preview["entry"], tick)
+                and numeric_matches(_find_value(row, ("stopLoss",)), preview["stop_loss"], tick)
+                and numeric_matches(_find_value(row, ("takeProfit",)), preview["take_profit"], tick)
+            )
+
+        selected: tuple[dict[str, Any], str] | None = None
+        matching_method: str | None = None
+        if response_order_id is not None:
+            selected = next((item for item in order_candidates if str(_find_value(item[0], ("orderId", "id"))) == str(response_order_id)), None)
+            if selected:
+                matching_method = "broker_order_id"
+        if selected is None and correlation_id:
+            selected = next((item for item in candidates if str(_find_value(item[0], ("strategyId", "clientOrderId", "clientId")) or "") == correlation_id), None)
+            if selected:
+                matching_method = "correlation_id"
+        if selected is None:
+            selected = next((item for item in candidates if composite_matches(item[0])), None)
+            if selected:
+                matching_method = "composite"
+
+        order, source = selected if selected else (None, None)
         position_id = _find_value(order, ("positionId",)) if order else None
-        position = next((row for row in mapped_positions if position_id is not None and str(_find_value(row, ("positionId", "id"))) == str(position_id)), None)
-        quantity = _find_value(order or position, ("qty", "quantity"))
-        side = str(_find_value(order or position, ("side",)) or "").lower()
-        stop = _find_value(order or position, ("stopLoss",))
-        target = _find_value(order or position, ("takeProfit",))
+        position = (order if source == "position" else next(
+            (row for row in mapped_positions if position_id is not None and str(_find_value(row, ("positionId", "id"))) == str(position_id)), None
+        ))
+        lots, units = quantity_values(order or {})
+        side = _normalized_side(_find_value(order, ("side",)))
+        stop = _find_value(order, ("stopLoss",))
+        target = _find_value(order, ("takeProfit",))
+        entry = _find_value(order, ("stopPrice",)) if expected_type == "stop" else _find_value(order, ("price", "entryPrice", "openPrice"))
+        actual_type = _normalized_order_type(_find_value(order, ("type", "orderType")))
+        broker_status = str(_find_value(order, ("status", "orderStatus")) or "").strip() or None
+        status_normalized = (broker_status or "").lower().replace("_", "").replace(" ", "")
+        is_open = _string_bool(_find_value(order, ("isOpen",)))
+        accepted_status = (
+            status_normalized not in {"rejected", "cancelled", "canceled", "expired"}
+            and (is_open is not False or source in {"history", "position"})
+        )
+        identity_match = matching_method in {"broker_order_id", "correlation_id"}
         expected_side = "buy" if preview["side"] == "long" else "sell"
         checks = {
-            "quantity_matches": quantity is not None and math.isclose(float(quantity), preview["lot_size"], rel_tol=1e-6),
+            "account_matches": bool(order) and account_matches(order),
+            "instrument_matches": bool(order) and instrument_matches(order),
+            "quantity_matches": numeric_matches(lots, preview["lot_size"], lot_step),
             "side_matches": side == expected_side,
-            "stop_loss_matches": stop is not None and math.isclose(float(stop), preview["stop_loss"], rel_tol=1e-6),
-            "take_profit_matches": target is not None and math.isclose(float(target), preview["take_profit"], rel_tol=1e-6),
+            "order_type_matches": (actual_type == expected_type) if actual_type else identity_match,
+            "entry_matches": numeric_matches(entry, preview["entry"], tick) if entry is not None else identity_match,
+            "stop_loss_matches": numeric_matches(stop, preview["stop_loss"], tick),
+            "take_profit_matches": numeric_matches(target, preview["take_profit"], tick),
+            "broker_status_accepted": bool(order) and accepted_status,
         }
-        return {"verified": bool(order) and all(checks.values()), "mapping_verified": True, "order_found": bool(order), "position_found": bool(position), "broker_order_id": str(order_id) if order_id is not None else None, "broker_position_id": str(position_id) if position_id is not None else None, **checks}
+        matched_order_id = _find_value(order, ("orderId", "id")) if order and source != "position" else None
+        return {
+            "verified": bool(order) and all(checks.values()),
+            "mapping_verified": bool(order), "mapping_failures": mapping_failures,
+            "order_found": bool(order) and source != "position", "position_found": bool(position),
+            "broker_state_source": source,
+            "matching_method": matching_method, "correlation_id": correlation_id,
+            "broker_order_id": str(matched_order_id) if matched_order_id is not None else None,
+            "broker_position_id": str(_find_value(position, ("positionId", "id"))) if position else None,
+            "broker_status": broker_status, "symbol": preview.get("pair"), "side": side or None,
+            "order_type": actual_type or expected_type,
+            "quantity_lots": float(lots) if lots is not None else None,
+            "quantity_units": float(units) if units is not None else None,
+            "entry": float(_decimal(entry)) if _decimal(entry) is not None else None,
+            "stop_loss": float(_decimal(stop)) if _decimal(stop) is not None else None,
+            "take_profit": float(_decimal(target)) if _decimal(target) is not None else None,
+            **checks,
+        }
 
     @staticmethod
     def _submission_result(record: dict[str, Any]) -> dict[str, Any]:
         state = record.get("submission_state", "unknown")
-        return {"schema_version": "1.0", "status": "submitted" if state == "verified" else state, "execution_id":record.get("execution_id"),"broker_order_id": record.get("broker_order_id"), "broker_position_id": record.get("broker_position_id"), "reconciliation": record.get("reconciliation", {}), "manual_review_required": state == "unknown"}
+        reconciliation = record.get("reconciliation", {})
+        return {
+            "schema_version": "1.0", "status": "submitted" if state == "verified" else state,
+            "execution_id": record.get("execution_id"), "broker_order_id": record.get("broker_order_id"),
+            "broker_position_id": record.get("broker_position_id"),
+            "broker_status": reconciliation.get("broker_status"),
+            "manual_review_required": state == "unknown", "reconciliation": reconciliation,
+        }
 
     def _record_run(self, context: VerifiedDemoContext, preview: dict[str, Any], state: str, broker_order_id: str | None, result: dict[str, Any]) -> str:
         now, run_id = utcnow(), f"run_{uuid4().hex}"
@@ -992,12 +1253,69 @@ class AutonomousDemoService:
             "reconciliation":record.get("reconciliation",{}),"created_at":record.get("created_at"),"completed_at":record.get("completed_at"),
             "manual_review_required":record.get("state")=="unknown"}
 
-    def execution_result(self,user_sub:str,execution_id:str)->dict[str,Any]:
+    async def _reconcile_unknown_execution(
+        self, user_sub: str, run: dict[str, Any], submission: dict[str, Any], preview: dict[str, Any],
+    ) -> dict[str, Any]:
+        context = await self.context(
+            user_sub, preview.get("profile_ref") or "",
+            allow_autonomous=preview.get("execution_origin") == "autonomous",
+        )
+        immutable = (
+            context.connection_id, context.account_id, context.acc_num, context.profile_ref,
+            context.account_record_id, context.connection_ref, context.account_alias,
+            context.environment, context.server, context.base_url, context.demo_classification,
+        )
+        stored = tuple(preview.get(key) for key in (
+            "connection_id", "account_id", "acc_num", "profile_ref", "account_record_id",
+            "connection_ref", "account_alias", "environment", "server", "base_url", "demo_classification",
+        ))
+        if immutable != stored:
+            logger.warning("execution_reconciliation_routing_mismatch user_ref=%s execution_id=%s", user_sub, run["id"])
+            return run
+        client = self._client(context.connection)
+        try:
+            config = await client.get_config()
+            correlation_id = f"afd-{preview['id'][-20:]}"
+            reconciliation = await self._poll_reconciliation(
+                client, config, preview, {"orderId": submission.get("broker_order_id")}, correlation_id,
+            )
+        except (TradeLockerError, TradeLockerMappingError):
+            return run
+        finally:
+            await client.aclose()
+        if not reconciliation["verified"]:
+            return run
+        broker_order_id = reconciliation.get("broker_order_id") or submission.get("broker_order_id")
+        self.execution.update_submission(
+            submission["id"], submission_state="verified", broker_order_id=broker_order_id,
+            broker_position_id=reconciliation.get("broker_position_id"),
+            reconciliation_json=reconciliation, verified_at=utcnow().isoformat(),
+        )
+        updated_submission = self.execution.get_submission(preview_id=preview["id"]) or submission
+        durable_result = self._submission_result(updated_submission)
+        self.execution.update_run(
+            run["id"], result_status="verified", broker_order_id=broker_order_id,
+            result_json=durable_result, completed_at=utcnow().isoformat(),
+        )
+        logger.info(
+            "autonomous_demo late_reconciliation_completed user_id=%s connection_ref=%s account_ref=%s account_alias=%s execution_id=%s broker_order_id=%s",
+            user_sub, context.connection_ref, context.account_record_id, context.account_alias,
+            run["id"], broker_order_id,
+        )
+        return self.execution.get_run(user_sub, run["id"]) or run
+
+    async def execution_result(self,user_sub:str,execution_id:str)->dict[str,Any]:
         action=self.execution.get_action_execution(user_sub,execution_id)
         if action:return self._action_result(action)
         run=self.execution.get_run(user_sub,execution_id)
         if not run:raise AutonomousExecutionError("execution_not_found","No owned demo execution was found.",status="not_found")
-        return {"schema_version":"1.0","status":run["result_status"],"execution_id":run["id"],"action":run["decision"],
+        if run["result_status"] == "unknown" and run.get("preview_id"):
+            submission = self.execution.get_submission_by_execution(run["id"])
+            preview = self.execution.get_preview(run["preview_id"])
+            if submission and preview and preview.get("user_sub") == user_sub:
+                run = await self._reconcile_unknown_execution(user_sub, run, submission, preview)
+        status = "submitted" if run["result_status"] == "verified" else run["result_status"]
+        return {"schema_version":"1.0","status":status,"execution_id":run["id"],"action":run["decision"],
             "symbol":run.get("selected_pair"),"side":run.get("selected_side"),"broker_order_id":run.get("broker_order_id"),
             "result":run.get("result"),"created_at":run.get("created_at"),"completed_at":run.get("completed_at")}
 

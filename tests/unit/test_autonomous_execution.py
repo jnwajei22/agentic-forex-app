@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from app.services.autonomous.execution import (
     AutonomousDemoService,
     AutonomousExecutionError,
     InstrumentMetadata,
+    VerifiedDemoContext,
     calculate_reward_risk,
     calculate_broker_position_size,
     normalize_pair,
@@ -23,7 +25,7 @@ from app.models.tradelocker import (
 from app.services.providers.errors import ProviderError
 from app.services.tradelocker.account_status import AccountStatusUnavailable
 from app.storage.execution import ExecutionRepository
-from app.storage.brokers import BrokerRepository
+from app.storage.brokers import BrokerConnection, BrokerRepository
 
 
 def metadata(**overrides):
@@ -549,3 +551,246 @@ def test_reconciliation_reports_protection_and_order_mismatches(overrides, faile
     )
     assert result["verified"] is False
     assert result[failed_check] is False
+
+
+class SubmissionClient:
+    def __init__(self, *, visible_after_order_read=2):
+        self.visible_after_order_read = visible_after_order_read
+        self.order_reads = 0
+        self.place_order_calls = 0
+        self.submitted = False
+        self.strategy_id = None
+
+    @staticmethod
+    def config():
+        order_columns = [
+            "id", "tradableInstrumentId", "qty", "side", "type", "status", "price",
+            "stopLoss", "takeProfit", "isOpen", "strategyId", "accountId", "accNum",
+        ]
+        return {"d": {
+            "ordersConfig": {"columns": [{"id": key} for key in order_columns]},
+            "ordersHistoryConfig": {"columns": [{"id": key} for key in order_columns]},
+            "positionsConfig": {"columns": [{"id": key} for key in (
+                "id", "tradableInstrumentId", "qty", "side", "stopLoss", "takeProfit",
+                "strategyId", "accountId", "accNum",
+            )]},
+        }}
+
+    def order_row(self):
+        return [
+            "432345564236299554", "4665", "1.19", "buy", "limit", "New", "1.143",
+            "1.141", "1.147", "true", self.strategy_id, "account-a", "1001",
+        ]
+
+    async def get_config(self): return self.config()
+
+    async def get_orders(self):
+        self.order_reads += 1
+        visible = self.submitted and self.order_reads >= self.visible_after_order_read
+        return {"d": [self.order_row()] if visible else []}
+
+    async def get_orders_history(self): return {"d": []}
+    async def get_open_positions(self): return {"d": []}
+    async def get_quote(self, symbol): return {"d": {"bp": 1.1429, "ap": 1.143}}
+
+    async def place_order(self, payload):
+        self.place_order_calls += 1
+        self.submitted = True
+        self.strategy_id = payload["strategyId"]
+        return {}
+
+    async def aclose(self): pass
+
+
+def submission_preview():
+    return {
+        "id": "preview_c17435280a1e4d12b380b9f2de482813",
+        "account_id": "account-a", "acc_num": "1001", "pair": "EURUSD",
+        "instrument_id": "4665", "side": "long", "order_type": "limit",
+        "entry": 1.143, "stop_loss": 1.141, "take_profit": 1.147,
+        "lot_size": 1.19, "quantity": 119000,
+        "broker_metadata": metadata(instrument_id="4665", route_id="route-1",
+            tick_size=0.00001, price_precision=5).__dict__,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible_after,expected_attempts", [(1, 1), (3, 3)])
+async def test_bounded_reconciliation_polls_until_pending_new_order_is_visible(
+    monkeypatch, visible_after, expected_attempts,
+):
+    monkeypatch.setattr(settings, "autonomous_broker_verification_max_attempts", 4)
+    monkeypatch.setattr(settings, "autonomous_broker_verification_initial_delay_seconds", 0)
+    client = SubmissionClient(visible_after_order_read=visible_after)
+    client.submitted = True
+    client.strategy_id = "afd-4d12b380b9f2de482813"
+    service = AutonomousDemoService()
+
+    result = await service._poll_reconciliation(
+        client, client.config(), submission_preview(), {}, client.strategy_id,
+    )
+
+    assert result["verified"] is True
+    assert result["verification_attempts"] == expected_attempts
+    assert result["matching_method"] == "correlation_id"
+    assert result["broker_status"] == "New" and result["broker_status_accepted"] is True
+    assert result["broker_order_id"] == "432345564236299554"
+    assert result["side"] == "buy" and result["symbol"] == "EURUSD"
+    assert result["quantity_lots"] == pytest.approx(1.19)
+    assert result["quantity_units"] == pytest.approx(119000)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_retries_a_transient_post_submit_read_error(monkeypatch):
+    class FlakyReadClient(SubmissionClient):
+        async def get_orders(self):
+            self.order_reads += 1
+            if self.order_reads == 1:
+                raise TradeLockerError("get_orders", "sanitized", code="http_error", status_code=502)
+            return {"d": [self.order_row()]}
+
+    monkeypatch.setattr(settings, "autonomous_broker_verification_max_attempts", 3)
+    monkeypatch.setattr(settings, "autonomous_broker_verification_initial_delay_seconds", 0)
+    client = FlakyReadClient()
+    client.submitted = True
+    client.strategy_id = "afd-4d12b380b9f2de482813"
+
+    result = await AutonomousDemoService()._poll_reconciliation(
+        client, client.config(), submission_preview(), {}, client.strategy_id,
+    )
+
+    assert result["verified"] is True and result["verification_attempts"] == 2
+
+
+def test_reconciliation_uses_full_composite_only_when_durable_ids_are_absent():
+    client = SubmissionClient()
+    client.strategy_id = None
+    result = AutonomousDemoService._reconcile(
+        client.config(), {"d": [client.order_row()]}, {"d": []}, {"d": []},
+        submission_preview(), {}, correlation_id="different-correlation",
+    )
+    assert result["verified"] is True
+    assert result["matching_method"] == "composite"
+
+
+def test_reconciliation_keeps_lots_units_and_account_boundaries_distinct():
+    client = SubmissionClient()
+    preview = submission_preview()
+    client.strategy_id = "afd-4d12b380b9f2de482813"
+    wrong_quantity = client.order_row()
+    wrong_quantity[2] = "119000"
+    result = AutonomousDemoService._reconcile(
+        client.config(), {"d": [wrong_quantity]}, {"d": []}, {"d": []}, preview, {},
+        correlation_id=client.strategy_id,
+    )
+    assert result["quantity_matches"] is False and result["verified"] is False
+
+    wrong_account = client.order_row()
+    wrong_account[11] = "account-b"
+    result = AutonomousDemoService._reconcile(
+        client.config(), {"d": [wrong_account]}, {"d": []}, {"d": []}, preview, {},
+        correlation_id=client.strategy_id,
+    )
+    assert result["account_matches"] is False and result["verified"] is False
+
+
+def submission_service(tmp_path, monkeypatch, client, *, origin="autonomous"):
+    monkeypatch.setattr(settings, "autonomous_broker_verification_initial_delay_seconds", 0)
+    monkeypatch.setattr(settings, "autonomous_broker_verification_max_attempts", 3)
+    repository = ExecutionRepository(tmp_path / "submission.db")
+    repository.get_or_create_settings("user", "connection-a", "account-a", "1001")
+    now = datetime.now(timezone.utc)
+    repository.insert_snapshot({
+        "id": "snap-submit", "user_sub": "user", "connection_id": "connection-a",
+        "account_id": "account-a", "acc_num": "1001", "environment": "demo",
+        "strategy_name": "strategy", "strategy_version": "1", "normalized_snapshot_json": "{}",
+        "retrieved_at": now.isoformat(), "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "created_at": now.isoformat(),
+    })
+    preview = submission_preview()
+    repository.insert_preview({
+        **{key: value for key, value in preview.items() if key != "broker_metadata"},
+        "snapshot_id": "snap-submit", "user_sub": "user",
+        "connection_id": "connection-a", "environment": "demo", "profile_ref": "profile-a",
+        "account_record_id": "account-record-a", "connection_ref": "connection-ref-a",
+        "account_alias": "herofx-demo-1", "server": "HeroFX",
+        "base_url": "https://demo.tradelocker.test/backend-api", "demo_classification": "demo",
+        "route_id": "route-1", "estimated_risk": 100, "risk_percent": 1,
+        "estimated_reward": 200, "reward_risk": 2,
+        "broker_metadata_json": json.dumps(preview["broker_metadata"]),
+        "status": "approved", "violations_json": "[]", "execution_origin": origin,
+        "expires_at": (now + timedelta(minutes=5)).isoformat(), "created_at": now.isoformat(),
+    })
+    connection = BrokerConnection(
+        connection_id="connection-a", connection_ref="connection-ref-a",
+        base_url="https://demo.tradelocker.test/backend-api", username="u", password="p",
+        server="HeroFX", account_id="account-a", account_number="1001", environment="demo",
+    )
+    context = VerifiedDemoContext(
+        user_sub="user", connection_id="connection-a", account_id="account-a", acc_num="1001",
+        account_name="Demo", currency="USD", environment="demo", server="HeroFX",
+        base_url=connection.base_url, execution_mode=ExecutionMode.DEMO_AUTONOMOUS,
+        risk={"strategy_name": "strategy", "strategy_version": "1", "strategy_config": {},
+              "maximum_open_positions": 1, "maximum_pending_orders": 1,
+              "maximum_new_entries_per_day": 2, "daily_loss_limit_percent": 3,
+              "drawdown_cutoff_percent": 10, "risk_per_trade_percent": 3},
+        connection=connection, profile_ref="profile-a", account_record_id="account-record-a",
+        account_alias="herofx-demo-1", connection_ref="connection-ref-a",
+        connection_label="HeroFX Demo", demo_classification="demo",
+    )
+    seen_client_args = []
+    def factory(**kwargs):
+        seen_client_args.append(kwargs)
+        return client
+    service = AutonomousDemoService(
+        execution_repository=repository, client_factory=factory,
+        account_status_service=SnapshotAccountService(),
+    )
+    async def bound_context(*args, **kwargs): return context
+    async def providers():
+        return ({"finnhub": {"available": True, "stale": False},
+                 "fred": {"available": True, "stale": False}}, [], {})
+    service.context = bound_context
+    service._provider_state = providers
+    service._kill_switch = lambda: False
+    return service, repository, preview["id"], seen_client_args
+
+
+@pytest.mark.asyncio
+async def test_autonomous_submission_uses_repaired_account_bound_verification(tmp_path, monkeypatch):
+    client = SubmissionClient(visible_after_order_read=2)
+    service, _, preview_id, seen = submission_service(tmp_path, monkeypatch, client)
+
+    result = await service.submit("user", preview_id, "autonomous:durable-key")
+
+    assert result["status"] == "submitted" and result["manual_review_required"] is False
+    assert result["broker_order_id"] == "432345564236299554"
+    assert result["broker_status"] == "New"
+    assert result["quantity_lots"] == pytest.approx(1.19)
+    assert result["quantity_units"] == pytest.approx(119000)
+    assert client.place_order_calls == 1
+    assert seen[0]["account_id"] == "account-a" and seen[0]["account_number"] == "1001"
+
+
+@pytest.mark.asyncio
+async def test_unknown_consumes_key_and_later_read_only_lookup_reconciles(tmp_path, monkeypatch):
+    client = SubmissionClient(visible_after_order_read=999)
+    service, repository, preview_id, _ = submission_service(tmp_path, monkeypatch, client, origin="manual")
+    monkeypatch.setattr(settings, "autonomous_broker_verification_max_attempts", 2)
+
+    unknown = await service.submit("user", preview_id, "manual:durable-key")
+    duplicate = await service.submit("user", preview_id, "manual:durable-key")
+
+    assert unknown["status"] == duplicate["status"] == "unknown"
+    assert unknown["manual_review_required"] is True and unknown["execution_id"]
+    assert client.place_order_calls == 1
+    submission = repository.get_submission(idempotency_key="manual:durable-key")
+    assert submission["submission_state"] == "unknown"
+
+    client.visible_after_order_read = client.order_reads + 1
+    reconciled = await service.execution_result("user", unknown["execution_id"])
+
+    assert reconciled["status"] == "submitted"
+    assert reconciled["broker_order_id"] == "432345564236299554"
+    assert client.place_order_calls == 1
+    assert repository.get_submission(idempotency_key="manual:durable-key")["submission_state"] == "verified"

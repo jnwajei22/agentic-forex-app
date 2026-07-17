@@ -843,8 +843,8 @@ async def submit_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:
     except AutonomousExecutionError as exc:return exc.as_dict()
 
 
-def get_demo_execution_result(execution_id:str)->dict[str,Any]:
-    try:return AutonomousDemoService().execution_result(_authenticated_user(),execution_id)
+async def get_demo_execution_result(execution_id:str)->dict[str,Any]:
+    try:return await AutonomousDemoService().execution_result(_authenticated_user(),execution_id)
     except AutonomousExecutionError as exc:return exc.as_dict()
 
 
