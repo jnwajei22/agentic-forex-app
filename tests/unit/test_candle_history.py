@@ -11,7 +11,9 @@ from app.services.market_data.history import (
     MAX_CANDLES,
     PaginatedCandleResult,
     TIMEFRAME_DURATION_MS,
+    aggregate_hourly_candles_to_utc_days,
     get_candles_paginated,
+    normalize_timeframe,
 )
 
 
@@ -159,6 +161,33 @@ def test_malformed_history_rows_are_discarded_at_boundary():
     candles, discarded = normalize_history_payload([raw(END), {"t": END - HOUR, "o": 1}])
     assert len(candles) == 1 and discarded == 1
     assert set(candles[0].model_dump()) == {"timestamp", "open", "high", "low", "close", "volume"}
+
+
+@pytest.mark.parametrize("alias", ["1D", "1d", "D", "day", "daily", "1440"])
+def test_daily_timeframe_aliases_send_documented_resolution(alias):
+    assert normalize_timeframe(alias) == "1D"
+
+
+def test_complete_hourly_broker_rows_aggregate_to_utc_daily_ohlcv():
+    day = END - END % TIMEFRAME_DURATION_MS["1D"]
+    rows = [Candle(timestamp=day + HOUR * index, open=1 + index, high=2 + index,
+                   low=.5 + index, close=1.5 + index, volume=index)
+            for index in range(24)]
+    daily, incomplete = aggregate_hourly_candles_to_utc_days(rows, required_count=1)
+    assert incomplete == []
+    assert [row.timestamp for row in daily] == [day]
+    assert daily[0].open == 1 and daily[0].close == 24.5
+    assert daily[0].high == 25 and daily[0].low == .5
+    assert daily[0].volume == sum(range(24))
+
+
+def test_incomplete_utc_day_is_rejected_from_aggregation():
+    day = END - END % TIMEFRAME_DURATION_MS["1D"]
+    rows = [Candle(timestamp=day + HOUR * index, open=1, high=2, low=.5, close=1.5, volume=0)
+            for index in range(23)]
+    daily, incomplete = aggregate_hourly_candles_to_utc_days(rows, required_count=1)
+    assert daily == []
+    assert incomplete == [datetime.fromtimestamp(day / 1000, timezone.utc).date().isoformat()]
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.brokers.tradelocker.mapping import TradeLockerMappingError, map_configured_rows
 from app.config.settings import settings
 from app.models.autonomous import AutonomousOrderProposal, ExecutionMode
+from app.services.market_data.history import normalize_timeframe
 from app.services.providers.errors import ProviderError
 from app.services.providers.finnhub import FinnhubClient
 from app.services.providers.fred import FredClient
@@ -303,13 +304,15 @@ class AutonomousDemoService:
         return finnhub_required, fred_required
 
     @staticmethod
-    def _snapshot_failure(component: str) -> AutonomousExecutionError:
+    def _snapshot_failure(
+        component: str, diagnostics: dict[str, Any] | None = None
+    ) -> AutonomousExecutionError:
         safe_component = component.replace("-", "_")
         return AutonomousExecutionError(
             "market_snapshot_unavailable",
             f"The required TradeLocker {safe_component.replace('_', ' ')} component is unavailable or unmappable.",
             reasons=[f"{safe_component}_unavailable"],
-            details={"missing_component": safe_component},
+            details={"missing_component": safe_component, **(diagnostics or {})},
         )
 
     async def context(self, user_sub: str, profile_ref: str, *, require_mode: bool = True,
@@ -546,10 +549,23 @@ class AutonomousDemoService:
                     for timeframe, count in (("1d", 190), ("4h", 250), ("1h", 200), ("15m", 200)):
                         try:
                             series = await client.get_candles(pair, timeframe, count)
-                        except TradeLockerError:
-                            raise self._snapshot_failure(f"{pair.lower()}_candles_{timeframe}") from None
+                        except TradeLockerError as exc:
+                            diagnostics = {
+                                "requested_timeframe": timeframe,
+                                "provider_timeframe_sent": normalize_timeframe(timeframe),
+                                "http_status": exc.status_code,
+                                "broker_error_category": exc.code,
+                                "rows_received": 0,
+                                "mapping_failure": exc.details.get("mapping_failure"),
+                            }
+                            diagnostics.update(exc.details)
+                            raise self._snapshot_failure(
+                                f"{pair.lower()}_candles_{timeframe}", diagnostics
+                            ) from None
                         if not series.complete:
-                            raise self._snapshot_failure(f"{pair.lower()}_candles_{timeframe}")
+                            raise self._snapshot_failure(
+                                f"{pair.lower()}_candles_{timeframe}", series.diagnostics()
+                            )
                         if timeframe == "1d": d1 = series
                         elif timeframe == "4h": h4 = series
                         elif timeframe == "1h": h1 = series

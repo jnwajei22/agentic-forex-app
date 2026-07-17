@@ -35,7 +35,12 @@ PageFetcher = Callable[[int, int], Awaitable[Any]]
 
 def normalize_timeframe(timeframe: str) -> str:
     candidate = timeframe.strip()
-    aliases = {"1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W"}
+    aliases = {
+        "1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W",
+        # These are accepted caller aliases. The provider always receives
+        # TradeLocker's documented, case-sensitive value (1D).
+        "D": "1D", "d": "1D", "day": "1D", "daily": "1D", "1440": "1D",
+    }
     candidate = aliases.get(candidate, candidate)
     if candidate not in TIMEFRAME_DURATION_MS:
         raise ValueError(f"Unsupported TradeLocker timeframe: {timeframe}.")
@@ -78,6 +83,58 @@ class PaginatedCandleResult:
     stop_reason: str | None = None
     malformed_discarded: int = 0
     correlation_id: str | None = None
+    requested_timeframe: str | None = None
+    provider_timeframe_sent: str | None = None
+    http_status: int | None = 200
+    broker_error_category: str | None = None
+    rows_received: int = 0
+    mapping_failure: str | None = None
+    source: str = "direct"
+    fallback_diagnostics: dict[str, Any] | None = None
+
+    def diagnostics(self) -> dict[str, Any]:
+        result = {
+            "requested_timeframe": self.requested_timeframe or self.timeframe,
+            "provider_timeframe_sent": self.provider_timeframe_sent or self.timeframe,
+            "http_status": self.http_status,
+            "broker_error_category": self.broker_error_category,
+            "rows_received": self.rows_received,
+            "mapping_failure": self.mapping_failure,
+            "candle_source": self.source,
+        }
+        if self.fallback_diagnostics is not None:
+            result["fallback"] = self.fallback_diagnostics
+        return result
+
+
+def aggregate_hourly_candles_to_utc_days(
+    candles: list[Candle], *, required_count: int
+) -> tuple[list[Candle], list[str]]:
+    """Aggregate only complete, canonical UTC days from verified 1H candles."""
+    by_day: dict[int, dict[int, Candle]] = {}
+    for candle in candles:
+        day_start = candle.timestamp - (candle.timestamp % TIMEFRAME_DURATION_MS["1D"])
+        by_day.setdefault(day_start, {})[candle.timestamp] = candle
+
+    daily: list[Candle] = []
+    incomplete: list[str] = []
+    hour = TIMEFRAME_DURATION_MS["1H"]
+    for day_start in sorted(by_day):
+        rows = by_day[day_start]
+        expected = {day_start + hour * index for index in range(24)}
+        if set(rows) != expected:
+            incomplete.append(iso_utc(day_start)[:10])
+            continue
+        ordered = [rows[timestamp] for timestamp in sorted(rows)]
+        daily.append(Candle(
+            timestamp=day_start,
+            open=ordered[0].open,
+            high=max(row.high for row in ordered),
+            low=min(row.low for row in ordered),
+            close=ordered[-1].close,
+            volume=sum(row.volume for row in ordered),
+        ))
+    return daily[-required_count:], incomplete
 
 
 async def get_candles_paginated(
@@ -158,6 +215,7 @@ async def get_candles_paginated(
     if requested_count is not None and len(ordered) > requested_count:
         ordered = ordered[-requested_count:]
     result.candles = ordered[:max_candles]
+    result.rows_received = len(result.candles)
     covered_range = range_fully_queried or (
         bool(ordered) and ordered[0].timestamp <= start_time_ms + duration
     )
@@ -174,6 +232,7 @@ async def get_candles_paginated(
         }.get(result.stop_reason, "The requested candle range was not fully covered.")
         result.warning = f"{reason} Returned {len(ordered)} of approximately {target} candles."
     if result.malformed_discarded:
+        result.mapping_failure = f"{result.malformed_discarded} malformed candle row(s)"
         suffix = f" Discarded {result.malformed_discarded} malformed candle(s)."
         result.warning = ((result.warning + suffix) if result.warning else suffix.strip())
     return result

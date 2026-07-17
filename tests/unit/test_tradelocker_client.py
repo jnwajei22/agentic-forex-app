@@ -293,3 +293,136 @@ async def test_submit_order_remains_unimplemented():
     with pytest.raises(NotImplementedError, match="intentionally disabled"):
         await adapter.submit_order(None)
     await adapter.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_daily_candles_use_documented_resolution_and_map_abbreviations():
+    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
+    day = 86_400_000
+    seen = []
+    client = _client(lambda request: httpx.Response(500))
+
+    async def resolve(symbol):
+        assert symbol == "EURUSD"
+        return 77, 9
+
+    async def history(**kwargs):
+        seen.append(kwargs)
+        assert kwargs["instrument_id"] == 77 and kwargs["route_id"] == 9
+        assert kwargs["resolution"] == "1D"
+        timestamps = [end - day, end]
+        return {"t": timestamps, "o": [1.0, 2.0], "h": [1.2, 2.2],
+                "l": [.9, 1.9], "c": [1.1, 2.1], "v": [0, 5]}
+
+    client._resolve_instrument = resolve
+    client._history_page = history
+    result = await client.get_candles("EURUSD", "day", 2, end_time_ms=end)
+    await client.aclose()
+
+    assert result.complete and result.source == "direct"
+    assert result.provider_timeframe_sent == "1D"
+    assert [row.close for row in result.candles] == [1.1, 2.1]
+    assert [row.volume for row in result.candles] == [0, 5]
+    assert seen
+
+
+@pytest.mark.asyncio
+async def test_daily_fallback_aggregates_only_same_account_symbol_and_info_route():
+    hour, day = 3_600_000, 86_400_000
+    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
+    first_day = end - (end % day) - day
+    hourly_rows = [
+        {"t": first_day + hour * index, "o": 1 + index, "h": 2 + index,
+         "l": .5 + index, "c": 1.5 + index, "v": 1}
+        for index in range(48)
+    ]
+    requests = []
+    client = _client(lambda request: httpx.Response(500), account_id="account-a", account_number="7")
+
+    async def resolve(symbol):
+        assert symbol == "EURUSD"
+        return 77, 9
+
+    async def history(**kwargs):
+        requests.append((client.account_id, client.account_number, kwargs["instrument_id"],
+                         kwargs["route_id"], kwargs["resolution"]))
+        assert kwargs["instrument_id"] == 77 and kwargs["route_id"] == 9
+        if kwargs["resolution"] == "1D":
+            return []
+        return [row for row in hourly_rows
+                if kwargs["start_time_ms"] <= row["t"] <= kwargs["end_time_ms"]]
+
+    client._resolve_instrument = resolve
+    client._history_page = history
+    result = await client.get_candles("EURUSD", "1d", 2, end_time_ms=end)
+    await client.aclose()
+
+    assert result.complete and result.source == "aggregated_1H"
+    assert len(result.candles) == 2
+    assert result.candles[0].open == 1 and result.candles[0].close == 24.5
+    assert result.candles[0].volume == 24
+    assert all(row[:4] == ("account-a", "7", 77, 9) for row in requests)
+    assert {row[4] for row in requests} == {"1D", "1H"}
+
+
+@pytest.mark.asyncio
+async def test_incomplete_hourly_fallback_blocks_with_exact_diagnostics():
+    hour, day = 3_600_000, 86_400_000
+    end = int(datetime(2026, 7, 17, 23, tzinfo=timezone.utc).timestamp() * 1000)
+    first_day = end - (end % day) - day
+    hourly_rows = [{"t": first_day + hour * index, "o": 1, "h": 2,
+                    "l": .5, "c": 1.5, "v": 0} for index in range(47)]
+    client = _client(lambda request: httpx.Response(500))
+
+    async def resolve(symbol): return 77, 9
+    async def history(**kwargs):
+        if kwargs["resolution"] == "1D":
+            return []
+        return [row for row in hourly_rows
+                if kwargs["start_time_ms"] <= row["t"] <= kwargs["end_time_ms"]]
+
+    client._resolve_instrument = resolve
+    client._history_page = history
+    result = await client.get_candles("EURUSD", "1440", 2, end_time_ms=end)
+    await client.aclose()
+
+    assert not result.complete
+    diagnostics = result.diagnostics()
+    assert diagnostics["requested_timeframe"] == "1440"
+    assert diagnostics["provider_timeframe_sent"] == "1D"
+    assert diagnostics["http_status"] == 200
+    assert diagnostics["broker_error_category"] == "incomplete_history"
+    assert diagnostics["rows_received"] == 0
+    assert diagnostics["mapping_failure"] is None
+    assert diagnostics["fallback"]["provider_timeframe_sent"] == "1H"
+    assert diagnostics["fallback"]["complete_daily_rows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_candles_cannot_cross_account_or_symbol_context():
+    end = int(datetime(2026, 7, 17, tzinfo=timezone.utc).timestamp() * 1000)
+
+    async def retrieve(account_id, account_number, symbol, instrument_id, close):
+        client = _client(lambda request: httpx.Response(500),
+                         account_id=account_id, account_number=account_number)
+
+        async def resolve(requested_symbol):
+            assert requested_symbol == symbol
+            return instrument_id, 9
+
+        async def history(**kwargs):
+            assert client.account_id == account_id and client.account_number == account_number
+            assert kwargs["instrument_id"] == instrument_id
+            return [{"t": end, "o": close, "h": close, "l": close,
+                     "c": close, "v": 0}]
+
+        client._resolve_instrument = resolve
+        client._history_page = history
+        result = await client.get_candles(symbol, "1D", 1, end_time_ms=end)
+        await client.aclose()
+        return result.candles[0]
+
+    eurusd = await retrieve("account-a", "7", "EURUSD", 77, 1.1)
+    gbpusd = await retrieve("account-b", "8", "GBPUSD", 88, 1.3)
+    assert eurusd.close == 1.1
+    assert gbpusd.close == 1.3

@@ -386,6 +386,7 @@ class SnapshotClient:
                 "minStopLossDistance": 0.0001, "commissionPerLot": 0, "leverage": 100}}}
 
     async def get_candles(self, symbol, timeframe, count):
+        self.calls.append(f"candles:{symbol}:{timeframe}:{count}")
         self._fail(f"candles_{timeframe}")
         return SimpleNamespace(complete=True, candles=[])
 
@@ -476,6 +477,36 @@ async def test_snapshot_failure_names_account_status_component(tmp_path, monkeyp
         await service.snapshot("user", profile, "EURUSD")
     assert error.value.as_dict()["missing_component"] == "account_status"
     assert error.value.reasons == ["account_status_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_autonomous_snapshot_succeeds_when_required_daily_candles_are_available(
+    tmp_path, monkeypatch
+):
+    service, profile, calls, clients = snapshot_service(
+        tmp_path, monkeypatch, mode="demo_autonomous"
+    )
+    result = await service.snapshot("user", profile, "EURUSD", autonomous=True)
+    assert result["status"] == "ok"
+    assert "candles:EURUSD:1d:190" in calls
+    assert result["market"]["pairs"]["EURUSD"]["complete"] is True
+    assert all(client.place_order_calls == 0 for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_daily_candle_failure_exposes_request_diagnostics(tmp_path, monkeypatch):
+    service, profile, _, clients = snapshot_service(
+        tmp_path, monkeypatch, fail_component="candles_1d", mode="demo_autonomous"
+    )
+    with pytest.raises(AutonomousExecutionError) as error:
+        await service.snapshot("user", profile, "EURUSD", autonomous=True)
+    payload = error.value.as_dict()
+    assert payload["missing_component"] == "eurusd_candles_1d"
+    assert payload["requested_timeframe"] == "1d"
+    assert payload["provider_timeframe_sent"] == "1D"
+    assert payload["rows_received"] == 0
+    assert payload["mapping_failure"] is None
+    assert all(client.place_order_calls == 0 for client in clients)
 
 
 @pytest.mark.asyncio
