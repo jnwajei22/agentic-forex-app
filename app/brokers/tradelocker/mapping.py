@@ -67,7 +67,10 @@ def map_configured_rows(
     """Map a TradeLocker row collection using its matching /trade/config columns."""
     try:
         columns = config_response["d"][config_key]["columns"]
-        rows = data_response["d"][data_key]
+        payload = data_response["d"]
+        # Current TradeLocker reads return the positional collection directly in `d`.
+        # Retain compatibility with the older named wrapper without ever exposing either raw form.
+        rows = payload[data_key] if isinstance(payload, dict) else payload
     except (KeyError, TypeError) as exc:
         raise TradeLockerMappingError(f"Malformed TradeLocker payload for {data_key}.") from exc
     if not isinstance(columns, list) or not isinstance(rows, list):

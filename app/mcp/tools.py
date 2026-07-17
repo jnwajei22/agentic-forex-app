@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import logging
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -48,6 +49,9 @@ from app.services.tradelocker.account_status import (
 from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
 from app.services.watchlist import get_default_watchlist
 from app.storage.brokers import BrokerRepository, BrokerStorageError
+
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_url() -> str:
@@ -492,25 +496,40 @@ async def _account_rows(account_alias: str | None, *, orders: bool) -> dict[str,
     user_sub = get_current_user_sub()
     if not user_sub:
         return {"status": "error", "error": "authentication_required"}
+    operation = "get_pending_orders" if orders else "get_open_positions"
+    context = None
     try:
         context = BrokerAccountResolver().resolve(user_sub, account_alias=account_alias)
         async with TradeLockerClient(base_url=context.base_url, username=context.username,
             password=context.password, server=context.server, account_id=context.account_id,
             account_number=context.account_number) as client:
             config = await client.get_config()
-            data = await (client.get_orders() if orders else client.get_positions())
+            data = await (client.get_orders() if orders else client.get_open_positions())
         rows = map_configured_rows(config_response=config, data_response=data,
             config_key="ordersConfig" if orders else "positionsConfig",
             data_key="orders" if orders else "positions")
+        logger.info("tradelocker_rows_read operation=%s user_ref=%s account_ref=%s account_alias=%s row_count=%s",
+            operation,user_sub,context.account_record_id,context.account_alias,len(rows))
         return {"status": "ok", "account": context.safe_identity(),
                 "orders" if orders else "positions": rows}
     except AccountResolutionError as exc:
+        logger.warning("tradelocker_rows_failed operation=%s user_ref=%s account_ref=%s error_category=%s",
+            operation,user_sub,context.account_record_id if context else None,exc.code)
         return {"status": "error", "error": exc.code, "message": str(exc)}
     except TradeLockerMappingError:
+        logger.warning("tradelocker_rows_failed operation=%s user_ref=%s account_ref=%s error_category=account_field_mapping_unavailable",
+            operation,user_sub,context.account_record_id if context else None)
         return {"status": "error", "error": "account_field_mapping_unavailable",
                 "message": "TradeLocker rows could not be safely labeled."}
     except TradeLockerError as exc:
+        logger.warning("tradelocker_rows_failed operation=%s user_ref=%s account_ref=%s error_category=%s",
+            operation,user_sub,context.account_record_id if context else None,exc.code)
         return _tradelocker_error(exc)
+    except Exception:
+        logger.error("tradelocker_rows_failed operation=%s user_ref=%s account_ref=%s error_category=internal_read_error",
+            operation,user_sub,context.account_record_id if context else None)
+        return {"status":"error","error":"internal_read_error",
+            "message":"The TradeLocker account rows could not be retrieved safely."}
 
 
 async def get_open_positions(account_alias: str | None = None) -> dict[str, Any]:
@@ -720,8 +739,22 @@ def get_autonomous_daily_summary(day:str|None=None)->dict[str,Any]:
 # Profile-bound demo execution API. These names intentionally expose only safe profile,
 # preview, execution, order, and position references; broker account routing is internal.
 async def get_demo_execution_status(profile_id: str) -> dict[str,Any]:
-    try:return await AutonomousDemoService().status(_authenticated_user(),profile_id)
-    except AutonomousExecutionError as exc:return exc.as_dict()
+    user=_authenticated_user()
+    try:
+        result=await AutonomousDemoService().status(user,profile_id)
+        logger.info("demo_execution_status user_ref=%s profile_ref=%s status=%s blockers=%s",
+            user,profile_id,result.get("status"),result.get("blocking_reasons",[]))
+        return result
+    except AutonomousExecutionError as exc:
+        logger.warning("demo_execution_status_failed user_ref=%s profile_ref=%s error_category=%s",
+            user,profile_id,exc.code)
+        return exc.as_dict()
+    except Exception:
+        logger.error("demo_execution_status_failed user_ref=%s profile_ref=%s error_category=internal_status_error",
+            user,profile_id)
+        return {"schema_version":"1.0","status":"blocked","error":"internal_status_error",
+            "message":"Demo execution status is temporarily unavailable.",
+            "blocking_reasons":["internal_status_error"],"can_submit_demo_orders":False}
 
 
 async def get_demo_trading_snapshot(profile_id: str,symbol: str)->dict[str,Any]:
@@ -731,17 +764,45 @@ async def get_demo_trading_snapshot(profile_id: str,symbol: str)->dict[str,Any]:
 
 async def review_demo_order(profile_id:str,symbol:str,side:Literal["long","short"],order_type:Literal["market","limit","stop"],
                             stop_loss:float,take_profit:float,reason:str,entry:float|None=None)->dict[str,Any]:
+    user=_authenticated_user()
     try:
         if not reason.strip() or len(reason)>500:raise AutonomousExecutionError("invalid_reason","A concise human-readable reason is required.",status="rejected")
-        service=AutonomousDemoService();snapshot=await service.snapshot(_authenticated_user(),profile_id,symbol)
+        service=AutonomousDemoService();snapshot=await service.snapshot(user,profile_id,symbol)
         if entry is None:
             if order_type!="market":raise AutonomousExecutionError("entry_required","Limit and stop orders require an entry price.",status="rejected")
             bid,ask=service._quote(snapshot["market"]["pairs"][normalize_pair(symbol)]["quote"]);entry=ask if side=="long" else bid
         proposal=AutonomousOrderProposal(snapshot_id=snapshot["snapshot_id"],pair=symbol,side=side,order_type=order_type,
             entry=entry,stop_loss=stop_loss,take_profit=take_profit,reason_codes=["user_reason"])
-        result=await service.review(_authenticated_user(),profile_id,proposal);result["reason"]=reason;result["submission_allowed"]=result.get("status")=="approved";return result
-    except ValidationError:return {"status":"rejected","error":"invalid_proposal","message":"The order proposal schema is invalid."}
-    except AutonomousExecutionError as exc:return exc.as_dict()
+        result=await service.review(user,profile_id,proposal)
+        required=("preview_id","expires_at","quantity","estimated_risk","estimated_margin")
+        if not isinstance(result,dict) or any(result.get(field) is None for field in required):
+            logger.error("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=preview_payload_missing",
+                user,profile_id,normalize_pair(symbol))
+            return _demo_review_error("preview_payload_missing","The validated preview payload is incomplete.")
+        result["reason"]=reason;result["submission_allowed"]=result.get("status")=="approved"
+        result["blocking_reasons"]=result.get("violations") or []
+        logger.info("demo_order_reviewed user_ref=%s profile_ref=%s symbol=%s preview_id=%s submission_allowed=%s",
+            user,profile_id,normalize_pair(symbol),result["preview_id"],result["submission_allowed"])
+        return result
+    except ValidationError:
+        logger.warning("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=invalid_proposal",
+            user,profile_id,normalize_pair(symbol))
+        return _demo_review_error("invalid_proposal","The order proposal schema is invalid.")
+    except AutonomousExecutionError as exc:
+        logger.warning("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=%s",
+            user,profile_id,normalize_pair(symbol),exc.code)
+        return _demo_review_error(exc.code,
+            "The demo order preview was blocked by a required validation or data dependency.",exc.reasons)
+    except Exception:
+        logger.error("demo_order_review_failed user_ref=%s profile_ref=%s symbol=%s error_category=internal_review_error",
+            user,profile_id,normalize_pair(symbol))
+        return _demo_review_error("internal_review_error","The demo order preview is temporarily unavailable.")
+
+
+def _demo_review_error(category:str,message:str,reasons:list[str]|None=None)->dict[str,Any]:
+    return {"schema_version":"1.0","status":"rejected","error":category,"message":message,
+        "blocking_reasons":reasons or [category],"preview_id":None,"expires_at":None,
+        "quantity":None,"estimated_risk":None,"estimated_margin":None,"submission_allowed":False}
 
 
 async def submit_demo_order(preview_id:str,idempotency_key:str)->dict[str,Any]:
