@@ -55,6 +55,7 @@ class VerifiedDemoContext:
     account_record_id: str
     account_alias: str
     connection_ref: str
+    connection_label: str | None
     demo_classification: str
 
 
@@ -256,11 +257,15 @@ class AutonomousDemoService:
         if require_mode and mode == ExecutionMode.READ_ONLY:
             raise AutonomousExecutionError("execution_mode_read_only", "The execution profile is read-only.")
         return VerifiedDemoContext(
-            user_sub, connection.connection_id, connection.account_id, connection.account_number,
-            account.get("name"), account.get("currency"), connection.environment,
-            connection.server, connection.base_url, mode, risk, connection,
-            resolved.profile_ref or profile_ref, resolved.account_record_id, resolved.account_alias,
-            resolved.connection_ref, resolved.demo_classification,
+            user_sub=user_sub, connection_id=connection.connection_id,
+            account_id=connection.account_id, acc_num=connection.account_number,
+            account_name=account.get("name"), currency=account.get("currency"),
+            environment=connection.environment, server=connection.server,
+            base_url=connection.base_url, execution_mode=mode, risk=risk,
+            connection=connection, profile_ref=resolved.profile_ref or profile_ref,
+            account_record_id=resolved.account_record_id, account_alias=resolved.account_alias,
+            connection_ref=resolved.connection_ref, connection_label=resolved.connection_label,
+            demo_classification=resolved.demo_classification,
         )
 
     def _client(self, connection: BrokerConnection) -> TradeLockerClient:

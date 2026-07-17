@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,14 @@ from app.services.tradelocker.config_cache import (
     TradeLockerConfigCacheKey,
     tradelocker_config_cache,
 )
+from app.models.tradelocker import (
+    TradeLockerAccountIdentity,
+    TradeLockerAccountStatus,
+    TradeLockerMarginStatus,
+    TradeLockerTodayStatus,
+)
+from app.services.autonomous.execution import AutonomousDemoService
+from app.storage.execution import ExecutionRepository
 
 
 @pytest.fixture
@@ -39,6 +48,89 @@ def _claims(subject: str) -> dict:
 def _client_for(subject: str) -> TestClient:
     app.dependency_overrides[platform.current_claims] = lambda: _claims(subject)
     return TestClient(app)
+
+
+class _DemoStatusDiscoveryClient:
+    def __init__(self, **kwargs):
+        self.account_id = kwargs["account_id"]
+        self.account_number = kwargs["account_number"]
+
+    async def get_accounts(self):
+        return {"accounts": [{"accountId": self.account_id, "accNum": self.account_number,
+            "name": "Profile Demo", "currency": "USD"}]}
+
+    async def aclose(self):
+        pass
+
+
+class _DemoStatusAccountService:
+    async def retrieve(self, user_sub, account_alias):
+        return TradeLockerAccountStatus(
+            retrieved_at=datetime.now(timezone.utc),
+            account=TradeLockerAccountIdentity(account_id="demo-account", account_number="7",
+                name="Profile Demo", currency="USD", account_alias=account_alias,
+                environment="demo", active=True),
+            balance=10_000, projected_balance=10_000, available_funds=9_000,
+            blocked_balance=0, cash_balance=10_000, withdrawal_available=9_000,
+            open_gross_pnl=0, open_net_pnl=0, positions_count=0, pending_orders_count=0,
+            today=TradeLockerTodayStatus(gross=0, net=0, fees=0, volume=0, trades_count=0),
+            margin=TradeLockerMarginStatus(initial_requirement=0, maintenance_requirement=0,
+                warning_level=100, stop_out_level=50, warning_requirement=0,
+                margin_before_warning=9_000),
+        )
+
+
+def test_demo_status_uses_profile_bound_safe_connection_label(platform_storage, monkeypatch):
+    monkeypatch.setattr(settings, "tradelocker_demo_base_url", "https://demo.tradelocker.test/backend-api")
+    monkeypatch.setattr(settings, "kill_switch_enabled", False)
+    monkeypatch.setattr(settings, "finnhub_enabled", True)
+    monkeypatch.setattr(settings, "finnhub_api_key", "test-provider-key")
+    username, password, token = "private-user", "private-password", "private-token"
+    demo_connection = platform_storage.save_connection("auth0|user-a",
+        base_url=settings.tradelocker_demo_base_url, username=username, password=password,
+        server="DEMO-SERVER", environment="demo", label="Safe Demo Connection")
+    platform_storage.sync_accounts("auth0|user-a", demo_connection.connection_ref,
+        {"accounts": [{"accountId": "demo-account", "accNum": "7", "currency": "USD"}]})
+    demo_account = platform_storage.list_accounts("auth0|user-a")[0]
+    demo_profile = platform_storage.create_profile("auth0|user-a", name="Profile Demo",
+        account_ref=demo_account["public_id"], execution_mode="demo_manual")
+    service = AutonomousDemoService(broker_repository=platform_storage,
+        execution_repository=ExecutionRepository(platform_storage.db_path),
+        client_factory=_DemoStatusDiscoveryClient,
+        account_status_service=_DemoStatusAccountService())
+    monkeypatch.setattr(platform, "AutonomousDemoService", lambda: service)
+
+    with _client_for("auth0|user-a") as client:
+        response = client.get(f"/api/execution-profiles/{demo_profile['public_id']}/demo-status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["broker"] == "Safe Demo Connection"
+    assert body["profile_ref"] == demo_profile["public_id"]
+    assert body["account_alias"] == demo_account["account_alias"]
+    assert body["confirmed_demo"] is True
+    serialized = response.text
+    assert username not in serialized and password not in serialized and token not in serialized
+
+    live_connection = platform_storage.save_connection("auth0|user-a",
+        base_url="https://live.tradelocker.test/backend-api", username="live-private-user",
+        password="live-private-password", server="LIVE-SERVER", environment="live",
+        label="Safe Live Connection", create_new=True)
+    platform_storage.sync_accounts("auth0|user-a", live_connection.connection_ref,
+        {"accounts": [{"accountId": "live-account", "accNum": "8", "currency": "USD"}]})
+    live_account = next(item for item in platform_storage.list_accounts("auth0|user-a")
+        if item["environment"] == "live")
+    live_profile = platform_storage.create_profile("auth0|user-a", name="Live Read Only",
+        account_ref=live_account["public_id"], execution_mode="read_only")
+
+    with _client_for("auth0|user-a") as client:
+        rejected = client.get(f"/api/execution-profiles/{live_profile['public_id']}/demo-status")
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "blocked"
+    assert rejected.json()["confirmed_demo"] is False
+    assert rejected.json()["can_submit_demo_orders"] is False
+    assert "account_not_demo" in rejected.json()["blocking_reasons"]
 
 
 def test_user_cannot_access_another_users_broker_connection(platform_storage):
