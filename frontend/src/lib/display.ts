@@ -10,6 +10,9 @@ export function displayValue(value?: string | null): string {
     read_only: "Read Only", demo_manual: "Demo Manual", demo_autonomous: "Demo Autonomous",
     hourly_forex: "Hourly Forex", hourly_forex_v1: "Hourly Forex v1",
     connected: "Connected", ready: "Ready", active: "Active", unavailable: "Unavailable",
+    unable_to_verify: "Unable to Verify", reauthentication_required: "Reauthentication Required",
+    kill_switch_enabled: "Kill Switch Enabled", selected_account: "Selected Account",
+    selected_connection: "Selected Connection",
     live: "Live", demo: "Demo", unknown: "Unknown", disabled: "Disabled",
   };
   const normalized = (value ?? "unknown").toLowerCase();

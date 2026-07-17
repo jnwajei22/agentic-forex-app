@@ -18,8 +18,8 @@ export default function Navigation({ authenticated }: { authenticated: boolean }
       <Link className="brand" href="/">Agentic Forex Desk</Link>
       <div className="nav-links">
         {authenticated ? <>
-          <Link href="/dashboard">Dashboard</Link>
-          <Link href="/settings">Settings</Link>
+          <Link href="/dashboard" aria-current={pathname === "/dashboard" ? "page" : undefined}>Dashboard</Link>
+          <Link href="/settings" aria-current={pathname === "/settings" ? "page" : undefined}>Settings</Link>
           <a className="button secondary" href="/auth/logout">Log out</a>
         </> : <a className="button" href="/auth/login?returnTo=/dashboard">Log in</a>}
       </div>
