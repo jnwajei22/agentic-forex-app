@@ -20,7 +20,8 @@ logger=logging.getLogger(__name__)
 DEFAULT_TIMEZONE="America/Chicago"
 DEFAULT_LOCAL_TIMES=("05:00","07:00","09:00","11:00","13:15")
 WEEKDAYS=("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
-MARKET_SESSION_TIMES={"asia":["19:00"],"london":["03:00"],"new_york":["08:00"],"overlap":["08:00"]}
+MARKET_SESSION_TIMES={"asia":["19:00"],"sydney":["17:00"],"tokyo":["19:00"],
+                      "london":["03:00"],"new_york":["08:00"],"london_new_york_overlap":["08:00"],"overlap":["08:00"]}
 
 
 async def dispatch_autonomous_cycle(runner:AutonomousDecisionRunner,user_sub:str,profile_ref:str,
@@ -51,7 +52,8 @@ def normalize_recurrence(value:dict[str,Any]|None,legacy_times:list[str]|None=No
         unknown=[item for item in sessions if item not in MARKET_SESSION_TIMES]
         if unknown:raise ScheduleStorageError("A market session is not supported.")
         times=validate_local_times([time for session in sessions for time in MARKET_SESSION_TIMES[session]])
-        return {"type":kind,"sessions":sessions,"days":days or list(WEEKDAYS[:5]),"times":times}
+        return {"type":kind,"sessions":sessions,"days":days or list(WEEKDAYS[:5]),"times":times,
+                "market_aware":bool(raw.get("market_aware",True))}
     if kind=="recurring_interval":
         start=str(raw.get("start_time") or "08:00");end=str(raw.get("end_time") or "17:00")
         validate_local_times([start,end]);minutes=int(raw.get("interval_minutes") or 60)
@@ -62,9 +64,10 @@ def normalize_recurrence(value:dict[str,Any]|None,legacy_times:list[str]|None=No
         while current<=last and len(times)<96:
             times.append(current.strftime("%H:%M"));current+=timedelta(minutes=minutes)
         return {"type":kind,"start_time":start,"end_time":end,"interval_minutes":minutes,
-                "days":days or list(WEEKDAYS[:5]),"times":times}
+                "days":days or list(WEEKDAYS[:5]),"times":times,"market_aware":bool(raw.get("market_aware",True))}
     times=validate_local_times(list(raw.get("times") or legacy_times or DEFAULT_LOCAL_TIMES))
-    return {"type":kind,"times":times,"days":days or (list(WEEKDAYS) if kind=="daily" else list(WEEKDAYS[:5]))}
+    return {"type":kind,"times":times,"days":days or (list(WEEKDAYS) if kind=="daily" else list(WEEKDAYS[:5])),
+            "market_aware":bool(raw.get("market_aware",True))}
 
 
 def _recurrence(schedule:dict[str,Any])->dict[str,Any]:
@@ -164,14 +167,35 @@ class AutonomousScheduleService:
         results=[]
         for item in self.schedules.list_schedules(user_sub):
             recent=self.schedules.list_dispatches(user_sub,1,item["profile_ref"])
-            results.append({**self._present(item,self._profile(user_sub,item["profile_ref"])),"latest_dispatch":recent[0] if recent else None})
+            profile=self._profile(user_sub,item["profile_ref"])
+            results.append({**self._present(item,profile),"readiness_warnings":self._readiness_warnings(user_sub,item,profile),
+                            "latest_dispatch":recent[0] if recent else None})
         return results
 
     def status(self,user_sub:str,schedule_id:str)->dict[str,Any]:
         schedule=self.schedules.get_schedule(user_sub,schedule_id)
         if not schedule:raise ScheduleStorageError("Autonomous schedule was not found.")
         dispatches=self.schedules.list_dispatches(user_sub,10,schedule["profile_ref"])
-        return {**self._present(schedule,self._profile(user_sub,schedule["profile_ref"])),"recent_runs":dispatches}
+        profile=self._profile(user_sub,schedule["profile_ref"])
+        return {**self._present(schedule,profile),"readiness_warnings":self._readiness_warnings(user_sub,schedule,profile),
+                "recent_runs":dispatches}
+
+    def _readiness_warnings(self,user_sub:str,schedule:dict[str,Any],profile:dict[str,Any])->list[dict[str,str]]:
+        warnings=[];controls=self.execution.get_autonomous_controls(user_sub)
+        if not profile.get("enabled"):warnings.append({"code":"strategy_disabled","message":"The associated strategy is disabled."})
+        if not profile.get("account_available") or not profile.get("locally_enabled"):
+            warnings.append({"code":"account_unavailable","message":"The trading account is unavailable."})
+        if controls.get("global_autonomous_kill_switch"):
+            warnings.append({"code":"kill_switch_active","message":"The global kill switch blocks scheduled submissions."})
+        universe=(profile.get("profile_v2") or {}).get("market_universe") or {}
+        if universe.get("mode")=="custom" and not universe.get("included_instrument_ids"):
+            warnings.append({"code":"no_market_selected","message":"The strategy has no selected markets."})
+        limit=((profile.get("profile_v2") or {}).get("risk_policy") or {}).get("maximum_new_entries_per_day")
+        if limit and len(_recurrence(schedule)["times"])>int(limit):
+            warnings.append({"code":"daily_entry_limit","message":"Scheduled checks exceed the strategy daily entry limit."})
+        if ScheduleRepository().worker_health()["status"]!="healthy":
+            warnings.append({"code":"automation_unavailable","message":"Automation services need attention."})
+        return warnings
 
     def daily_summary(self,user_sub:str,day:date|None=None)->dict[str,Any]:
         target=day or utcnow().date();start=datetime.combine(target,time.min,tzinfo=timezone.utc);end=start+timedelta(days=1)

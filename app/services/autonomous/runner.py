@@ -20,6 +20,8 @@ FINAL_STATES={"trade","no_trade","blocked","market_closed","error","skipped"}
 SAFE_PRE_SUBMIT_RETRY_REASONS={"provider_unavailable","market_snapshot_unavailable","broker_unreachable",
     "account_mapping_unavailable","account_status_unavailable","runner_internal_error",
     "tradelocker_rate_limit_exhausted"}
+DRY_RUN_IGNORED_REASONS={"profile_disabled","global_autonomous_kill_switch_enabled",
+    "demo_autonomous_disabled","live_autonomous_disabled","live_autonomous_execution_not_implemented"}
 logger=logging.getLogger(__name__)
 
 
@@ -65,8 +67,8 @@ class AutonomousDecisionRunner:
         reasons.extend(readiness["blocking_reasons"])
         return list(dict.fromkeys(reasons))
 
-    async def _market_preflight(self,user_sub:str,profile:dict[str,Any],now:datetime)->dict[str,Any]:
-        context=await self.demo.context(user_sub,profile["public_id"],allow_autonomous=True)
+    async def _market_preflight(self,user_sub:str,profile:dict[str,Any],now:datetime,*,autonomous:bool=True)->dict[str,Any]:
+        context=await self.demo.context(user_sub,profile["public_id"],allow_autonomous=autonomous)
         client=self.demo._client(context.connection,context)
         try: payload=await client.get_symbols()
         except TradeLockerError: raise AutonomousExecutionError("market_universe_unavailable","The account market universe is unavailable.",reasons=["market_universe_unavailable"]) from None
@@ -134,14 +136,15 @@ class AutonomousDecisionRunner:
         return {"schema_version":"1.0","status":"ok","snapshot_id":raw["snapshot_id"],"context_hash":digest,
             "profile_ref":profile_ref,"decision_context":context,"expires_at":raw["expires_at"]}
 
-    async def run(self,user_sub:str,profile_ref:str,run_key:str,trigger_reason:str,*,allow_safe_retry:bool=False)->dict[str,Any]:
+    async def run(self,user_sub:str,profile_ref:str,run_key:str,trigger_reason:str,*,allow_safe_retry:bool=False,
+                  dry_run:bool=False)->dict[str,Any]:
         if not 8<=len(run_key)<=128 or not 1<=len(trigger_reason)<=200:
             raise AutonomousExecutionError("invalid_run_request","run_key or trigger_reason is invalid.",status="rejected")
         profile=self._profile(user_sub,profile_ref);now=utcnow();run_id=f"adrun_{uuid4().hex}"
         claimed,record=self.execution.claim_decision_run({"id":run_id,"run_key":run_key,"user_sub":user_sub,"profile_ref":profile_ref,
             "strategy_ref":profile.get("strategy_template_id") or "unknown","strategy_version":profile.get("strategy_version") or "unknown",
             "decision_provider":profile.get("decision_provider") or "no_trade","model_identifier":profile.get("model_identifier"),
-            "trigger_reason":trigger_reason,"state":"claimed","shadow_mode":False,
+            "trigger_reason":trigger_reason,"state":"claimed","shadow_mode":dry_run,
             "started_at":now.isoformat(),"created_at":now.isoformat(),"updated_at":now.isoformat()})
         if not claimed:
             state=record.get("state")
@@ -156,13 +159,15 @@ class AutonomousDecisionRunner:
                 validation_json={},decision_json={})
         try:
             reasons=self._blocking_reasons(profile,now,user_sub)
+            if dry_run:
+                reasons=[reason for reason in reasons if reason not in DRY_RUN_IGNORED_REASONS]
             if reasons:return self._finish(run_id,"skipped",reasons)
             if isinstance(self.demo,AutonomousDemoService):
-                market=await self._market_preflight(user_sub,profile,now)
+                market=await self._market_preflight(user_sub,profile,now,autonomous=not dry_run)
                 if not market["open"]:
                     return self._finish(run_id,"market_closed",["no_selected_market_open"],validation_json=market)
             self.execution.update_decision_run(run_id,state="snapshotting")
-            snapshot=await self.demo.snapshot(user_sub,profile_ref,autonomous=True)
+            snapshot=await self.demo.snapshot(user_sub,profile_ref,autonomous=not dry_run)
             if self._loss_cooldown_active(snapshot,int(profile.get("cooldown_minutes_after_loss") or 60),utcnow()):
                 return self._finish(run_id,"blocked",["loss_cooldown_active"])
             context,digest=build_decision_context(snapshot,profile)
@@ -187,6 +192,10 @@ class AutonomousDecisionRunner:
             if validation:
                 self.execution.update_decision_run(run_id,validation_json={"approved":False,"reasons":validation})
                 return self._finish(run_id,"blocked",validation)
+            if dry_run:
+                self.execution.update_decision_run(run_id,validation_json={"approved":True,"reasons":[],
+                    "dry_run":True,"would_submit":False,"would_trade":True})
+                return self._finish(run_id,"no_trade",["dry_run_trade_candidate"])
             proposal=AutonomousOrderProposal(snapshot_id=snapshot["snapshot_id"],pair=decision.symbol or "",side=decision.side,
                 order_type=decision.order_type,entry=decision.entry,stop_loss=decision.stop_loss,take_profit=decision.take_profit,
                 reason_codes=decision.reason_codes)
@@ -237,4 +246,5 @@ class AutonomousDecisionRunner:
                 "daily_pnl":risk.get("daily_realized_pnl"),"open_pnl":risk.get("open_pnl")},
             "preview_id":record.get("preview_id"),"execution_id":record.get("execution_id"),"shadow_mode":None,
             "provider":record.get("decision_provider"),"model_identifier":record.get("model_identifier"),
-            "started_at":record.get("started_at"),"completed_at":record.get("completed_at"),"duplicate":duplicate}
+            "started_at":record.get("started_at"),"completed_at":record.get("completed_at"),
+            "trigger_reason":record.get("trigger_reason"),"dry_run":bool(record.get("shadow_mode")),"duplicate":duplicate}

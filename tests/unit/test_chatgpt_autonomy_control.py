@@ -237,3 +237,36 @@ async def test_real_runner_records_pending_limit_without_preview_or_broker_write
     assert result["reason_codes"] == ["maximum_pending_orders_reached"]
     assert result["preview_id"] is None and result["execution_id"] is None
     assert demo.review_calls == demo.submit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_dry_run_never_reviews_or_submits_even_when_trade_candidate_passes(tmp_path, monkeypatch):
+    weekday = datetime(2026, 7, 15, 14, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.services.autonomous.runner.utcnow", lambda: weekday)
+    _, brokers, execution, _, _, profile, _ = setup_service(tmp_path, monkeypatch)
+    brokers.update_profile("user", profile["public_id"], decision_provider="openai",
+        model_identifier="server-test-model", minimum_confidence=.7, enabled=False)
+    execution.update_autonomous_controls("user", {"demo_autonomous_enabled": False,
+        "global_autonomous_kill_switch": True}, updated_by="test", source="test")
+
+    class SafeDryRunDemo(PendingLimitDemo):
+        async def snapshot(self, user_sub, profile_ref, *, autonomous):
+            assert autonomous is False
+            result = await super().snapshot(user_sub, profile_ref, autonomous=autonomous)
+            result["risk_state"]["blocking_reasons"] = []
+            result["pending_orders"] = []
+            result["execution_eligibility"] = True
+            return result
+
+    demo = SafeDryRunDemo()
+    provider = DeterministicTestDecisionProvider(StructuredDecision(action=DecisionAction.TRADE,
+        symbol="EURUSD", side="long", order_type="market", entry=1.1001, stop_loss=1.099,
+        take_profit=1.1023, confidence=.9, reason_codes=["fixture"], rationale="fixture"))
+    runner = AutonomousDecisionRunner(brokers=brokers, execution=execution, demo=demo, provider=provider)
+
+    result = await runner.run("user", profile["public_id"], "dry-run-trade-candidate", "demo_test", dry_run=True)
+
+    assert result["status"] == "no_trade"
+    assert result["reason_codes"] == ["dry_run_trade_candidate"]
+    assert result["dry_run"] is True and result["execution_id"] is None
+    assert demo.review_calls == demo.submit_calls == 0
