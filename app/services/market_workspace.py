@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, timedelta
+from datetime import datetime, timezone
 from typing import Any, Awaitable
 
 from app.services.providers.errors import ProviderError
@@ -21,6 +22,10 @@ class MarketWorkspaceService:
         self.fred = fred or FredClient()
 
     @staticmethod
+    def _stamp(payload: dict[str, Any]) -> dict[str, Any]:
+        return {**payload, "last_updated": datetime.now(timezone.utc).isoformat()}
+
+    @staticmethod
     async def _partial(provider: str, request: Awaitable[Any], fallback: Any) -> tuple[Any, dict | None]:
         try:
             return await request, None
@@ -32,25 +37,25 @@ class MarketWorkspaceService:
 
     async def search(self, query: str, limit: int = 25) -> dict[str, Any]:
         results, warning = await self._partial("Finnhub", self.finnhub.symbol_search(query, limit), [])
-        return {"query": query, "results": results, "sources": ["Finnhub"],
-                "warnings": [warning] if warning else []}
+        return self._stamp({"query": query, "results": results, "sources": ["Finnhub"],
+                "warnings": [warning] if warning else []})
 
     async def overview(self, symbols: list[str] | None = None) -> dict[str, Any]:
         requested = (symbols or list(DEFAULT_SYMBOLS))[:12]
         rows = await asyncio.gather(*(self._partial("Finnhub", self.finnhub.quote(symbol), None)
                                       for symbol in requested))
-        return {"quotes": [value for value, _ in rows if value], "sources": ["Finnhub"],
-                "warnings": [warning for _, warning in rows if warning]}
+        return self._stamp({"quotes": [value for value, _ in rows if value], "sources": ["Finnhub"],
+                "warnings": [warning for _, warning in rows if warning]})
 
     async def news(self, category: str = "general", limit: int = 20) -> dict[str, Any]:
         items, warning = await self._partial("Finnhub", self.finnhub.market_news(category, limit), [])
-        return {"items": [item.model_dump(mode="json") for item in items], "sources": ["Finnhub"],
-                "warnings": [warning] if warning else []}
+        return self._stamp({"items": [item.model_dump(mode="json") for item in items], "sources": ["Finnhub"],
+                "warnings": [warning] if warning else []})
 
     async def calendar(self, start: date, end: date, limit: int = 50) -> dict[str, Any]:
         items, warning = await self._partial("Finnhub", self.finnhub.economic_calendar(start, end, limit), [])
-        return {"items": [item.model_dump(mode="json") for item in items], "sources": ["Finnhub"],
-                "warnings": [warning] if warning else []}
+        return self._stamp({"items": [item.model_dump(mode="json") for item in items], "sources": ["Finnhub"],
+                "warnings": [warning] if warning else []})
 
     async def macro(self) -> dict[str, Any]:
         async def series(series_id: str) -> dict[str, Any]:
@@ -64,13 +69,13 @@ class MarketWorkspaceService:
 
         rows = await asyncio.gather(*(self._partial("FRED", series(series_id), None)
                                       for series_id in MACRO_SERIES))
-        return {"indicators": [value for value, _ in rows if value], "sources": ["FRED"],
-                "warnings": [warning for _, warning in rows if warning]}
+        return self._stamp({"indicators": [value for value, _ in rows if value], "sources": ["FRED"],
+                "warnings": [warning for _, warning in rows if warning]})
 
     async def symbol(self, symbol: str) -> dict[str, Any]:
         quote, warning = await self._partial("Finnhub", self.finnhub.quote(symbol), None)
-        return {"symbol": symbol, "quote": quote, "tradingview_symbol": symbol.replace(":", ":"),
-                "sources": ["Finnhub", "TradingView"], "warnings": [warning] if warning else []}
+        return self._stamp({"symbol": symbol, "quote": quote, "tradingview_symbol": symbol,
+                "sources": ["Finnhub", "TradingView"], "warnings": [warning] if warning else []})
 
     async def aclose(self) -> None:
         await asyncio.gather(self.finnhub.aclose(), self.fred.aclose())

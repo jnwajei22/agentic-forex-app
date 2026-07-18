@@ -24,6 +24,7 @@ from app.services.autonomous.decision import decision_provider_readiness
 from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
+from app.storage.user_experience import UserExperienceRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
@@ -129,6 +130,28 @@ class AutonomousScheduleRequest(BaseModel):
     maximum_lateness_seconds: int = Field(default=600,ge=30,le=3600)
 
 
+class UserPreferencesUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    appearance:Literal["light","dark","system"]|None=None
+    timezone:str|None=Field(default=None,min_length=1,max_length=80)
+    date_format:Literal["locale","month_day_year","day_month_year","year_month_day"]|None=None
+    time_format:Literal["locale","12_hour","24_hour"]|None=None
+    currency_display:Literal["account","usd"]|None=None
+    notifications:dict[str,bool]|None=None
+
+
+class WatchlistCreate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str=Field(min_length=1,max_length=60)
+    symbols:list[str]=Field(default_factory=list,max_length=100)
+
+
+class WatchlistUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str|None=Field(default=None,min_length=1,max_length=60)
+    items:list[dict[str,Any]]=Field(default_factory=list,max_length=100)
+
+
 async def current_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     scheme, separator, token = (authorization or "").partition(" ")
     if not separator or scheme.lower() != "bearer" or not token:
@@ -209,6 +232,43 @@ async def _account_instruments(user_sub: str, account_alias: str) -> tuple[dict[
 async def me(claims: dict = Depends(current_claims)) -> dict:
     repository().ensure_user(claims["sub"], claims.get("email"))
     return {"sub": claims["sub"], "email": claims.get("email")}
+
+
+@router.get("/user-preferences")
+async def user_preferences(claims:dict=Depends(current_claims))->dict:
+    return UserExperienceRepository().preferences(claims["sub"])
+
+
+@router.patch("/user-preferences")
+async def update_user_preferences(payload:UserPreferencesUpdate,claims:dict=Depends(current_claims))->dict:
+    return UserExperienceRepository().update_preferences(claims["sub"],payload.model_dump(exclude_none=True))
+
+
+@router.get("/watchlists")
+async def list_watchlists(claims:dict=Depends(current_claims))->dict:
+    return {"watchlists":UserExperienceRepository().list_watchlists(claims["sub"])}
+
+
+@router.post("/watchlists",status_code=201)
+async def create_watchlist(payload:WatchlistCreate,claims:dict=Depends(current_claims))->dict:
+    try:return UserExperienceRepository().create_watchlist(claims["sub"],payload.name,payload.symbols)
+    except Exception as exc:
+        if "UNIQUE" in str(exc):raise HTTPException(status_code=409,detail="A watchlist with this name already exists.") from None
+        raise
+
+
+@router.put("/watchlists/{watchlist_id}")
+async def update_watchlist(watchlist_id:str,payload:WatchlistUpdate,claims:dict=Depends(current_claims))->dict:
+    result=UserExperienceRepository().replace_watchlist(claims["sub"],watchlist_id,name=payload.name,items=payload.items)
+    if not result:raise HTTPException(status_code=404,detail="Watchlist not found.")
+    return result
+
+
+@router.delete("/watchlists/{watchlist_id}")
+async def delete_watchlist(watchlist_id:str,claims:dict=Depends(current_claims))->dict:
+    if not UserExperienceRepository().delete_watchlist(claims["sub"],watchlist_id):
+        raise HTTPException(status_code=409,detail="The default Forex Majors watchlist cannot be removed.")
+    return {"status":"deleted","watchlist_id":watchlist_id}
 
 
 async def _market_response(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -511,12 +571,29 @@ async def disable_account(account_id: str, claims: dict = Depends(current_claims
     return {"status": "disabled", "account_id": account_id}
 
 
+@router.put("/broker/accounts/{account_id}/enable")
+async def enable_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_enabled(claims["sub"],account_id,True):
+        raise HTTPException(status_code=404,detail="Account not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status":"enabled","account_id":account_id}
+
+
 @router.put("/broker/connections/{connection_id}/disable")
 async def disable_connection(connection_id: str, claims: dict = Depends(current_claims)) -> dict:
     if not repository().disable_connection(claims["sub"], connection_id):
         raise HTTPException(status_code=404, detail="Connection not found.")
     tradelocker_config_cache.invalidate_user(claims["sub"])
     return {"status": "disabled", "connection_id": connection_id}
+
+
+@router.delete("/broker/connections/{connection_id}")
+async def remove_connection(connection_id:str,claims:dict=Depends(current_claims))->dict:
+    try:removed=repository().remove_connection(claims["sub"],connection_id)
+    except BrokerStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+    if not removed:raise HTTPException(status_code=404,detail="Trading connection not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status":"removed","connection_id":connection_id}
 
 
 @router.get("/execution-profiles")
@@ -682,10 +759,73 @@ async def autonomous_profile_status(profile_id:str,claims:dict=Depends(current_c
     except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
 
 
+@router.post("/execution-profiles/{profile_id}/demo-test")
+async def run_profile_demo_test(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    profile=repository().get_profile(claims["sub"],profile_id)
+    if not profile:raise HTTPException(status_code=404,detail="Strategy not found.")
+    if profile.get("account_environment")!="demo":
+        raise HTTPException(status_code=409,detail={"error":"demo_account_required",
+            "message":"Run Demo Test requires a verified demo trading account."})
+    try:
+        result=await AutonomousDecisionRunner().run(claims["sub"],profile_id,
+            f"demo-test:{profile_id}:{uuid.uuid4().hex[:16]}","demo_test",dry_run=True)
+        return {**result,"dry_run":True,"submission_allowed":False,
+            "message":"Analysis completed without submitting an order."}
+    except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
+
+
 @router.get("/autonomous-runs")
 async def recent_autonomous_runs(claims:dict=Depends(current_claims))->dict:
     runner=AutonomousDecisionRunner()
     return {"runs":[runner._public_run(item) for item in runner.execution.recent_decision_runs(claims["sub"],20)]}
+
+
+@router.get("/activity")
+async def activity(account_alias:str|None=None,profile_id:str|None=None,event_type:str|None=None,
+                   outcome:str|None=None,date_from:date|None=None,date_to:date|None=None,
+                   claims:dict=Depends(current_claims))->dict:
+    execution=ExecutionRepository();repo=repository();profiles={item["public_id"]:item for item in repo.list_profiles(claims["sub"])}
+    events=[]
+    for record in execution.recent_decision_runs(claims["sub"],200):
+        public=AutonomousDecisionRunner._public_run(record);profile=profiles.get(str(record.get("profile_ref")),{})
+        events.append({"id":record.get("id"),"event_type":"strategy_evaluated","occurred_at":record.get("completed_at") or record.get("started_at"),
+            "account_alias":profile.get("account_alias"),"account_number":profile.get("account_number"),
+            "environment":profile.get("account_environment"),"profile_id":record.get("profile_ref"),"strategy_name":profile.get("name"),
+            "outcome":public["outcome"],"symbol":public.get("symbol"),"reason_codes":public.get("reason_codes",[]),
+            "confidence":(record.get("decision") or {}).get("confidence"),"dry_run":bool(record.get("shadow_mode")),"run_id":record.get("id")})
+    for record in execution.recent_executions(claims["sub"],100):
+        events.append({"id":record.get("id"),"event_type":"demo_order_submitted","occurred_at":record.get("created_at"),
+            "profile_id":record.get("profile_ref"),"outcome":str(record.get("state") or "submitted").upper(),
+            "symbol":record.get("symbol"),"environment":"demo"})
+    for record in execution.autonomous_control_audit(claims["sub"],100):
+        enabled=bool(record.get("new_value"));control=record.get("control_name")
+        kind=("kill_switch_enabled" if enabled else "kill_switch_disabled") if control=="global_autonomous_kill_switch" else "safety_control_updated"
+        events.append({"id":f"control-{record.get('id')}","event_type":kind,"occurred_at":record.get("changed_at"),
+            "outcome":"CONFIRMED","reason_codes":[record.get("reason")] if record.get("reason") else []})
+    def keep(item:dict[str,Any])->bool:
+        stamp=str(item.get("occurred_at") or "")[:10]
+        return (not account_alias or item.get("account_alias")==account_alias) and (not profile_id or item.get("profile_id")==profile_id) \
+            and (not event_type or item.get("event_type")==event_type) and (not outcome or item.get("outcome")==outcome) \
+            and (not date_from or stamp>=date_from.isoformat()) and (not date_to or stamp<=date_to.isoformat())
+    filtered=sorted((item for item in events if keep(item)),key=lambda item:str(item.get("occurred_at") or ""),reverse=True)
+    return {"events":filtered,"count":len(filtered),"generated_at":datetime.now(timezone.utc).isoformat()}
+
+
+@router.get("/status")
+async def user_status(claims:dict=Depends(current_claims))->dict:
+    repo=repository();connections=repo.list_connections(claims["sub"]);accounts=repo.list_accounts(claims["sub"])
+    worker=ScheduleRepository().worker_health();configured_finnhub=bool(settings.finnhub_enabled and settings.finnhub_api_key)
+    configured_fred=bool(settings.fred_enabled and settings.fred_api_key)
+    verified=[str(item.get("last_verified_at")) for item in accounts if item.get("last_verified_at")]
+    return {"services":[
+        {"id":"application_api","label":"Application API","status":"available"},
+        {"id":"broker","label":"HeroFX","status":"connected" if any(item.get("enabled") for item in connections) else "needs_attention"},
+        {"id":"platform","label":"TradeLocker integration","status":"connected" if any(item.get("enabled") for item in connections) else "unavailable"},
+        {"id":"market_data","label":"Market data","status":"available" if configured_finnhub else "unavailable"},
+        {"id":"news","label":"News","status":"available" if configured_finnhub else "unavailable"},
+        {"id":"macro","label":"Macro data","status":"available" if configured_fred else "unavailable"},
+        {"id":"automation","label":"Automation","status":"available" if worker["status"]=="healthy" else "needs_attention"}],
+        "last_successful_sync":max(verified) if verified else None,"generated_at":datetime.now(timezone.utc).isoformat()}
 
 
 @router.get("/autonomous-schedules")

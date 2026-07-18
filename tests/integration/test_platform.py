@@ -73,6 +73,37 @@ def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmati
         assert isolated["live_autonomous_enabled"] is False
 
 
+def test_preferences_watchlists_and_safe_status_are_user_scoped(platform_storage):
+    with _client_for("auth0|ux-a") as client:
+        preferences=client.patch("/api/user-preferences",json={"timezone":"Europe/London",
+            "notifications":{"schedule_failed":False}})
+        assert preferences.status_code==200 and preferences.json()["timezone"]=="Europe/London"
+        initial=client.get("/api/watchlists").json()["watchlists"]
+        assert initial[0]["name"]=="Forex Majors"
+        custom=client.post("/api/watchlists",json={"name":"Metals","symbols":["OANDA:XAU_USD"]})
+        assert custom.status_code==201 and custom.json()["items"][0]["symbol"]=="OANDA:XAU_USD"
+        status=client.get("/api/status")
+        assert status.status_code==200 and all("worker_id" not in str(item) for item in status.json()["services"])
+    with _client_for("auth0|ux-b") as client:
+        assert client.get("/api/user-preferences").json()["timezone"]=="America/Chicago"
+        assert all(item["name"]!="Metals" for item in client.get("/api/watchlists").json()["watchlists"])
+
+
+def test_demo_test_endpoint_is_explicitly_non_submitting(platform_storage,monkeypatch):
+    user="auth0|dry-run";connection=platform_storage.save_connection(user,base_url="https://demo.test/backend-api",
+        username="user",password="password",server="HeroFX",environment="demo")
+    platform_storage.sync_accounts(user,connection.connection_ref,{"accounts":[{"accountId":"1","accNum":"12345678","currency":"USD"}]})
+    account=platform_storage.list_accounts(user)[0]
+    profile=platform_storage.create_profile(user,name="Demo Strategy",account_ref=account["public_id"])
+    class FakeRunner:
+        async def run(self,*args,**kwargs):
+            assert kwargs["dry_run"] is True
+            return {"status":"no_trade","outcome":"NO_TRADE","run_id":"dry","reason_codes":["dry_run_trade_candidate"]}
+    monkeypatch.setattr(platform,"AutonomousDecisionRunner",lambda:FakeRunner())
+    with _client_for(user) as client:
+        result=client.post(f"/api/execution-profiles/{profile['public_id']}/demo-test")
+    assert result.status_code==200 and result.json()["submission_allowed"] is False and result.json()["dry_run"] is True
+
 def test_profile_decision_engine_update_persists_and_reports_safe_readiness(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", None)
     connection = platform_storage.save_connection("auth0|provider-user",

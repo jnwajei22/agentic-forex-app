@@ -459,6 +459,14 @@ class BrokerRepository:
         connection=self.get_connection(auth0_sub)
         return self.disable_connection(auth0_sub,connection.connection_ref) if connection else False
 
+    def remove_connection(self,auth0_sub:str,connection_ref:str)->bool:
+        with self._connect() as db:
+            try:
+                return db.execute("DELETE FROM broker_connections WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)",
+                                  (connection_ref,auth0_sub)).rowcount==1
+            except sqlite3.IntegrityError:
+                raise BrokerStorageError("Delete bound strategies before removing this trading connection.") from None
+
     def list_profiles(self, auth0_sub: str) -> list[dict[str,Any]]:
         with self._connect() as db:
             rows=db.execute("""SELECT p.public_id,p.name,p.execution_mode,p.enabled,p.risk_json,p.allowed_instruments_json,
