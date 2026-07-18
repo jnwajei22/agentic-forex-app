@@ -6,6 +6,7 @@ from app.storage.brokers import BrokerRepository, BrokerStorageError
 from app.models.orders import OrderPreview
 from app.services.market_data.history import PaginatedCandleResult
 from app.services.tradelocker.account_status import TradeLockerAccountStatusService
+from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
 
 
 class TradeLockerAdapter(BrokerAdapter):
@@ -38,9 +39,29 @@ class TradeLockerAdapter(BrokerAdapter):
         start_time_ms: int | None = None, end_time_ms: int | None = None,
         minimum_usable: int | None = None,
     ) -> PaginatedCandleResult:
+        user_sub = get_current_user_sub()
+        if user_sub and not getattr(self.client, "cache_user_id", None):
+            try:
+                context = BrokerAccountResolver().resolve(user_sub)
+            except AccountResolutionError as exc:
+                raise TradeLockerError("broker_connection", str(exc), code=exc.code) from None
+            scoped = TradeLockerClient(
+                base_url=context.base_url, username=context.username,
+                password=context.password, server=context.server,
+                account_id=context.account_id, account_number=context.account_number,
+                cache_user_id=user_sub, cache_connection_id=context.connection_ref,
+                cache_account_record_id=context.account_record_id,
+            )
+            try:
+                return await scoped.get_candles(
+                    pair, timeframe, lookback, start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms, minimum_usable=minimum_usable,
+                )
+            finally:
+                await scoped.aclose()
         return await self.client.get_candles(
-            pair, timeframe, lookback, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
-            minimum_usable=minimum_usable,
+            pair, timeframe, lookback, start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms, minimum_usable=minimum_usable,
         )
 
     async def submit_order(self, preview: OrderPreview) -> dict:

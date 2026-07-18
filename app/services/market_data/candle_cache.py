@@ -9,7 +9,11 @@ from typing import Any, Callable
 
 from app.config.settings import settings
 from app.models.market import Candle
-from app.services.market_data.history import normalize_timeframe, next_completed_candle_due_ms
+from app.services.market_data.history import (
+    TIMEFRAME_DURATION_MS,
+    normalize_timeframe,
+    next_completed_candle_due_ms,
+)
 
 
 def _utcnow() -> datetime:
@@ -55,6 +59,23 @@ class CandleCacheEntry:
 
     def fresh(self, now: datetime) -> bool:
         return now <= self.expires_at
+
+    def covers(
+        self, *, required_count: int, start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> bool:
+        selected = [
+            candle for candle in self.candles
+            if (start_time_ms is None or candle.timestamp >= start_time_ms)
+            and (end_time_ms is None or candle.timestamp <= end_time_ms)
+        ]
+        if len(selected) < required_count:
+            return False
+        if start_time_ms is not None:
+            duration = TIMEFRAME_DURATION_MS[normalize_timeframe(self.key.timeframe)]
+            if selected[0].timestamp > start_time_ms + duration:
+                return False
+        return True
 
 
 class DurableCandleCache:
@@ -151,6 +172,13 @@ class DurableCandleCache:
             if excess:
                 db.execute("""DELETE FROM tradelocker_candle_cache WHERE rowid IN
                     (SELECT rowid FROM tradelocker_candle_cache ORDER BY fetched_at LIMIT ?)""", (excess,))
+            retention_cutoff = now - timedelta(
+                seconds=settings.tradelocker_candle_cache_max_stale_seconds
+            )
+            db.execute(
+                "DELETE FROM tradelocker_candle_cache WHERE fetched_at < ?",
+                (retention_cutoff.isoformat(),),
+            )
         return self.get(normalized)  # type: ignore[return-value]
 
     def delete(self, key: CandleCacheKey) -> None:

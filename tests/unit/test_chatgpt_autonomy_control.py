@@ -217,6 +217,8 @@ class PendingLimitDemo:
 
 @pytest.mark.asyncio
 async def test_real_runner_records_pending_limit_without_preview_or_broker_write(tmp_path, monkeypatch):
+    weekday = datetime(2026, 7, 15, 14, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.services.autonomous.runner.utcnow", lambda: weekday)
     service, brokers, execution, _, _, profile, _ = setup_service(tmp_path, monkeypatch)
     brokers.update_profile("user", profile["public_id"], decision_provider="openai",
         model_identifier="server-test-model", minimum_confidence=.7)

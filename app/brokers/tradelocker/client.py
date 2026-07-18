@@ -498,6 +498,8 @@ class TradeLockerClient:
                         code=code, status_code=exc.status_code,
                         details={"retryable": True, "suggested_retry_at": self._history_cooldown_until,
                                  "attempts": self._history_attempts,
+                                 "retry_count": self._history_retries,
+                                 "cooldown_until": self._history_cooldown_until,
                                  "total_backoff_seconds": round(self._history_backoff_seconds, 3)},
                     ) from None
                 if exc.status_code == 429 and delay > settings.tradelocker_rate_limit_max_backoff_seconds:
@@ -506,6 +508,8 @@ class TradeLockerClient:
                         code="tradelocker_rate_limit_exhausted", status_code=429,
                         details={"retryable": True, "suggested_retry_at": self._history_cooldown_until,
                                  "attempts": self._history_attempts,
+                                 "retry_count": self._history_retries,
+                                 "cooldown_until": self._history_cooldown_until,
                                  "total_backoff_seconds": round(self._history_backoff_seconds, 3)},
                     ) from None
                 self._history_retries += 1
@@ -530,15 +534,23 @@ class TradeLockerClient:
     def _cached_candle_result(
         self, entry: CandleCacheEntry, *, symbol: str, timeframe: str,
         requested_count: int | None, minimum_usable: int, end_ms: int,
+        start_ms: int | None = None,
         fresh: bool, rate_limited: bool = False,
     ) -> PaginatedCandleResult:
+        candles = [
+            candle for candle in entry.candles
+            if (start_ms is None or candle.timestamp >= start_ms)
+            and candle.timestamp <= end_ms
+        ]
         result = PaginatedCandleResult(
             instrument_id=entry.key.instrument_id, timeframe=entry.key.timeframe,
-            requested_start_ms=entry.candles[0].timestamp, requested_end_ms=end_ms,
-            estimated_candles=requested_count or len(entry.candles), candles=list(entry.candles),
+            requested_start_ms=(start_ms if start_ms is not None else
+                                (candles[0].timestamp if candles else entry.candles[0].timestamp)),
+            requested_end_ms=end_ms,
+            estimated_candles=requested_count or len(candles), candles=candles,
             batches_requested=0, complete=True, stop_reason="cache_hit",
             requested_timeframe=timeframe, provider_timeframe_sent=entry.key.timeframe,
-            rows_received=len(entry.candles), raw_count=len(entry.candles), source=entry.source,
+            rows_received=len(candles), raw_count=len(candles), source=entry.source,
             cache_hit=True, cache_fresh=fresh,
             cache_age_seconds=round(entry.age_seconds(datetime.now(timezone.utc)), 3),
             upstream_request_made=False,
@@ -565,13 +577,16 @@ class TradeLockerClient:
         if key is not None and result.complete and result.usable_candles:
             metadata = result.canonical_dict()["metadata"]
             self.candle_cache.put(
-                key, result.usable_candles, source=result.source, metadata=metadata
+                key, result.usable_candles,
+                source="aggregated" if result.source.startswith("aggregated") else "direct",
+                metadata=metadata,
             )
         return result
 
     def _rate_limit_cache_fallback(
         self, exc: TradeLockerError, cached: CandleCacheEntry | None, *, symbol: str,
         timeframe: str, requested_count: int | None, minimum_usable: int, end_ms: int,
+        start_ms: int | None = None,
     ) -> PaginatedCandleResult | None:
         if exc.code != "tradelocker_rate_limit_exhausted" or cached is None:
             return None
@@ -580,13 +595,28 @@ class TradeLockerClient:
             exc.details.update({"cache_available": True, "cache_age_seconds": round(age, 3),
                                 "cache_rejection_reason": "cache_exceeds_stale_tolerance"})
             return None
+        if not cached.covers(
+            required_count=minimum_usable, start_time_ms=start_ms, end_time_ms=end_ms
+        ):
+            rejection = (
+                "cached_range_not_covered" if start_ms is not None
+                else "cached_history_insufficient"
+            )
+            exc.details.update({"cache_available": True, "cache_age_seconds": round(age, 3),
+                                "cache_rejection_reason": rejection})
+            return None
         result = self._cached_candle_result(
             cached, symbol=symbol, timeframe=timeframe, requested_count=requested_count,
-            minimum_usable=minimum_usable, end_ms=end_ms, fresh=False, rate_limited=True,
+            minimum_usable=minimum_usable, end_ms=end_ms, start_ms=start_ms,
+            fresh=False, rate_limited=True,
         )
         if not result.complete:
+            rejection = (
+                "cached_range_not_covered" if start_ms is not None
+                else "cached_history_insufficient"
+            )
             exc.details.update({"cache_available": True, "cache_age_seconds": round(age, 3),
-                                "cache_rejection_reason": "cached_history_insufficient"})
+                                "cache_rejection_reason": rejection})
             return None
         result.attempts = self._history_attempts
         result.retry_count = self._history_retries
@@ -605,7 +635,11 @@ class TradeLockerClient:
         end_time_ms: int | None = None,
         minimum_usable: int | None = None,
     ) -> PaginatedCandleResult:
-        request_key = (symbol.replace("/", "").upper(), timeframe, lookback,
+        try:
+            coalesced_timeframe = normalize_timeframe(timeframe)
+        except ValueError:
+            coalesced_timeframe = timeframe.upper()
+        request_key = (symbol.replace("/", "").upper(), coalesced_timeframe, lookback,
                        start_time_ms, end_time_ms, minimum_usable)
         existing = self._candle_inflight.get(request_key)
         if existing is not None:
@@ -656,10 +690,14 @@ class TradeLockerClient:
         )
         cached = self.candle_cache.get(cache_key) if cache_key is not None else None
         required = minimum_usable or lookback or 1
-        if cached is not None and cached.fresh(datetime.now(timezone.utc)):
+        requested_start_ms = start_time_ms
+        if (cached is not None and cached.fresh(datetime.now(timezone.utc))
+                and cached.covers(required_count=required, start_time_ms=requested_start_ms,
+                                  end_time_ms=end_ms)):
             candidate = self._cached_candle_result(
                 cached, symbol=symbol, timeframe=timeframe, requested_count=lookback,
-                minimum_usable=required, end_ms=end_ms, fresh=True,
+                minimum_usable=required, end_ms=end_ms, start_ms=requested_start_ms,
+                fresh=True,
             )
             if candidate.complete:
                 return candidate
@@ -671,7 +709,10 @@ class TradeLockerClient:
             # exactly the requested number of broker rows.
             range_count = effective_count * 2 if resolution == "1D" else effective_count
             start_time_ms = end_ms - TIMEFRAME_DURATION_MS[resolution] * range_count
-            if cached is not None and len(cached.candles) >= required:
+            cached_requested_count = int(cached.metadata.get("requested_count") or 0) if cached else 0
+            if (cached is not None and len(cached.candles) >= required
+                    and (cached_requested_count >= effective_count
+                         or len(cached.candles) >= effective_count)):
                 # Include one overlap candle so incremental refresh can safely
                 # merge and deduplicate without downloading the full window.
                 start_time_ms = max(
@@ -716,6 +757,7 @@ class TradeLockerClient:
             fallback = self._rate_limit_cache_fallback(
                 exc, cached, symbol=symbol, timeframe=timeframe,
                 requested_count=lookback, minimum_usable=required, end_ms=end_ms,
+                start_ms=requested_start_ms,
             )
             if fallback is not None:
                 return fallback
@@ -767,6 +809,24 @@ class TradeLockerClient:
             if resolution == "1D":
                 fallback_diagnostics["complete_daily_rows"] = len(aggregated_rows)
         except (TradeLockerError, ValueError) as exc:
+            if isinstance(exc, TradeLockerError) and exc.code == "tradelocker_rate_limit_exhausted":
+                fallback = self._rate_limit_cache_fallback(
+                    exc, cached, symbol=symbol, timeframe=timeframe,
+                    requested_count=lookback, minimum_usable=required, end_ms=end_ms,
+                    start_ms=requested_start_ms,
+                )
+                if fallback is not None:
+                    return fallback
+                exc.details.setdefault("cache_available", cached is not None)
+                exc.details.setdefault(
+                    "cache_age_seconds",
+                    round(cached.age_seconds(datetime.now(timezone.utc)), 3) if cached else None,
+                )
+                exc.details.setdefault(
+                    "cache_rejection_reason",
+                    "cache_missing" if cached is None else "cached_history_insufficient",
+                )
+                raise
             fallback_diagnostics = {
                 "requested_timeframe": timeframe,
                 "provider_timeframe_sent": "1H",

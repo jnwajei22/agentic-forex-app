@@ -574,6 +574,12 @@ class AutonomousDemoService:
                                 "broker_error_category": exc.code,
                                 "rows_received": 0,
                                 "mapping_failure": exc.details.get("mapping_failure"),
+                                "cache_hit": False,
+                                "cache_fresh": False,
+                                "upstream_request_made": True,
+                                "usable_count": 0,
+                                "newest_completed_timestamp": None,
+                                "is_sufficient": False,
                             }
                             diagnostics.update(exc.details)
                             reason = exc.code if exc.code in {
@@ -618,6 +624,27 @@ class AutonomousDemoService:
                         elif timeframe == "1h": h1 = series
                         else: m15 = series
                     if timeframe_failures:
+                        failed_metadata = [
+                            value.get("metadata", {}) for value in timeframe_results.values()
+                        ]
+                        candle_request_summary = {
+                            "upstream_requests": sum(int(item.get("attempts") or 0)
+                                                     for item in failed_metadata),
+                            "cache_hits": sum(bool(item.get("cache_hit"))
+                                              for item in failed_metadata),
+                            "coalesced_requests": sum(int(item.get("coalesced_requests") or 0)
+                                                      for item in failed_metadata),
+                            "rate_limit_retries": sum(int(item.get("retry_count") or 0)
+                                                      for item in failed_metadata),
+                            "total_backoff_seconds": round(sum(
+                                float(item.get("total_backoff_seconds") or 0)
+                                for item in failed_metadata
+                            ), 3),
+                            "cooldown_until": max((
+                                str(item["cooldown_until"]) for item in failed_metadata
+                                if item.get("cooldown_until")
+                            ), default=None),
+                        }
                         raise AutonomousExecutionError(
                             "market_snapshot_unavailable",
                             "One or more required TradeLocker candle timeframes failed validation.",
@@ -625,7 +652,8 @@ class AutonomousDemoService:
                             details={"missing_component": "candle_history",
                                      "failing_timeframes": [key for key, value in timeframe_results.items()
                                                             if value["blocking_reasons"]],
-                                     "timeframes": timeframe_results},
+                                     "timeframes": timeframe_results,
+                                     "candle_requests": candle_request_summary},
                         )
                 market[pair] = {"quote": quote,"bid":bid,"ask":ask,"spread":ask-bid,"quote_retrieved_at":utcnow().isoformat(),
                     "instrument_metadata":instrument.__dict__,

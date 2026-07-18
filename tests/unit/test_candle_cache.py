@@ -84,9 +84,22 @@ def test_cache_keys_isolate_users_accounts_instruments_and_symbols(tmp_path):
     cache.put(key, [candle], source="direct", metadata={"complete": True})
     assert cache.get(key) is not None
     for changed in ({"user_id": "user-b"}, {"account_id": "account-b"},
-                    {"instrument_id": "88"}, {"symbol": "GBPUSD"},
+                    {"account_number": "8"}, {"instrument_id": "88"},
+                    {"symbol": "GBPUSD"},
                     {"connection_id": "conn-b"}):
         assert cache.get(CandleCacheKey(**{**base, **changed})) is None
+
+
+def test_cache_range_coverage_is_explicit(tmp_path):
+    cache = DurableCandleCache(tmp_path / "coverage.db")
+    values = [normalize_candle(item) for item in rows("1h", 50)]
+    key = CandleCacheKey("user-a", "connection-a", "account-a", "7", "77", "EURUSD", "1H")
+    entry = cache.put(key, values, source="direct", metadata={"requested_count": 50})
+    duration = TIMEFRAME_DURATION_MS["1H"]
+    assert entry.covers(required_count=10, start_time_ms=values[-10].timestamp,
+                        end_time_ms=values[-1].timestamp + duration)
+    assert not entry.covers(required_count=10, start_time_ms=values[0].timestamp-duration*10,
+                            end_time_ms=values[-1].timestamp + duration)
 
 
 @pytest.mark.asyncio
@@ -117,6 +130,31 @@ async def test_stale_cache_incrementally_refreshes_merges_and_deduplicates(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_larger_window_does_not_incrementally_refresh_from_smaller_cache(tmp_path):
+    cache = DurableCandleCache(tmp_path / "larger-window.db")
+    current = client(cache, ImmediateLimiter())
+    duration = TIMEFRAME_DURATION_MS["1H"]
+    end = (int(datetime.now(timezone.utc).timestamp() * 1000) // duration) * duration
+    cached_rows = [normalize_candle(item) for item in rows("1h", 50, end=end-duration)]
+    key = CandleCacheKey("user-a", "connection-a", "account-a", "7", "77", "EURUSD", "1H")
+    cache.put(key, cached_rows, source="direct", metadata={"requested_count": 50})
+    with sqlite3.connect(tmp_path / "larger-window.db") as db:
+        db.execute("UPDATE tradelocker_candle_cache SET expires_at=?",
+                   ((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),))
+    async def resolve(symbol): return 77, 9
+    seen = []
+    async def history(**kwargs):
+        seen.append(kwargs)
+        return rows("1h", 100, end=end)
+    current._resolve_instrument = resolve
+    current._history_page = history
+    result = await current.get_candles("EURUSD", "1h", 100, end_time_ms=end, minimum_usable=50)
+    await current.aclose()
+    assert result.complete and seen
+    assert seen[0]["start_time_ms"] <= end-duration*100
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_uses_sufficient_stale_cache_with_warning(tmp_path, monkeypatch):
     cache = DurableCandleCache(tmp_path / "rate.db")
     current = client(cache, ImmediateLimiter())
@@ -137,6 +175,30 @@ async def test_rate_limit_uses_sufficient_stale_cache_with_warning(tmp_path, mon
     await current.aclose()
     assert result.complete and result.cache_hit and not result.cache_fresh
     assert "cached_candles_used_after_rate_limit" in result.warnings
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_rejects_noncovering_explicit_range(tmp_path):
+    cache = DurableCandleCache(tmp_path / "range-rate.db")
+    current = client(cache, ImmediateLimiter())
+    duration = TIMEFRAME_DURATION_MS["1H"]
+    end = (int(datetime.now(timezone.utc).timestamp() * 1000) // duration) * duration
+    cached_rows = [normalize_candle(item) for item in rows("1h", 50, end=end)]
+    key = CandleCacheKey("user-a", "connection-a", "account-a", "7", "77", "EURUSD", "1H")
+    cache.put(key, cached_rows, source="direct", metadata={"requested_count": 50})
+    async def resolve(symbol): return 77, 9
+    async def limited(**kwargs):
+        raise TradeLockerError("get_candles", "limited",
+            code="tradelocker_rate_limit_exhausted", status_code=429,
+            details={"retryable": True})
+    current._resolve_instrument = resolve
+    current._history_page = limited
+    with pytest.raises(TradeLockerError) as error:
+        await current.get_candles("EURUSD", "1h", None,
+            start_time_ms=cached_rows[0].timestamp-duration*20,
+            end_time_ms=end, minimum_usable=10)
+    await current.aclose()
+    assert error.value.details["cache_rejection_reason"] == "cached_range_not_covered"
 
 
 @pytest.mark.asyncio

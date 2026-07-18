@@ -32,7 +32,7 @@ def compact(snapshot: dict) -> dict:
             "candle_requests": snapshot.get("candle_requests"), "pairs": pairs}
 
 
-async def verify(profile_ref: str) -> dict:
+async def verify(profile_ref: str, symbol: str) -> dict:
     with sqlite3.connect(settings.sqlite_path) as db:
         row = db.execute("""SELECT u.auth0_sub FROM execution_profiles p
             JOIN users u ON u.id=p.user_id WHERE p.public_id=?""", (profile_ref,)).fetchone()
@@ -42,7 +42,9 @@ async def verify(profile_ref: str) -> dict:
     runs = []
     for _ in range(2):
         try:
-            runs.append(compact(await service.snapshot(str(row[0]), profile_ref, "EURUSD", autonomous=True)))
+            runs.append(compact(await service.snapshot(
+                str(row[0]), profile_ref, symbol, autonomous=True
+            )))
         except AutonomousExecutionError as exc:
             runs.append(exc.as_dict())
     return {"status": "ok", "profile_ref": profile_ref, "runs": runs}
@@ -51,8 +53,9 @@ async def verify(profile_ref: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--symbol", default="GBPUSD")
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(verify(args.profile)), indent=2))
+    print(json.dumps(asyncio.run(verify(args.profile, args.symbol)), indent=2))
 
 
 if __name__ == "__main__":
