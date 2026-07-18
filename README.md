@@ -66,6 +66,8 @@ TradeLocker account-field configuration is cached for 15 minutes by Auth0 user, 
 
 ## Deployment
 
+The provider-neutral domain, capability registry, generic trading compatibility APIs, canonical instrument mapping, runtime configuration lifecycle, and credential key rotation are documented in [Provider and configuration architecture](docs/provider-architecture.md). Users never configure environment variables. Large local `.env` files remain compatibility tooling; production uses typed defaults, database-backed runtime/user settings, and a small managed bootstrap-secret layer.
+
 Build and test the locally bundled widget before starting or packaging the backend:
 
 ```text

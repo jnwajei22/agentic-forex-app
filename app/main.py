@@ -16,6 +16,8 @@ from app.storage.brokers import BrokerStorageError
 from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository
 from app.storage.schedules import ScheduleRepository
+from app.storage.runtime_settings import RuntimeSettingsRepository
+from app.storage.signal_intents import SignalIntentRepository
 from app.jobs.autonomous_scheduler import AutonomousSchedulerWorker
 from app.oauth.constants import CANONICAL_MCP_RESOURCE
 
@@ -23,7 +25,7 @@ from app.oauth.constants import CANONICAL_MCP_RESOURCE
 @asynccontextmanager
 async def lifespan(app_instance):
     # Ordered, idempotent additive migrations run before either API or embedded worker accepts traffic.
-    BrokerRepository();ExecutionRepository();ScheduleRepository()
+    BrokerRepository();ExecutionRepository();ScheduleRepository();RuntimeSettingsRepository();SignalIntentRepository()
     worker=AutonomousSchedulerWorker() if settings.autonomous_scheduler_embedded else None
     task=None
     async with mcp_app.lifespan(app_instance):

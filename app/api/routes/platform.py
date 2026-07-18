@@ -25,11 +25,14 @@ from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
 from app.storage.user_experience import UserExperienceRepository
+from app.storage.runtime_settings import RuntimeSettingsRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
 from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
 from app.services.market_workspace import MarketWorkspaceService
+from app.providers.registry import provider_registry
+from app.services.instruments import InstrumentMappingError, instrument_mapper
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -91,12 +94,18 @@ class ExecutionProfileUpdate(BaseModel):
 class ExecutionProfileV2Patch(BaseModel):
     model_config=ConfigDict(extra="forbid")
     schema_version: Literal[2] | None = None
+    asset_class:Literal["forex","equities","options"]|None=None
+    trading_account:str|None=None
     trading_policy: dict[str, Any] | None = None
     market_universe: dict[str, Any] | None = None
     risk_policy: dict[str, Any] | None = None
     capital_allocation: CapitalAllocationPatch | None = None
     exit_policy: dict[str, Any] | None = None
     schedule_policy: dict[str, Any] | None = None
+    provider_capability_requirements:list[str]|None=None
+    forex:dict[str,Any]|None=None
+    equities:dict[str,Any]|None=None
+    options:dict[str,Any]|None=None
     enabled: bool | None = None
 
 
@@ -150,6 +159,10 @@ class WatchlistUpdate(BaseModel):
     model_config=ConfigDict(extra="forbid")
     name:str|None=Field(default=None,min_length=1,max_length=60)
     items:list[dict[str,Any]]=Field(default_factory=list,max_length=100)
+
+
+class AccountNicknameUpdate(BaseModel):
+    nickname:str|None=Field(default=None,max_length=64)
 
 
 async def current_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -234,6 +247,87 @@ async def me(claims: dict = Depends(current_claims)) -> dict:
     return {"sub": claims["sub"], "email": claims.get("email")}
 
 
+@router.get("/providers")
+async def providers(claims:dict=Depends(current_claims))->dict:
+    enabled=set(RuntimeSettingsRepository().get_all()["enabled_providers"])
+    rows=[]
+    for provider in provider_registry.all():
+        item=provider.public()
+        if provider.status=="available" and provider.provider_type not in enabled:item["status"]="disabled"
+        rows.append(item)
+    return {"providers":rows}
+
+
+@router.get("/providers/{provider_type}/capabilities")
+async def provider_capabilities(provider_type:str,claims:dict=Depends(current_claims))->dict:
+    provider=provider_registry.get(provider_type)
+    if not provider:raise HTTPException(status_code=404,detail="Provider not found.")
+    return {"provider_type":provider_type,"status":provider.status,
+        "execution_provider":provider.execution_provider,"capabilities":provider.capabilities.public()}
+
+
+@router.get("/trading/connections")
+async def trading_connections(claims:dict=Depends(current_claims))->dict:
+    rows=[]
+    for item in repository().list_connections(claims["sub"]):
+        rows.append({**item,"provider_type":"tradelocker","authentication_type":"credentials",
+            "display_name":item.get("label") or item.get("broker_name"),"roles":["execution","account_data","broker_market_data"]})
+    return {"connections":rows}
+
+
+@router.post("/trading/connections/{provider_type}")
+async def create_trading_connection(provider_type:str,claims:dict=Depends(current_claims))->dict:
+    provider=provider_registry.get(provider_type)
+    if not provider:raise HTTPException(status_code=404,detail="Provider not found.")
+    if provider_type!="tradelocker":raise HTTPException(status_code=501,detail=f"{provider.display_name} is {provider.status}.")
+    return {"provider_type":"tradelocker","status":"credentials_required","connection_url":"/connect-tradelocker?new=1"}
+
+
+@router.delete("/trading/connections/{connection_id}")
+async def delete_trading_connection(connection_id:str,claims:dict=Depends(current_claims))->dict:
+    try:
+        if not repository().remove_connection(claims["sub"],connection_id):raise HTTPException(status_code=404,detail="Connection not found.")
+    except BrokerStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+    return {"status":"deleted","connection_id":connection_id}
+
+
+@router.get("/trading/accounts")
+async def trading_accounts(claims:dict=Depends(current_claims))->dict:
+    capabilities=provider_registry.require("tradelocker").capabilities.public()
+    rows=[]
+    for item in repository().list_accounts(claims["sub"]):
+        rows.append({**item,"external_account_id":item.get("account_id"),"base_currency":item.get("currency"),
+            "provider_type":"tradelocker","asset_classes":capabilities["asset_classes"],
+            "capabilities":capabilities,"is_primary":item.get("is_default_analysis",False)})
+    return {"accounts":rows}
+
+
+@router.put("/trading/accounts/{account_id}/primary")
+async def primary_trading_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_default_account(claims["sub"],account_id):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"primary","account_id":account_id}
+
+
+@router.put("/trading/accounts/{account_id}/nickname")
+async def nickname_trading_account(account_id:str,payload:AccountNicknameUpdate,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_nickname(claims["sub"],account_id,payload.nickname):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"updated","account_id":account_id,"nickname":payload.nickname}
+
+
+@router.put("/trading/accounts/{account_id}/enable")
+async def enable_trading_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_enabled(claims["sub"],account_id,True):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"enabled","account_id":account_id}
+
+
+@router.get("/trading/accounts/{account_id}/capabilities")
+async def trading_account_capabilities(account_id:str,claims:dict=Depends(current_claims))->dict:
+    account=next((item for item in repository().list_accounts(claims["sub"]) if item["public_id"]==account_id),None)
+    if not account:raise HTTPException(status_code=404,detail="Account not found.")
+    return {"account_id":account_id,"provider_type":"tradelocker",
+        "capabilities":provider_registry.require("tradelocker").capabilities.public()}
+
+
 @router.get("/user-preferences")
 async def user_preferences(claims:dict=Depends(current_claims))->dict:
     return UserExperienceRepository().preferences(claims["sub"])
@@ -308,18 +402,28 @@ async def market_macro(claims:dict=Depends(current_claims))->dict:
     return await _market_response("macro")
 
 
-@router.get("/markets/{symbol}")
+@router.get("/markets/{canonical_id:path}/summary")
+async def market_summary(canonical_id:str,claims:dict=Depends(current_claims))->dict:
+    try:return await _market_response("summary",canonical_id)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+
+
+@router.get("/markets/{symbol:path}")
 async def market_symbol(symbol:str,claims:dict=Depends(current_claims))->dict:
     return await _market_response("symbol",symbol)
 
 
-@router.get("/accounts/{account_alias}/tradability/{symbol}")
+@router.get("/accounts/{account_alias}/tradability/{symbol:path}")
 async def account_tradability(account_alias:str,symbol:str,claims:dict=Depends(current_claims))->dict:
     context,instruments=await _account_instruments(claims["sub"],account_alias)
-    requested=symbol.casefold()
-    match=next((item for item in instruments if requested in {
+    requested=symbol.casefold(); candidates={requested}
+    try:
+        canonical=instrument_mapper.resolve(symbol)
+        candidates.update({canonical.symbol.casefold(),canonical.symbol.replace("/","").casefold()})
+    except InstrumentMappingError:pass
+    match=next((item for item in instruments if candidates.intersection({
         str(item.get("symbol","")).casefold(),str(item.get("broker_symbol","")).casefold(),
-        str(item.get("id","")).casefold(),str(item.get("instrument_id","")).casefold()}),None)
+        str(item.get("id","")).casefold(),str(item.get("instrument_id","")).casefold()})),None)
     return {"account_alias":account_alias,"symbol":symbol,"available":match is not None,
             "currently_tradable":bool(match and match.get("tradeable",match.get("tradable",True))),
             "instrument":match,"environment":context.get("environment"),"source":"TradeLocker"}

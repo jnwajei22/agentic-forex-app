@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     onboarding_assertion_issuers: str | None = None
     sqlite_path: str = "storage/app.db"
     broker_secret_key: str | None = None
+    broker_secret_keys_json: str = "{}"
+    active_encryption_key_version: str = "v1"
     allow_env_broker_fallback: bool = False
 
     database_url: str | None = None

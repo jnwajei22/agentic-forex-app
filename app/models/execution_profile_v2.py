@@ -146,15 +146,59 @@ class SchedulePolicy(StrictModel):
     run_when_any_selected_market_is_open: bool = True
 
 
+class ForexExtension(StrictModel):
+    lot_sizing: Literal["risk_based", "fixed"] = "risk_based"
+    pip_distance_limit: float | None = Field(None, gt=0)
+    maximum_currency_exposure_pct: float | None = Field(None, gt=0, le=100)
+    sessions: list[str] = Field(default_factory=list)
+
+
+class EquitiesExtension(StrictModel):
+    sizing: Literal["shares", "fractional", "risk_based"] = "risk_based"
+    extended_hours: bool = False
+    maximum_sector_exposure_pct: float | None = Field(None, gt=0, le=100)
+    restrict_earnings_window: bool = True
+
+
+class OptionsExtension(StrictModel):
+    minimum_days_to_expiration: int = Field(7, ge=0)
+    maximum_days_to_expiration: int = Field(60, ge=1)
+    strike_selection: Literal["delta", "moneyness", "fixed"] = "delta"
+    maximum_contracts: int = Field(1, ge=1)
+    maximum_premium: float = Field(gt=0)
+    maximum_absolute_delta: float | None = Field(None, gt=0, le=1)
+    assignment_acknowledged: bool = False
+
+    @model_validator(mode="after")
+    def expiration_range(self) -> "OptionsExtension":
+        if self.maximum_days_to_expiration < self.minimum_days_to_expiration:
+            raise ValueError("maximum_days_to_expiration must be at least minimum_days_to_expiration")
+        return self
+
+
 class ExecutionProfileV2(StrictModel):
     schema_version: Literal[2] = 2
+    asset_class: Literal["forex", "equities", "options"] = "forex"
+    trading_account: str | None = None
     trading_policy: TradingPolicy = Field(default_factory=TradingPolicy)
     market_universe: MarketUniverse = Field(default_factory=MarketUniverse)
     risk_policy: RiskPolicy = Field(default_factory=RiskPolicy)
     capital_allocation: CapitalAllocation = Field(default_factory=CapitalAllocation)
     exit_policy: ExitPolicy = Field(default_factory=ExitPolicy)
     schedule_policy: SchedulePolicy = Field(default_factory=SchedulePolicy)
+    provider_capability_requirements: list[str] = Field(default_factory=list)
+    forex: ForexExtension | None = Field(default_factory=ForexExtension)
+    equities: EquitiesExtension | None = None
+    options: OptionsExtension | None = None
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def extension_matches_asset_class(self) -> "ExecutionProfileV2":
+        if self.asset_class == "equities" and self.equities is None:
+            raise ValueError("equities extension is required for equities strategies")
+        if self.asset_class == "options" and self.options is None:
+            raise ValueError("options extension is required for options strategies")
+        return self
 
 
 def deep_merge(original: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:

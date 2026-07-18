@@ -50,6 +50,28 @@ def _client_for(subject: str) -> TestClient:
     return TestClient(app)
 
 
+def test_generic_provider_routes_project_legacy_tradelocker_records(platform_storage):
+    connection = platform_storage.save_connection("auth0|generic", base_url="https://demo.example/backend-api",
+        username="user", password="password", server="HeroFX", environment="demo")
+    platform_storage.sync_accounts("auth0|generic", connection.connection_ref,
+        {"accounts":[{"accountId":"external-1","accNum":"12345678","currency":"USD"}]})
+    account = platform_storage.list_accounts("auth0|generic")[0]
+    with _client_for("auth0|generic") as client:
+        providers = client.get("/api/providers").json()["providers"]
+        assert next(item for item in providers if item["provider_type"]=="tradingview_chart")["execution_provider"] is False
+        generic_connection = client.get("/api/trading/connections").json()["connections"][0]
+        generic_account = client.get("/api/trading/accounts").json()["accounts"][0]
+        legacy_connection = client.get("/api/broker/connections").json()["connections"][0]
+        legacy_account = client.get("/api/broker/accounts").json()["accounts"][0]
+        assert generic_connection["public_id"] == legacy_connection["public_id"]
+        assert generic_connection["broker_name"] != generic_connection["platform_name"]
+        assert generic_account["public_id"] == legacy_account["public_id"] == account["public_id"]
+        assert generic_account["capabilities"]["order_submission"] is True
+        public_payload = str({"providers":providers,"connection":generic_connection,"account":generic_account}).lower()
+        assert "password" not in public_payload and "api_key" not in public_payload and "ciphertext" not in public_payload
+        assert client.put(f"/api/trading/accounts/{account['public_id']}/primary").status_code == 200
+
+
 def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmation(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "kill_switch_enabled", False)
     with _client_for("auth0|controls-a") as client:

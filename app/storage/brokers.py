@@ -14,6 +14,7 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.config.settings import settings
+from app.config.crypto import SecretDecryptionError, VersionedSecretCipher
 from app.models.execution_profile_v2 import ExecutionProfileV2, deep_merge, migrate_legacy_profile
 
 
@@ -102,6 +103,11 @@ class BrokerRepository:
                 db.execute("ALTER TABLE broker_connections ADD COLUMN needs_discovery_refresh INTEGER NOT NULL DEFAULT 1")
             if "discovery_version" not in connection_columns:
                 db.execute("ALTER TABLE broker_connections ADD COLUMN discovery_version INTEGER NOT NULL DEFAULT 0")
+            if "encryption_key_version" not in connection_columns:
+                db.execute("ALTER TABLE broker_connections ADD COLUMN encryption_key_version TEXT NOT NULL DEFAULT 'v1'")
+            db.execute("""CREATE TABLE IF NOT EXISTS credential_key_migrations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,connection_public_id TEXT NOT NULL,
+                from_version TEXT NOT NULL,to_version TEXT NOT NULL,migrated_at TEXT NOT NULL)""")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS broker_accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +253,14 @@ class BrokerRepository:
             raise BrokerStorageError("BROKER_SECRET_KEY is not configured.")
         return Fernet(base64.urlsafe_b64encode(hashlib.sha256(self.secret.encode()).digest()))
 
+    def _cipher(self) -> VersionedSecretCipher:
+        try: keys = json.loads(settings.broker_secret_keys_json or "{}")
+        except json.JSONDecodeError: keys = {}
+        if self.secret: keys.setdefault("v1", self.secret)
+        active = settings.active_encryption_key_version if settings.active_encryption_key_version in keys else "v1"
+        if not keys: raise BrokerStorageError("BROKER_SECRET_KEY is not configured.")
+        return VersionedSecretCipher(keys, active)
+
     def ensure_user(self, auth0_sub: str, email: str | None = None) -> int:
         now = _now()
         with self._connect() as db:
@@ -261,7 +275,8 @@ class BrokerRepository:
                         create_new: bool = False) -> BrokerConnection:
         user_id = self.ensure_user(auth0_sub, email)
         env = infer_tradelocker_environment(base_url, environment)
-        encrypted, now = self._fernet().encrypt(password.encode()), _now()
+        encrypted, key_version = self._cipher().encrypt(password)
+        now = _now()
         with self._connect() as db:
             target = None
             if connection_ref:
@@ -274,26 +289,42 @@ class BrokerRepository:
                 if len(rows) > 1:
                     raise BrokerStorageError("Choose the connection to reauthenticate.")
             if target:
-                db.execute("""UPDATE broker_connections SET base_url=?,username=?,password_encrypted=?,server=?,environment=?,
+                db.execute("""UPDATE broker_connections SET base_url=?,username=?,password_encrypted=?,encryption_key_version=?,server=?,environment=?,
                     label=COALESCE(?,label),status='active',needs_discovery_refresh=1,last_authenticated_at=?,updated_at=? WHERE id=? AND user_id=?""",
-                    (base_url.rstrip('/'),username,encrypted,server,env,label,now,now,target["id"],user_id))
+                    (base_url.rstrip('/'),username,encrypted,key_version,server,env,label,now,now,target["id"],user_id))
                 connection_id = int(target["id"])
             else:
                 cur = db.execute("""INSERT INTO broker_connections(user_id,public_id,provider,base_url,username,password_encrypted,
-                    server,environment,label,status,last_authenticated_at,created_at,updated_at)
-                    VALUES(?,?,'tradelocker',?,?,?,?,?,?,'active',?,?,?)""",
-                    (user_id,_ref("conn"),base_url.rstrip('/'),username,encrypted,server,env,label or server,now,now,now))
+                    encryption_key_version,server,environment,label,status,last_authenticated_at,created_at,updated_at)
+                    VALUES(?,?,'tradelocker',?,?,?,?,?,?,?,'active',?,?,?)""",
+                    (user_id,_ref("conn"),base_url.rstrip('/'),username,encrypted,key_version,server,env,label or server,now,now,now))
                 connection_id = int(cur.lastrowid)
         return self.get_connection_by_id(auth0_sub, str(connection_id))
 
     def _row_connection(self, row: sqlite3.Row) -> BrokerConnection:
         try:
-            password = self._fernet().decrypt(row["password_encrypted"]).decode()
-        except InvalidToken:
+            version = row["encryption_key_version"] if "encryption_key_version" in row.keys() else "v1"
+            password = self._cipher().decrypt(row["password_encrypted"], version)
+        except (InvalidToken, SecretDecryptionError):
             raise BrokerStorageError("Stored broker credentials cannot be decrypted.") from None
         return BrokerConnection(connection_id=str(row["id"]),base_url=row["base_url"],username=row["username"],password=password,
             server=row["server"],account_id=row["account_id"],account_number=row["account_number"],environment=row["environment"],
             label=row["label"],enabled=row["status"] == "active",connection_ref=row["public_id"])
+
+    def reencrypt_credentials(self, limit: int = 100) -> int:
+        cipher = self._cipher(); migrated = 0
+        with self._connect() as db:
+            rows = db.execute("SELECT id,public_id,password_encrypted,encryption_key_version FROM broker_connections WHERE encryption_key_version<>? LIMIT ?",
+                (cipher.active_version, limit)).fetchall()
+            for row in rows:
+                try: encrypted, version = cipher.reencrypt(row["password_encrypted"], row["encryption_key_version"])
+                except SecretDecryptionError: continue
+                db.execute("UPDATE broker_connections SET password_encrypted=?,encryption_key_version=?,updated_at=? WHERE id=?",
+                    (encrypted, version, _now(), row["id"]))
+                db.execute("INSERT INTO credential_key_migrations(connection_public_id,from_version,to_version,migrated_at) VALUES(?,?,?,?)",
+                    (row["public_id"], row["encryption_key_version"], version, _now()))
+                migrated += 1
+        return migrated
 
     def get_connection_by_id(self, auth0_sub: str, connection_id: str) -> BrokerConnection:
         with self._connect() as db:
@@ -410,6 +441,13 @@ class BrokerRepository:
             try: cur=db.execute("""UPDATE broker_accounts SET account_alias=?,nickname=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",(alias,nickname,account_ref,auth0_sub))
             except sqlite3.IntegrityError: raise BrokerStorageError("That account alias is already in use.") from None
             return cur.rowcount==1
+
+    def set_account_nickname(self, auth0_sub: str, account_ref: str, nickname: str | None) -> bool:
+        value = nickname.strip() if nickname else None
+        with self._connect() as db:
+            return db.execute("""UPDATE broker_accounts SET nickname=? WHERE public_id=?
+                AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",
+                (value, account_ref, auth0_sub)).rowcount == 1
 
     def set_default_account(self, auth0_sub: str, account_ref: str) -> bool:
         with self._connect() as db:

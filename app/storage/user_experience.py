@@ -19,8 +19,8 @@ DEFAULT_NOTIFICATIONS = {
     "daily_loss_limit_reached": True, "trading_connection_disconnected": True,
     "schedule_failed": True, "automation_interruption": True, "daily_summary": False,
 }
-DEFAULT_FOREX_MAJORS = ["OANDA:EUR_USD", "OANDA:GBP_USD", "OANDA:USD_JPY",
-                          "OANDA:USD_CHF", "OANDA:AUD_USD", "OANDA:USD_CAD", "OANDA:NZD_USD"]
+DEFAULT_FOREX_MAJORS = ["forex:EUR/USD", "forex:GBP/USD", "forex:USD/JPY",
+                          "forex:USD/CHF", "forex:AUD/USD", "forex:USD/CAD", "forex:NZD/USD"]
 
 
 class UserExperienceRepository:
@@ -102,7 +102,7 @@ class UserExperienceRepository:
 
     def create_watchlist(self, user_sub: str, name: str, symbols: list[str]) -> dict[str, Any]:
         watchlist_id = f"watchlist_{uuid4().hex}"; now = _now()
-        clean = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol.strip()))[:100]
+        clean = list(dict.fromkeys(symbol.strip() if ":" in symbol else symbol.strip().upper() for symbol in symbols if symbol.strip()))[:100]
         with self._connect() as db:
             db.execute("INSERT INTO user_watchlists VALUES(?,?,?,?,?,?)", (watchlist_id, user_sub, name.strip(), 0, now, now))
             db.executemany("INSERT INTO user_watchlist_items VALUES(?,?,?,?,?,?)",
@@ -119,7 +119,8 @@ class UserExperienceRepository:
             db.execute("DELETE FROM user_watchlist_items WHERE watchlist_id=? AND user_sub=?", (watchlist_id, user_sub))
             now = _now(); seen: set[str] = set(); normalized = []
             for item in items[:100]:
-                symbol = str(item.get("symbol", "")).strip().upper()
+                raw = str(item.get("canonical_id") or item.get("symbol", "")).strip()
+                symbol = raw if ":" in raw else raw.upper()
                 if not symbol or symbol in seen: continue
                 seen.add(symbol); normalized.append((watchlist_id, user_sub, symbol, len(normalized), bool(item.get("pinned")), now))
             db.executemany("INSERT INTO user_watchlist_items VALUES(?,?,?,?,?,?)", normalized)
