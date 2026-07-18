@@ -62,10 +62,10 @@ export async function updateAutonomousControls(
   previous: AutonomousControls,
   patch: AutonomousControlPatch,
   setControls: (controls: AutonomousControls) => void,
-  request: typeof browserBackendMutation = browserBackendMutation,
+  request: (path:string,method:"POST"|"PUT"|"PATCH"|"DELETE",body?:object)=>Promise<AutonomousControls> = browserBackendMutation,
 ): Promise<AutonomousControls> {
   try {
-    const confirmed = await request<AutonomousControls>("autonomous-controls", "PATCH", patch);
+    const confirmed = await request("autonomous-controls", "PATCH", patch);
     setControls(confirmed);
     return confirmed;
   } catch (error) {

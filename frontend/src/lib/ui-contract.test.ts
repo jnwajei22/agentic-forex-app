@@ -21,7 +21,7 @@ test("offline dashboard remains visible without claiming an empty database", () 
   assert.match(dashboard, /Unable to Verify/);
   assert.match(dashboard, /Restore Backend Connection/);
   assert.match(accounts, /if \(loadState === "unavailable"\)/);
-  assert.match(accounts, /if \(!connections\.length\)/);
+  assert.match(accounts, /if \(!connections\.length && !sectionErrors\.connections\)/);
   assert.ok(accounts.indexOf('loadState === "unavailable"') < accounts.indexOf("!connections.length"));
 });
 

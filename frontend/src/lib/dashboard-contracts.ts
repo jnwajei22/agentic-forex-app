@@ -81,7 +81,7 @@ export type WorkerHealth = {
 
 export type DailySummary = {
   date: string;
-  outcomes: { TRADE: number; NO_TRADE: number; BLOCKED: number; ERROR: number };
+  outcomes: { TRADE: number; NO_TRADE: number; BLOCKED: number; MARKET_CLOSED?:number; SKIPPED?:number; ERROR: number };
   daily_entry_count: number;
   kill_switch: boolean;
   armed_profiles: number;

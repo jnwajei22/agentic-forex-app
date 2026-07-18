@@ -72,12 +72,14 @@ test("proxy supports PATCH and forwards GET and PATCH through configured backend
   const proxy = readFileSync(new URL("../app/api/backend/[...path]/route.ts", import.meta.url), "utf8");
   const dashboard = readFileSync(new URL("../app/dashboard/page.tsx", import.meta.url), "utf8");
   const backend = readFileSync(new URL("./backend.ts", import.meta.url), "utf8");
+  const runtime = readFileSync(new URL("./backend-runtime.ts", import.meta.url), "utf8");
 
   assert.match(proxy, /"autonomous-controls"/);
   assert.match(proxy, /export async function PATCH/);
   assert.match(proxy, /backendFetch\(`\/api\/\$\{path\}\$\{request\.nextUrl\.search\}`/);
-  assert.match(dashboard, /backendFetch<AutonomousControls>\("\/api\/autonomous-controls"\)/);
-  assert.match(backend, /process\.env\.NEXT_PUBLIC_API_BASE_URL/);
+  assert.match(dashboard, /loadDashboardData\(await authenticatedBackendClient\(\)\)/);
+  assert.match(readFileSync(new URL("./dashboard-data.ts", import.meta.url), "utf8"), /"\/api\/autonomous-controls"/);
+  assert.match(runtime, /env\.NEXT_PUBLIC_API_BASE_URL/);
   assert.match(backend, /fetch\(`\$\{baseUrl\}\$\{path\}`/);
 });
 

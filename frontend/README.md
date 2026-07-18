@@ -44,6 +44,8 @@ The `/login` page starts Auth0's `/auth/login` flow. Protected pages verify the 
 6. Configure the Raspberry Pi backend with `FRONTEND_ORIGIN=https://app.agenticforexdesk.com` and expose it through Cloudflare Tunnel at the URL in `NEXT_PUBLIC_API_BASE_URL`.
 7. Deploy, log in, connect TradeLocker, discover accounts, and select one. The dashboard should then show `connected` and the selected account.
 
+`NEXT_PUBLIC_API_BASE_URL` must be the public HTTPS backend origin, not the Vercel frontend URL or a localhost address. Set `BACKEND_DIAGNOSTICS_ENABLED=true` temporarily to log sanitized dashboard request metadata (configuration booleans, backend hostname, path, method, status, and failure category); bearer tokens, cookies, credentials, and query strings are never logged.
+
 For Vercel preview URLs, register each callback URL in Auth0 or use a controlled preview-domain strategy. Never put `AUTH0_CLIENT_SECRET`, backend `BROKER_SECRET_KEY`, TradeLocker credentials, or access tokens in `NEXT_PUBLIC_*` variables.
 
 ## Pages
