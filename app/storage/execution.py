@@ -169,6 +169,8 @@ class ExecutionRepository:
                 db.execute("ALTER TABLE broker_submissions ADD COLUMN execution_id TEXT")
             if "execution_origin" not in preview_columns:
                 db.execute("ALTER TABLE autonomous_order_previews ADD COLUMN execution_origin TEXT NOT NULL DEFAULT 'manual'")
+            if "estimated_margin" not in preview_columns:
+                db.execute("ALTER TABLE autonomous_order_previews ADD COLUMN estimated_margin REAL")
             decision_columns={row["name"] for row in db.execute("PRAGMA table_info(autonomous_decision_runs)")}
             if "execution_json" not in decision_columns:
                 db.execute("ALTER TABLE autonomous_decision_runs ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{}'")
@@ -353,6 +355,17 @@ class ExecutionRepository:
                 (user_sub, account_id, acc_num, pair, now),
             ).fetchone()
         return row is not None
+
+    def profile_broker_ids(self,user_sub:str,profile_ref:str)->dict[str,Any]:
+        with self._connect() as db:
+            rows=db.execute("""SELECT s.broker_order_id,s.broker_position_id,p.estimated_risk,p.estimated_margin FROM broker_submissions s
+                JOIN autonomous_order_previews p ON p.id=s.preview_id
+                WHERE p.user_sub=? AND p.profile_ref=? AND s.submission_state IN ('submitted','verified','accepted')""",
+                (user_sub,profile_ref)).fetchall()
+        return {"order_ids":{str(row["broker_order_id"]) for row in rows if row["broker_order_id"]},
+            "position_ids":{str(row["broker_position_id"]) for row in rows if row["broker_position_id"]},
+            "estimated_open_risk":sum(float(row["estimated_risk"] or 0) for row in rows if row["broker_position_id"]),
+            "estimated_margin_used":sum(float(row["estimated_margin"] or 0) for row in rows if row["broker_position_id"])}
 
     def claim_submission(self, submission_id: str, preview_id: str, idempotency_key: str, fingerprint: str) -> tuple[bool, dict[str, Any]]:
         now = utcnow().isoformat()

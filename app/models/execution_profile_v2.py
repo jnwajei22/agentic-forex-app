@@ -59,6 +59,36 @@ class RiskPolicy(StrictModel):
         return self
 
 
+class CapitalAllocation(StrictModel):
+    mode: Literal["full_account", "fixed_amount", "equity_percentage"] = "full_account"
+    fixed_amount: float | None = Field(None, gt=0)
+    equity_percentage: float | None = Field(None, gt=0, le=100)
+    risk_base: Literal["account_equity", "allocated_capital"] = "account_equity"
+    compounding_mode: Literal["disabled", "realized_pnl", "periodic_rebalance"] = "disabled"
+    maximum_margin_utilization_pct: float = Field(70.0, gt=0, le=100)
+    maximum_gross_exposure_multiple: float | None = Field(None, gt=0)
+    allow_shared_capital: bool = False
+
+    @model_validator(mode="after")
+    def allocation_value_required(self) -> "CapitalAllocation":
+        if self.mode == "fixed_amount" and self.fixed_amount is None:
+            raise ValueError("fixed_amount is required in fixed_amount mode")
+        if self.mode == "equity_percentage" and self.equity_percentage is None:
+            raise ValueError("equity_percentage is required in equity_percentage mode")
+        return self
+
+
+class CapitalAllocationPatch(StrictModel):
+    mode: Literal["full_account", "fixed_amount", "equity_percentage"] | None = None
+    fixed_amount: float | None = Field(None, gt=0)
+    equity_percentage: float | None = Field(None, gt=0, le=100)
+    risk_base: Literal["account_equity", "allocated_capital"] | None = None
+    compounding_mode: Literal["disabled", "realized_pnl", "periodic_rebalance"] | None = None
+    maximum_margin_utilization_pct: float | None = Field(None, gt=0, le=100)
+    maximum_gross_exposure_multiple: float | None = Field(None, gt=0)
+    allow_shared_capital: bool | None = None
+
+
 class StopLossPolicy(StrictModel):
     enabled: bool = True
     mode: Literal["adaptive_structure", "volatility", "fixed_distance", "fixed_percentage"] = "adaptive_structure"
@@ -121,6 +151,7 @@ class ExecutionProfileV2(StrictModel):
     trading_policy: TradingPolicy = Field(default_factory=TradingPolicy)
     market_universe: MarketUniverse = Field(default_factory=MarketUniverse)
     risk_policy: RiskPolicy = Field(default_factory=RiskPolicy)
+    capital_allocation: CapitalAllocation = Field(default_factory=CapitalAllocation)
     exit_policy: ExitPolicy = Field(default_factory=ExitPolicy)
     schedule_policy: SchedulePolicy = Field(default_factory=SchedulePolicy)
     enabled: bool = True

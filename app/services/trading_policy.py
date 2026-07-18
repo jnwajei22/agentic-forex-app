@@ -146,6 +146,59 @@ class SizingResult:
     audit: dict[str, Any]
 
 
+def authorized_capital(*, account_equity: float, allocation: dict[str, Any],
+                       realized_profile_pnl: float = 0.0) -> float:
+    if account_equity < 0: raise ValueError("account_equity must be non-negative")
+    mode=allocation.get("mode","full_account")
+    if mode=="fixed_amount": base=float(allocation.get("fixed_amount") or 0)
+    elif mode=="equity_percentage": base=account_equity*float(allocation.get("equity_percentage") or 0)/100
+    else: base=account_equity
+    if allocation.get("compounding_mode")=="realized_pnl":base+=realized_profile_pnl
+    # Disabled fixed allocations never compound; periodic rebalance changes only when
+    # equity/percentage or the explicitly saved fixed allocation changes.
+    return min(account_equity,max(0.0,base))
+
+
+def build_capital_state(*, account_equity: float, allocation: dict[str, Any], risk_policy: dict[str, Any],
+                        realized_profile_pnl: float = 0.0, unrealized_profile_pnl: float = 0.0,
+                        open_risk_amount: float = 0.0, margin_used: float = 0.0,
+                        margin_reserved: float = 0.0) -> dict[str, float]:
+    capital=authorized_capital(account_equity=account_equity,allocation=allocation,
+        realized_profile_pnl=realized_profile_pnl)
+    risk_base=capital if allocation.get("risk_base")=="allocated_capital" else account_equity
+    margin_budget=capital*float(allocation.get("maximum_margin_utilization_pct",70))/100
+    risk_budget=capital*float(risk_policy.get("maximum_total_open_risk_pct",1))/100
+    return {"account_equity":account_equity,"authorized_capital":capital,"risk_base_amount":risk_base,
+        "margin_used":margin_used,"margin_reserved":margin_reserved,
+        "remaining_margin_budget":max(0.0,margin_budget-margin_used-margin_reserved),
+        "open_risk_amount":open_risk_amount,"remaining_risk_budget":max(0.0,risk_budget-open_risk_amount),
+        "realized_profile_pnl":realized_profile_pnl,"unrealized_profile_pnl":unrealized_profile_pnl}
+
+
+def profile_attributed_capital_metrics(positions:list[dict[str,Any]],orders:list[dict[str,Any]],
+                                       *,owned_position_ids:set[str],owned_order_ids:set[str],
+                                       order_history:list[dict[str,Any]]|None=None)->dict[str,float]:
+    classified=classify_orders(positions,orders);categories={item["order_id"]:item["category"] for item in classified["orders"]}
+    realized=unrealized=open_risk=margin_used=margin_reserved=0.0
+    for row in positions:
+        position_id=str(_value(row,"positionId","id") or "")
+        if position_id not in owned_position_ids:continue
+        unrealized+=float(_value(row,"unrealizedPnl","openPnl","pnl") or 0)
+        margin_used+=float(_value(row,"marginUsed","usedMargin","margin") or 0)
+        explicit_risk=_value(row,"openRisk","riskAmount","stopLossRisk")
+        if explicit_risk is not None:open_risk+=max(0.0,float(explicit_risk))
+    for row in orders:
+        order_id=str(_value(row,"orderId","id") or "")
+        if order_id not in owned_order_ids or categories.get(order_id)!="pending_entry":continue
+        margin_reserved+=float(_value(row,"margin","reservedMargin","marginRequirement") or 0)
+    for row in order_history or []:
+        order_id=str(_value(row,"orderId","id") or "")
+        if order_id in owned_order_ids:
+            realized+=float(_value(row,"realizedPnl","closedPnl","pnl") or 0)
+    return {"realized_profile_pnl":realized,"unrealized_profile_pnl":unrealized,
+        "open_risk_amount":open_risk,"margin_used":margin_used,"margin_reserved":margin_reserved}
+
+
 def deterministic_size(*, equity: float, entry: float, stop: float, loss_per_price_unit: float,
                        minimum_quantity: float, maximum_quantity: float, quantity_increment: float,
                        risk_policy: dict[str, Any], proposed_multiplier: float = 1.0,

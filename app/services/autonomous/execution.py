@@ -23,7 +23,8 @@ from app.services.providers.fred import FredClient
 from app.services.tradelocker.account_status import AccountStatusUnavailable, TradeLockerAccountStatusService
 from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
 from app.services.trading_policy import (classify_orders, count_open_positions, market_is_open,
-    normalize_instrument, resolve_universe, screen_candidates)
+    normalize_instrument, resolve_universe, screen_candidates, authorized_capital,
+    build_capital_state, profile_attributed_capital_metrics)
 from app.storage.brokers import BrokerConnection, BrokerRepository, BrokerStorageError
 from app.storage.execution import ExecutionRepository, utcnow
 
@@ -247,7 +248,8 @@ def calculate_broker_position_size(
     *, balance: float, available_funds: float, risk_percent: float,
     entry: float, stop_loss: float, metadata: InstrumentMetadata,
     quote_to_account_rate: float, spread: float = 0.0,
-    commission_per_lot: float = 0.0,
+    commission_per_lot: float = 0.0, risk_base_amount: float | None = None,
+    remaining_allocation_margin: float | None = None,
 ) -> dict[str, float]:
     if balance <= 0 or available_funds <= 0:
         raise AutonomousExecutionError("insufficient_account_funds", "Account balance and available funds must be positive.", status="rejected")
@@ -259,7 +261,10 @@ def calculate_broker_position_size(
     risk_per_lot = price_risk * metadata.contract_size * conversion + max(0.0, commission_per_lot)
     if risk_per_lot <= 0:
         raise AutonomousExecutionError("position_size_unverifiable", "The broker-specific position size could not be verified safely.", status="rejected")
-    risk_budget = balance * risk_percent / 100.0
+    risk_base = balance if risk_base_amount is None else risk_base_amount
+    if risk_base <= 0:
+        raise AutonomousExecutionError("capital_allocation_exhausted", "The profile has no authorized risk capital remaining.", status="rejected")
+    risk_budget = risk_base * risk_percent / 100.0
     raw_lots = risk_budget / risk_per_lot
     step = Decimal(str(metadata.lot_step))
     lots = float((Decimal(str(raw_lots)) / step).to_integral_value(rounding=ROUND_DOWN) * step)
@@ -271,9 +276,12 @@ def calculate_broker_position_size(
     estimated_margin = lots * metadata.contract_size * entry * conversion / metadata.leverage
     if estimated_margin > available_funds:
         raise AutonomousExecutionError("insufficient_margin", "Estimated margin exceeds available funds.", status="rejected")
+    if remaining_allocation_margin is not None and estimated_margin > remaining_allocation_margin:
+        raise AutonomousExecutionError("capital_margin_limit", "Estimated margin exceeds the profile allocation margin budget.", status="rejected")
     return {
         "lot_size": lots, "quantity": lots * metadata.contract_size,
-        "estimated_risk": estimated, "risk_percent": estimated / balance * 100,
+        "estimated_risk": estimated, "risk_percent": estimated / risk_base * 100,
+        "risk_budget":risk_budget,"risk_base_amount":risk_base,
         "estimated_margin":estimated_margin,"available_funds_after_margin":available_funds-estimated_margin,
     }
 
@@ -330,6 +338,9 @@ class AutonomousDemoService:
         mode = ExecutionMode.DEMO_AUTONOMOUS if allow_autonomous else ExecutionMode.DEMO_MANUAL
         risk = self.execution.get_or_create_settings(user_sub, resolved.connection_id, resolved.account_id, resolved.account_number)
         risk.update(profile.get("risk") or {})
+        v2_risk=(profile.get("profile_v2") or {}).get("risk_policy") or {}
+        if v2_risk:
+            risk["maximum_total_open_risk_pct"]=float(v2_risk.get("maximum_total_open_risk_pct",1))
         if not 0 < float(risk["risk_per_trade_percent"]) <= 1.0:
             raise AutonomousExecutionError("risk_policy_invalid", "Risk per trade must be greater than zero and no more than 1%.")
         risk["risk_per_trade_percent"] = min(float(risk["risk_per_trade_percent"]), 1.0)
@@ -345,6 +356,9 @@ class AutonomousDemoService:
         risk["strategy_version"] = profile.get("strategy_version",risk.get("strategy_version","1"))
         risk["strategy_config"] = profile.get("strategy_config") or {}
         risk["execution_mode"] = mode.value
+        risk["capital_allocation"]=(profile.get("profile_v2") or {}).get("capital_allocation") or {
+            "mode":"full_account","risk_base":"account_equity","compounding_mode":"disabled",
+            "maximum_margin_utilization_pct":70.0,"allow_shared_capital":False}
         connection = BrokerConnection(connection_id=resolved.connection_id, connection_ref=resolved.connection_ref,
             base_url=resolved.base_url, username=resolved.username, password=resolved.password,
             server=resolved.server, account_id=resolved.account_id, account_number=resolved.account_number,
@@ -402,7 +416,7 @@ class AutonomousDemoService:
             **cache_scope,
         )
 
-    async def _broker_risk_counts(self,context:VerifiedDemoContext)->dict[str,int]|None:
+    async def _broker_risk_counts(self,context:VerifiedDemoContext)->dict[str,Any]|None:
         client=self._client(context.connection,context)
         if not all(hasattr(client,name) for name in ("get_config","get_open_positions","get_orders")):
             await client.aclose();return None
@@ -414,9 +428,13 @@ class AutonomousDemoService:
                 config_key="ordersConfig",data_key="orders")
         finally:await client.aclose()
         classified=classify_orders(positions,orders)["counts"]
+        ownership=self.execution.profile_broker_ids(context.user_sub,context.profile_ref)
+        metrics=profile_attributed_capital_metrics(positions,orders,owned_position_ids=ownership["position_ids"],owned_order_ids=ownership["order_ids"])
+        metrics["open_risk_amount"]=max(metrics["open_risk_amount"],ownership["estimated_open_risk"])
+        metrics["margin_used"]=max(metrics["margin_used"],ownership["estimated_margin_used"])
         return {"open_positions":count_open_positions(positions),"pending_entry_orders":classified["pending_entry"],
             "protective_stop_orders":classified["protective_stop_loss"],
-            "protective_take_profit_orders":classified["protective_take_profit"]}
+            "protective_take_profit_orders":classified["protective_take_profit"],"capital_metrics":metrics}
 
     async def status(self, user_sub: str, profile_ref: str) -> dict[str, Any]:
         reasons = []
@@ -451,6 +469,9 @@ class AutonomousDemoService:
             except (AccountStatusUnavailable,TradeLockerError,TradeLockerMappingError):
                 reasons.append("account_status_unavailable")
         autonomous_reasons=list(dict.fromkeys([*autonomous_reasons,*reasons]))
+        capital_state=(build_capital_state(account_equity=account.projected_balance,
+            allocation=context.risk["capital_allocation"],risk_policy={"maximum_total_open_risk_pct":context.risk.get("maximum_total_open_risk_pct",1)},
+            **broker_counts["capital_metrics"]) if account and broker_counts and context else None)
         return {
             "schema_version": "1.0", "status": "ready" if not reasons else "blocked",
             "account_environment": context.environment if context else None,
@@ -471,6 +492,7 @@ class AutonomousDemoService:
             "pending_orders_count":broker_counts["pending_entry_orders"] if broker_counts else account.pending_orders_count if account else None,
             "protective_stop_orders":broker_counts["protective_stop_orders"] if broker_counts else None,
             "protective_take_profit_orders":broker_counts["protective_take_profit_orders"] if broker_counts else None,
+            "capital_state":capital_state,
             "limits":context.risk if context else None,"allowed_pairs":context.risk["allowed_pairs"] if context else [],
             "ready_for_preview":not reasons,"ready_for_submission":not reasons,
         }
@@ -714,8 +736,8 @@ class AutonomousDemoService:
         pending_entries = classified["counts"]["pending_entry"]
         risk_state = {
             "daily_realized_pnl": account.today.net, "open_pnl": account.open_net_pnl,
-            "daily_loss_remaining": max(0.0, account.balance * context.risk["daily_loss_limit_percent"] / 100 + daily_pnl),
-            "maximum_new_trade_risk": account.balance * context.risk["risk_per_trade_percent"] / 100,
+            "daily_loss_remaining": 0.0,
+            "maximum_new_trade_risk": 0.0,
             "current_drawdown_percent": max(0.0, (high_watermark - equity) / high_watermark * 100) if high_watermark > 0 else 100.0,
             "open_positions": open_positions, "maximum_open_positions": context.risk["maximum_open_positions"],
             "pending_entry_orders": pending_entries, "maximum_pending_entry_orders": context.risk["maximum_pending_orders"],
@@ -729,6 +751,19 @@ class AutonomousDemoService:
                 if pending_entries >= context.risk["maximum_pending_orders"] else []),
             "order_classification": classified,
         }
+        ownership=self.execution.profile_broker_ids(user_sub,context.profile_ref)
+        metrics=profile_attributed_capital_metrics(positions,orders,owned_position_ids=ownership["position_ids"],owned_order_ids=ownership["order_ids"],order_history=order_history)
+        metrics["open_risk_amount"]=max(metrics["open_risk_amount"],ownership["estimated_open_risk"])
+        metrics["margin_used"]=max(metrics["margin_used"],ownership["estimated_margin_used"])
+        capital_state=build_capital_state(account_equity=equity,allocation=context.risk["capital_allocation"],
+            risk_policy={"maximum_total_open_risk_pct":context.risk.get("maximum_total_open_risk_pct",1)},**metrics)
+        try:self.brokers.validate_profile_capital(user_sub,context.profile_ref,equity)
+        except BrokerStorageError:risk_state["blocking_reasons"].append("account_capital_overallocated")
+        risk_state["can_open_position"]=risk_state["can_open_position"] and not risk_state["blocking_reasons"]
+        risk_state["capital_state"]=capital_state
+        profile_pnl=metrics["realized_profile_pnl"]+metrics["unrealized_profile_pnl"]
+        risk_state["daily_loss_remaining"]=max(0.0,capital_state["risk_base_amount"]*context.risk["daily_loss_limit_percent"]/100+profile_pnl)
+        risk_state["maximum_new_trade_risk"]=capital_state["risk_base_amount"]*context.risk["risk_per_trade_percent"]/100
         candle_metadata = [value.get("metadata", {}) for pair_data in market.values()
                            for value in pair_data.get("timeframes", {}).values()]
         candle_request_summary = {
@@ -884,6 +919,8 @@ class AutonomousDemoService:
             stop_loss=proposal.stop_loss, metadata=metadata, quote_to_account_rate=quote_to_account,
             spread=spread,
             commission_per_lot=metadata.commission_per_lot,
+            risk_base_amount=float(normalized["risk_state"]["capital_state"]["risk_base_amount"]),
+            remaining_allocation_margin=float(normalized["risk_state"]["capital_state"]["remaining_margin_budget"]),
         )
         preview_id, now = f"preview_{uuid4().hex}", utcnow()
         estimated_reward = size["lot_size"] * float(calculation["reward_distance"]) * metadata.contract_size * quote_to_account
@@ -898,6 +935,7 @@ class AutonomousDemoService:
             "route_id": metadata.route_id, "side": proposal.side, "order_type": proposal.order_type,
             "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit,
             "quantity": size["quantity"], "lot_size": size["lot_size"], "estimated_risk": size["estimated_risk"],
+            "estimated_margin":size["estimated_margin"],
             "risk_percent": size["risk_percent"], "estimated_reward": estimated_reward, "reward_risk": calculation["reward_risk"],
             "broker_metadata_json": json.dumps(metadata.__dict__, separators=(",", ":"), sort_keys=True),
             "status": "approved", "violations_json": "[]",
@@ -988,7 +1026,15 @@ class AutonomousDemoService:
             if self.execution.new_entries_since(user_sub,context.account_id,day_start)>=context.risk["maximum_new_entries_per_day"]:
                 raise AutonomousExecutionError("daily_entry_limit","The profile's maximum new entries per day was reached.",status="rejected")
             total_loss = account.today.net + account.open_net_pnl
-            if account.balance <= 0 or total_loss <= -(account.balance * context.risk["daily_loss_limit_percent"] / 100):
+            allocation=context.risk.get("capital_allocation")
+            if allocation:
+                try:self.brokers.validate_profile_capital(user_sub,context.profile_ref,account.projected_balance)
+                except BrokerStorageError:
+                    raise AutonomousExecutionError("account_capital_overallocated","Enabled profiles exceed account equity allocation.",status="rejected") from None
+            else:allocation={"mode":"full_account","risk_base":"account_equity","maximum_margin_utilization_pct":100}
+            fresh_authorized=authorized_capital(account_equity=account.projected_balance,allocation=allocation)
+            fresh_risk_base=fresh_authorized if allocation.get("risk_base")=="allocated_capital" else account.projected_balance
+            if account.balance <= 0 or total_loss <= -(fresh_risk_base * context.risk["daily_loss_limit_percent"] / 100):
                 raise AutonomousExecutionError("daily_loss_limit", "The account daily loss limit was reached.", status="rejected")
             high_watermark = self.execution.observe_equity(
                 user_sub, context.connection_id, context.account_id, context.acc_num,
@@ -1008,7 +1054,7 @@ class AutonomousDemoService:
                 account_currency = (context.currency or account.account.currency or "").upper()
                 conversion = await self._fresh_conversion_rate(client, metadata.quote_currency, account_currency)
                 current_risk_per_lot = ((abs(preview["entry"] - preview["stop_loss"]) + (ask - bid)) * metadata.contract_size * conversion + metadata.commission_per_lot)
-                if current_risk_per_lot * preview["lot_size"] > account.balance * context.risk["risk_per_trade_percent"] / 100:
+                if current_risk_per_lot * preview["lot_size"] > fresh_risk_base * context.risk["risk_per_trade_percent"] / 100:
                     raise AutonomousExecutionError("risk_limit_changed", "Fresh market state would exceed the account risk limit.", status="rejected")
                 if abs(current - preview["entry"]) / preview["entry"] * 100 > settings.autonomous_price_tolerance_percent:
                     raise AutonomousExecutionError("price_moved", "The current price moved beyond the configured tolerance.", status="rejected")
@@ -1017,6 +1063,17 @@ class AutonomousDemoService:
                 mapped_positions = map_configured_rows(config_response=config, data_response=before_positions, config_key="positionsConfig", data_key="positions")
                 mapped_orders = map_configured_rows(config_response=config, data_response=before_orders, config_key="ordersConfig", data_key="orders")
                 classified = classify_orders(mapped_positions, mapped_orders)
+                ownership=self.execution.profile_broker_ids(user_sub,context.profile_ref)
+                metrics=profile_attributed_capital_metrics(mapped_positions,mapped_orders,
+                    owned_position_ids=ownership["position_ids"],owned_order_ids=ownership["order_ids"])
+                metrics["open_risk_amount"]=max(metrics["open_risk_amount"],ownership["estimated_open_risk"])
+                metrics["margin_used"]=max(metrics["margin_used"],ownership["estimated_margin_used"])
+                fresh_capital=build_capital_state(account_equity=account.projected_balance,
+                    allocation=allocation,risk_policy={"maximum_total_open_risk_pct":context.risk.get("maximum_total_open_risk_pct",1)},**metrics)
+                if float(preview.get("estimated_margin") or 0)>fresh_capital["remaining_margin_budget"]:
+                    raise AutonomousExecutionError("capital_margin_limit","The profile allocation margin budget was reached.",status="rejected")
+                if float(preview["estimated_risk"])>fresh_capital["remaining_risk_budget"]:
+                    raise AutonomousExecutionError("capital_risk_limit","The profile allocation risk budget was reached.",status="rejected")
                 open_positions = count_open_positions(mapped_positions)
                 if open_positions >= context.risk["maximum_open_positions"]:
                     raise AutonomousExecutionError("maximum_open_positions_reached", "The maximum open-position limit was reached.", status="rejected")

@@ -485,6 +485,16 @@ class BrokerRepository:
             return None
         normalized = ExecutionProfileV2.model_validate(deep_merge(current["profile_v2"], patch))
         value = normalized.model_dump(mode="json")
+        allocation=value["capital_allocation"]
+        peers=[item for item in self.list_profiles(auth0_sub) if item["account_id"]==current["account_id"]
+               and item["public_id"]!=profile_ref and item.get("enabled") and item.get("migration_state")=="native_v2"]
+        if not allocation.get("allow_shared_capital"):
+            exclusive=[allocation,*[item["profile_v2"]["capital_allocation"] for item in peers
+                         if not item["profile_v2"]["capital_allocation"].get("allow_shared_capital")]]
+            if sum(float(item.get("equity_percentage") or 0) for item in exclusive if item.get("mode")=="equity_percentage")>100:
+                raise BrokerStorageError("Enabled profiles allocate more than 100% of account equity.")
+            if any(item.get("mode")=="full_account" for item in exclusive) and len(exclusive)>1:
+                raise BrokerStorageError("A full-account allocation cannot overlap another exclusive profile allocation.")
         risk = value["risk_policy"]
         # Keep legacy readers operational during the compatibility window.
         legacy_risk = {**current["risk"], "risk_per_trade_percent": risk["fixed_risk_pct"] if risk["mode"] == "fixed" else risk["base_risk_pct"],
@@ -500,6 +510,20 @@ class BrokerRepository:
                 (json.dumps(value), json.dumps(legacy_risk), json.dumps(legacy_instruments),
                  value["trading_policy"]["minimum_confidence"], value["enabled"], _now(), profile_ref, auth0_sub))
         return self.get_profile(auth0_sub, profile_ref)
+
+    def validate_profile_capital(self,auth0_sub:str,profile_ref:str,account_equity:float)->None:
+        from app.services.trading_policy import authorized_capital
+        profile=self.get_profile(auth0_sub,profile_ref)
+        if profile is None:raise BrokerStorageError("Profile not found.")
+        allocations=[]
+        for item in self.list_profiles(auth0_sub):
+            if item["account_id"]!=profile["account_id"] or not item.get("enabled"):continue
+            if item["public_id"]!=profile_ref and item.get("migration_state")!="native_v2":continue
+            allocation=item["profile_v2"]["capital_allocation"]
+            if allocation.get("allow_shared_capital"):continue
+            allocations.append(authorized_capital(account_equity=account_equity,allocation=allocation))
+        if sum(allocations)>account_equity+1e-9:
+            raise BrokerStorageError("Enabled profiles exceed current account equity allocation.")
 
     def account_connection_context(self, auth0_sub: str, account_alias: str) -> dict[str, Any] | None:
         row = self.get_account_record(auth0_sub, alias=account_alias)

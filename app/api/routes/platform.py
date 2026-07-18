@@ -26,7 +26,7 @@ from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
-from app.models.execution_profile_v2 import ExecutionProfileV2
+from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
 from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
 
 
@@ -92,6 +92,7 @@ class ExecutionProfileV2Patch(BaseModel):
     trading_policy: dict[str, Any] | None = None
     market_universe: dict[str, Any] | None = None
     risk_policy: dict[str, Any] | None = None
+    capital_allocation: CapitalAllocationPatch | None = None
     exit_policy: dict[str, Any] | None = None
     schedule_policy: dict[str, Any] | None = None
     enabled: bool | None = None
@@ -179,7 +180,8 @@ def _profile_contract(profile: dict[str, Any], instruments: list[dict[str, Any]]
         "profile":profile["profile_v2"], "supported_enum_options":_capabilities(profile, instruments),
         "server_defaults":ExecutionProfileV2().model_dump(mode="json"),
         "field_validation_ranges":{"minimum_confidence":{"minimum":0,"maximum":1},"risk_pct_per_trade":{"exclusive_minimum":0,"maximum":1},
-            "daily_loss_limit_pct":{"exclusive_minimum":0,"maximum":3},"drawdown_cutoff_pct":{"exclusive_minimum":0,"maximum":10}},
+            "daily_loss_limit_pct":{"exclusive_minimum":0,"maximum":3},"drawdown_cutoff_pct":{"exclusive_minimum":0,"maximum":10},
+            "capital_equity_percentage":{"exclusive_minimum":0,"maximum":100},"capital_margin_utilization_pct":{"exclusive_minimum":0,"maximum":100}},
         "account_capabilities":_capabilities(profile, instruments), "available_market_groups":list(MARKET_GROUPS),
         "warnings":warnings, "migration":{"state":migration,"legacy_compatibility":True,"legacy_columns_retained":True}}
 

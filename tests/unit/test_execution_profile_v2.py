@@ -6,9 +6,12 @@ from pydantic import ValidationError
 from app.models.execution_profile_v2 import ExecutionProfileV2, deep_merge, migrate_legacy_profile
 from app.storage.brokers import BrokerRepository
 from app.services.trading_policy import (
-    classify_orders, count_open_positions, deterministic_size, market_is_open,
-    normalize_instrument, resolve_universe, screen_candidates, validate_exit_prices,
+    authorized_capital, build_capital_state, classify_orders, count_open_positions,
+    deterministic_size, market_is_open, normalize_instrument,
+    profile_attributed_capital_metrics, resolve_universe, screen_candidates, validate_exit_prices,
 )
+from app.services.autonomous.execution import InstrumentMetadata, calculate_broker_position_size, AutonomousExecutionError
+from app.storage.brokers import BrokerStorageError
 
 
 def instruments():
@@ -112,3 +115,72 @@ def test_market_hours_are_asset_aware_and_screening_is_bounded():
     screened=screen_candidates(catalog*10,maximum_screened=8,maximum_deeply_analyzed=2)
     assert screened["candidates_screened"] == 8
     assert screened["candidates_deeply_analyzed"] == 2
+
+
+def allocation(**updates):
+    return {"mode":"fixed_amount","fixed_amount":7000,"equity_percentage":None,
+        "risk_base":"allocated_capital","compounding_mode":"disabled",
+        "maximum_margin_utilization_pct":70,"maximum_gross_exposure_multiple":None,
+        "allow_shared_capital":False,**updates}
+
+
+def sizing_metadata():
+    return InstrumentMetadata(instrument_id="1",route_id="r",contract_size=100_000,pip_size=.0001,
+        lot_step=.01,min_lots=.01,max_lots=100,quote_currency="USD",minimum_stop_distance=.0001,
+        commission_per_lot=0,leverage=100,tick_size=.00001,price_precision=5)
+
+
+def test_allocated_capital_produces_17_50_not_250_risk_budget():
+    state=build_capital_state(account_equity=100_000,allocation=allocation(),
+        risk_policy={"maximum_total_open_risk_pct":1})
+    result=calculate_broker_position_size(balance=100_000,available_funds=90_000,risk_percent=.25,
+        risk_base_amount=state["risk_base_amount"],remaining_allocation_margin=state["remaining_margin_budget"],
+        entry=1.1,stop_loss=1.099,metadata=sizing_metadata(),quote_to_account_rate=1)
+    assert state["authorized_capital"] == 7000
+    assert result["risk_budget"] == pytest.approx(17.50)
+    assert result["risk_budget"] != 250
+    assert result["estimated_risk"] <= 17.50
+
+
+def test_model_multiplier_cannot_escape_allocation_and_margin_is_separate():
+    sized=deterministic_size(equity=7000,entry=100,stop=99,loss_per_price_unit=1,
+        minimum_quantity=1,maximum_quantity=10000,quantity_increment=1,proposed_multiplier=999,
+        risk_policy={"mode":"adaptive","base_risk_pct":.25,"minimum_risk_pct":.1,
+            "maximum_risk_pct":.5,"maximum_total_open_risk_pct":1})
+    assert sized.risk_amount == 35
+    with pytest.raises(AutonomousExecutionError) as raised:
+        calculate_broker_position_size(balance=100_000,available_funds=90_000,risk_percent=.25,
+            risk_base_amount=7000,remaining_allocation_margin=1,entry=1.1,stop_loss=1.099,
+            metadata=sizing_metadata(),quote_to_account_rate=1)
+    assert raised.value.code == "capital_margin_limit"
+
+
+def test_fixed_allocation_does_not_compound_but_realized_mode_does():
+    assert authorized_capital(account_equity=100_000,allocation=allocation(),realized_profile_pnl=500)==7000
+    assert authorized_capital(account_equity=100_000,allocation=allocation(compounding_mode="realized_pnl"),realized_profile_pnl=500)==7500
+    percentage=allocation(mode="equity_percentage",fixed_amount=None,equity_percentage=10,compounding_mode="periodic_rebalance")
+    assert authorized_capital(account_equity=110_000,allocation=percentage)==11_000
+    assert authorized_capital(account_equity=5_000,allocation=allocation())==5_000
+
+
+def test_protective_orders_do_not_reserve_allocation_margin():
+    positions=[{"positionId":"p","qty":1,"stopLossId":"sl","takeProfitId":"tp","marginUsed":200}]
+    orders=[{"orderId":"sl","positionId":"p","type":"stop","margin":999},
+            {"orderId":"tp","positionId":"p","type":"limit","margin":999},
+            {"orderId":"entry","type":"limit","status":"working","margin":75}]
+    metrics=profile_attributed_capital_metrics(positions,orders,owned_position_ids={"p"},owned_order_ids={"sl","tp","entry"})
+    assert metrics["margin_used"] == 200
+    assert metrics["margin_reserved"] == 75
+
+
+def test_multiple_profiles_cannot_overallocate_equity(tmp_path):
+    repo=BrokerRepository(tmp_path/"alloc.db","secret")
+    connection=repo.save_connection("owner",base_url="https://demo.test",username="u",password="p",server="s",environment="demo")
+    repo.sync_accounts("owner",connection.connection_ref,{"accounts":[{"accountId":"a","accNum":"1"}]})
+    account=repo.list_accounts("owner")[0]
+    one=repo.create_profile("owner",name="one",account_ref=account["public_id"])
+    two=repo.create_profile("owner",name="two",account_ref=account["public_id"])
+    repo.update_profile_v2("owner",one["public_id"],{"capital_allocation":allocation(fixed_amount=6000)})
+    repo.update_profile_v2("owner",two["public_id"],{"capital_allocation":allocation(fixed_amount=5000)})
+    with pytest.raises(BrokerStorageError,match="exceed current account equity"):
+        repo.validate_profile_capital("owner",one["public_id"],10_000)

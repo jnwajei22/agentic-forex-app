@@ -231,6 +231,121 @@
         "title": "AutonomousScheduleRequest",
         "type": "object"
       },
+      "CapitalAllocationPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_shared_capital": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allow Shared Capital"
+          },
+          "compounding_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "disabled",
+                  "realized_pnl",
+                  "periodic_rebalance"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compounding Mode"
+          },
+          "equity_percentage": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 100.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Equity Percentage"
+          },
+          "fixed_amount": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fixed Amount"
+          },
+          "maximum_gross_exposure_multiple": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Gross Exposure Multiple"
+          },
+          "maximum_margin_utilization_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 100.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Margin Utilization Pct"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "full_account",
+                  "fixed_amount",
+                  "equity_percentage"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "risk_base": {
+            "anyOf": [
+              {
+                "enum": [
+                  "account_equity",
+                  "allocated_capital"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Risk Base"
+          }
+        },
+        "title": "CapitalAllocationPatch",
+        "type": "object"
+      },
       "CompletionRequest": {
         "properties": {
           "csrf_token": {
@@ -481,6 +596,16 @@
       "ExecutionProfileV2Patch": {
         "additionalProperties": false,
         "properties": {
+          "capital_allocation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapitalAllocationPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "enabled": {
             "anyOf": [
               {
