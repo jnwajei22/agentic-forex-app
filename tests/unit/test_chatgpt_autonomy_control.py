@@ -44,6 +44,7 @@ def setup_service(tmp_path, monkeypatch, *, runner=None):
         {"accounts": [{"accountId": "demo-1", "accNum": "7", "currency": "USD"}]})
     account = brokers.list_accounts("user")[0]
     brokers.rename_account("user", account["public_id"], "herofx-demo-1")
+    brokers.set_default_account("user", account["public_id"])
     account = brokers.list_accounts("user")[0]
     profile = brokers.create_profile("user", name="AI Demo Competition", account_ref=account["public_id"],
         strategy_template_id="strategy_hourly_forex_v1")

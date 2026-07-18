@@ -10,14 +10,74 @@ def repo(tmp_path):
     return BrokerRepository(tmp_path / "multi.db", "secret")
 
 
-def add_connection(storage, user, *, server="Alpha", environment="demo", create_new=False):
+def add_connection(storage, user, *, server="Alpha", environment="demo", create_new=False, select_default=True):
     connection = storage.save_connection(user, base_url=f"https://{environment}.tradelocker.test/backend-api",
         username=f"{user}@test", password="private", server=server, environment=environment,
         create_new=create_new)
     storage.sync_accounts(user, connection.connection_ref, {"accounts": [
         {"accountId": f"id-{server}", "accNum": "7", "name": f"{server} account", "currency": "USD"}
     ]})
+    if select_default and not any(account["is_default_analysis"] for account in storage.list_accounts(user)):
+        account = next(account for account in storage.list_accounts(user) if account["connection_id"] == connection.connection_ref)
+        storage.set_default_account(user, account["public_id"])
     return connection
+
+
+def test_discovery_persists_every_account_without_choosing_a_default(tmp_path):
+    storage=repo(tmp_path)
+    connection=storage.save_connection("new-user",base_url="https://demo.tradelocker.test/backend-api",
+        username="new@test",password="private",server="Three",environment="demo")
+    discovered={"accounts":[
+        {"accountId":"a1","accNum":"101","name":"Primary demo","currency":"USD"},
+        {"accountId":"a2","accNum":"102","name":"Secondary demo","currency":"EUR"},
+        {"accountId":"a3","accNum":"103","name":"Third demo","currency":"GBP"},
+    ]}
+    storage.sync_accounts("new-user",connection.connection_ref,discovered)
+    accounts=storage.list_accounts("new-user")
+    assert len(accounts) == 3
+    assert {account["account_name"] for account in accounts} == {"Primary demo","Secondary demo","Third demo"}
+    assert not any(account["is_default_analysis"] for account in accounts)
+
+
+def test_explicit_selection_chooses_exactly_one_and_rediscovery_preserves_it(tmp_path):
+    storage=repo(tmp_path)
+    connection=storage.save_connection("new-user",base_url="https://demo.tradelocker.test/backend-api",
+        username="new@test",password="private",server="Three",environment="demo")
+    discovered={"accounts":[
+        {"accountId":"a1","accNum":"101","name":"Primary demo"},
+        {"accountId":"a2","accNum":"102","name":"Chosen demo"},
+        {"accountId":"a3","accNum":"103","name":"Third demo"},
+    ]}
+    storage.sync_accounts("new-user",connection.connection_ref,discovered)
+    assert storage.select_account("new-user","a2","102",connection.connection_ref)
+    selected=[account for account in storage.list_accounts("new-user") if account["is_default_analysis"]]
+    assert len(selected) == 1
+    assert selected[0]["account_name"] == "Chosen demo"
+    assert len(storage.list_accounts("new-user")) == 3
+    assert all(account["available"] for account in storage.list_accounts("new-user"))
+
+    storage.sync_accounts("new-user",connection.connection_ref,{"accounts":[
+        {"accountId":"a1","accNum":"101","name":"Primary renamed"},
+        {"accountId":"a2","accNum":"102","name":"Chosen renamed"},
+        {"accountId":"a3","accNum":"103","name":"Third renamed"},
+    ]})
+    selected=[account for account in storage.list_accounts("new-user") if account["is_default_analysis"]]
+    assert len(selected) == 1
+    assert selected[0]["account_name"] == "Chosen renamed"
+
+
+def test_rediscovery_marks_missing_accounts_unavailable_without_deleting_them(tmp_path):
+    storage=repo(tmp_path)
+    connection=storage.save_connection("new-user",base_url="https://demo.tradelocker.test/backend-api",
+        username="new@test",password="private",server="Three",environment="demo")
+    storage.sync_accounts("new-user",connection.connection_ref,{"accounts":[
+        {"accountId":"a1","accNum":"101"},{"accountId":"a2","accNum":"102"},{"accountId":"a3","accNum":"103"},
+    ]})
+    storage.sync_accounts("new-user",connection.connection_ref,{"accounts":[{"accountId":"a2","accNum":"102"}]})
+    accounts=storage.list_accounts("new-user")
+    assert len(accounts) == 3
+    assert sum(account["available"] for account in accounts) == 1
+    assert sum(not account["available"] for account in accounts) == 2
 
 
 def test_multiple_connections_and_accounts_are_preserved(tmp_path):

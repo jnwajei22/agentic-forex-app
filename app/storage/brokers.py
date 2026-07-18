@@ -350,11 +350,10 @@ class BrokerRepository:
                          active,json.dumps(item,default=str),now,existing["id"]))
                 else:
                     alias=self._unique_alias(db,owner["user_id"],f"{owner['server']}-{owner['environment']}-{anum}")
-                    default=not db.execute("SELECT 1 FROM broker_accounts WHERE user_id=? AND is_default_analysis=1",(owner["user_id"],)).fetchone()
                     db.execute("""INSERT INTO broker_accounts(public_id,user_id,connection_id,broker_account_id,acc_num,account_alias,
                         account_name,currency,environment,is_demo,broker_active,is_default_analysis,metadata_json,first_discovered_at,last_verified_at)
                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(_ref("acct"),owner["user_id"],owner["id"],aid,anum,alias,item.get("name"),item.get("currency"),owner["environment"],
-                        1 if owner["environment"]=="demo" else 0 if owner["environment"]=="live" else None,active,default,json.dumps(item,default=str),now,now))
+                        1 if owner["environment"]=="demo" else 0 if owner["environment"]=="live" else None,active,0,json.dumps(item,default=str),now,now))
             db.execute("UPDATE broker_accounts SET available=0,unavailable_since=COALESCE(unavailable_since,?) WHERE connection_id=?",(now,owner["id"]))
             for aid,anum in seen:
                 db.execute("UPDATE broker_accounts SET available=1,unavailable_since=NULL WHERE connection_id=? AND broker_account_id=? AND acc_num=?",(owner["id"],aid,anum))

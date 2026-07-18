@@ -287,6 +287,11 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
     password = "private-password"
     token = "private-jwt-token"
     captured = {}
+    discovered_accounts = [
+        {"accountId": 12345, "accNum": 2, "name": "First", "currency": "USD"},
+        {"accountId": 12346, "accNum": 3, "name": "Second", "currency": "EUR"},
+        {"accountId": 12347, "accNum": 4, "name": "Third", "currency": "GBP"},
+    ]
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -299,7 +304,7 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
             return None
 
         async def get_accounts(self):
-            return {"accounts": [{"accountId": 12345, "accNum": 2}]}
+            return {"accounts": discovered_accounts}
 
     monkeypatch.setattr(platform, "TradeLockerClient", FakeClient)
     with _client_for("auth0|user-a") as client:
@@ -315,7 +320,10 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
         discovered = client.post("/api/broker/tradelocker/discover-accounts")
 
     assert saved.json()["status"] == "connected_no_account"
-    assert discovered.json() == {"accounts": [{"accountId": 12345, "accNum": 2}]}
+    assert discovered.json() == {"accounts": discovered_accounts}
+    stored_accounts = platform_storage.list_accounts("auth0|user-a")
+    assert len(stored_accounts) == 3
+    assert not any(account["is_default_analysis"] for account in stored_accounts)
     assert captured["password"] == password
     output = saved.text + discovered.text
     assert password not in output
