@@ -7,7 +7,7 @@ import anyio
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from app.brokers.tradelocker.client import TradeLockerClient, TradeLockerError
 from app.config.settings import settings
@@ -26,6 +26,8 @@ from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
+from app.models.execution_profile_v2 import ExecutionProfileV2
+from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -82,6 +84,17 @@ class ExecutionProfileUpdate(BaseModel):
     decision_provider: Literal["openai","no_trade"] | None = None
     model_identifier: str | None = Field(default=None,max_length=80)
     minimum_confidence: float | None = Field(default=None,ge=0,le=1)
+
+
+class ExecutionProfileV2Patch(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    schema_version: Literal[2] | None = None
+    trading_policy: dict[str, Any] | None = None
+    market_universe: dict[str, Any] | None = None
+    risk_policy: dict[str, Any] | None = None
+    exit_policy: dict[str, Any] | None = None
+    schedule_policy: dict[str, Any] | None = None
+    enabled: bool | None = None
 
 
 class AutonomousControlsUpdate(BaseModel):
@@ -142,6 +155,48 @@ def repository() -> BrokerRepository:
 def _profile_with_provider_readiness(profile: dict[str, Any]) -> dict[str, Any]:
     return {**profile, "provider_readiness": decision_provider_readiness(
         profile.get("decision_provider"), profile.get("model_identifier"))}
+
+
+def _capabilities(profile: dict[str, Any], instruments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    instruments = instruments or []
+    return {"supported_trading_policy_modes":["adaptive","preset"],
+        "available_presets":[{"id":"hourly_forex","version":"1"}], "available_market_groups":list(MARKET_GROUPS),
+        "supported_risk_modes":["fixed","adaptive"],
+        "supported_stop_modes":["adaptive_structure","volatility","fixed_distance","fixed_percentage"],
+        "supported_take_profit_modes":["reward_to_risk","adaptive_structure","trailing_only","none"],
+        "trailing_stop_capability":{"configured":True,"broker_managed":False},
+        "partial_exit_capability":{"configured":True,"execution_supported":False},
+        "account_asset_classes":sorted({item["asset_class"] for item in instruments}),
+        "live_demo_restrictions":{"demo_execution":True,"live_autonomous_execution":False},
+        "broker_execution_capabilities":{"market_orders":True,"protective_stop_loss":True,"protective_take_profit":True}}
+
+
+def _profile_contract(profile: dict[str, Any], instruments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    migration = profile.get("migration_state", "legacy_projected")
+    warnings = ([{"code":"legacy_profile_projected","message":"This legacy profile is projected into V2 and will be persisted on its next PATCH."}]
+        if migration != "native_v2" else [])
+    return {"profile_id":profile["public_id"], "account_id":profile["account_id"], "account_alias":profile["account_alias"],
+        "profile":profile["profile_v2"], "supported_enum_options":_capabilities(profile, instruments),
+        "server_defaults":ExecutionProfileV2().model_dump(mode="json"),
+        "field_validation_ranges":{"minimum_confidence":{"minimum":0,"maximum":1},"risk_pct_per_trade":{"exclusive_minimum":0,"maximum":1},
+            "daily_loss_limit_pct":{"exclusive_minimum":0,"maximum":3},"drawdown_cutoff_pct":{"exclusive_minimum":0,"maximum":10}},
+        "account_capabilities":_capabilities(profile, instruments), "available_market_groups":list(MARKET_GROUPS),
+        "warnings":warnings, "migration":{"state":migration,"legacy_compatibility":True,"legacy_columns_retained":True}}
+
+
+async def _account_instruments(user_sub: str, account_alias: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    context=repository().account_connection_context(user_sub,account_alias)
+    if context is None: raise HTTPException(status_code=404,detail="Account not found.")
+    try:
+        async with TradeLockerClient(base_url=context["base_url"],username=context["username"],password=context["password"],
+            server=context["server"],account_id=context["account_id"],account_number=context["account_number"]) as client:
+            payload=await client.get_symbols()
+    except TradeLockerError as exc:
+        raise HTTPException(status_code=502,detail={"error":exc.code,"message":"The account instrument catalog is unavailable."}) from None
+    normalized=[item for row in TradeLockerClient._instrument_rows(payload) if (item:=normalize_instrument(row)) is not None]
+    # Broker routing is deliberately retained only inside the service boundary.
+    public=[{key:value for key,value in item.items() if not key.startswith("_")} for item in normalized]
+    return context,public
 
 
 @router.get("/me")
@@ -409,6 +464,79 @@ async def list_execution_profiles(claims: dict = Depends(current_claims)) -> dic
     return {"profiles": [_profile_with_provider_readiness(profile) for profile in repository().list_profiles(claims["sub"])]}
 
 
+@router.get("/execution-profiles/{profile_id}")
+async def get_execution_profile_v2(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    profile=repository().get_profile(claims["sub"],profile_id)
+    if not profile:raise HTTPException(status_code=404,detail="Profile not found.")
+    return _profile_contract(profile)
+
+
+@router.patch("/execution-profiles/{profile_id}")
+async def patch_execution_profile_v2(profile_id:str,payload:ExecutionProfileV2Patch,claims:dict=Depends(current_claims))->dict:
+    patch=payload.model_dump(exclude_none=True)
+    try: profile=repository().update_profile_v2(claims["sub"],profile_id,patch)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422,detail={"error":"profile_validation_failed","fields":exc.errors(include_url=False)}) from None
+    if not profile:raise HTTPException(status_code=404,detail="Profile not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return _profile_contract(profile)
+
+
+@router.get("/execution-profiles/{profile_id}/capabilities")
+async def execution_profile_capabilities(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    profile=repository().get_profile(claims["sub"],profile_id)
+    if not profile:raise HTTPException(status_code=404,detail="Profile not found.")
+    _,instruments=await _account_instruments(claims["sub"],profile["account_alias"])
+    return _capabilities(profile,instruments)
+
+
+@router.get("/autonomous-runs/{run_id}/audit")
+async def autonomous_run_audit(run_id:str,claims:dict=Depends(current_claims))->dict:
+    record=ExecutionRepository().get_decision_run(claims["sub"],run_id)
+    if not record:raise HTTPException(status_code=404,detail="Autonomous run not found.")
+    context=record.get("context") or {};market=context.get("market") or {}
+    compact_market={symbol:{key:value for key,value in data.items() if key!="timeframes"}
+                    for symbol,data in market.items() if isinstance(data,dict)}
+    return {"run_id":run_id,"outcome":AutonomousDecisionRunner._public_run(record)["outcome"],
+        "selected_market_universe":context.get("allowed_symbols",[]),"markets_currently_open":record.get("validation",{}).get("markets_currently_open",[]),
+        "candidates_screened":record.get("validation",{}).get("candidates_screened",0),
+        "candidates_deeply_analyzed":record.get("validation",{}).get("candidates_deeply_analyzed",0),
+        "chosen_instrument":(record.get("decision") or {}).get("symbol"),"trading_policy":context.get("strategy"),
+        "risk_state_counts":context.get("risk_state",{}),"execution_result":record.get("execution",{}),
+        "reason_codes":record.get("reason_codes",[]),"market_summary":compact_market,"usage":record.get("usage",{})}
+
+
+@router.get("/accounts/{account_alias}/instruments")
+async def account_instruments(account_alias:str,asset_class:str|None=None,group:str|None=None,
+                              tradable:bool|None=None,search:str|None=None,claims:dict=Depends(current_claims))->dict:
+    context,instruments=await _account_instruments(claims["sub"],account_alias)
+    if asset_class:instruments=[item for item in instruments if item["asset_class"]==asset_class.lower()]
+    if group:instruments=[item for item in instruments if item["market_group"]==group]
+    if tradable is not None:instruments=[item for item in instruments if item["currently_tradable"] is tradable]
+    if search:
+        needle=search.casefold();instruments=[item for item in instruments if needle in f"{item['broker_symbol']} {item.get('description') or ''}".casefold()]
+    return {"account_alias":context["account_alias"],"instruments":instruments,"count":len(instruments)}
+
+
+@router.get("/accounts/{account_alias}/market-groups")
+async def account_market_groups(account_alias:str,claims:dict=Depends(current_claims))->dict:
+    _,instruments=await _account_instruments(claims["sub"],account_alias);counts={group:0 for group in MARKET_GROUPS}
+    for item in instruments:counts[item["market_group"]]+=1
+    return {"account_alias":account_alias,"groups":[{"id":group,"instrument_count":counts[group]} for group in MARKET_GROUPS]}
+
+
+@router.get("/accounts/{account_alias}/market-universe")
+async def account_market_universe(account_alias:str,profile_id:str|None=None,claims:dict=Depends(current_claims))->dict:
+    _,instruments=await _account_instruments(claims["sub"],account_alias)
+    profile=repository().get_profile(claims["sub"],profile_id) if profile_id else None
+    if profile_id and (not profile or profile["account_alias"].casefold()!=account_alias.casefold()):
+        raise HTTPException(status_code=404,detail="Profile not found for this account.")
+    universe=profile["profile_v2"]["market_universe"] if profile else {"mode":"all_available"}
+    selected=resolve_universe(instruments,universe)
+    return {"account_alias":account_alias,"selection":universe,"instruments":selected,"count":len(selected),
+        "tradable_count":sum(1 for item in selected if item["currently_tradable"])}
+
+
 @router.post("/execution-profiles", status_code=201)
 async def create_execution_profile(payload: ExecutionProfileCreate, claims: dict = Depends(current_claims)) -> dict:
     try:
@@ -432,8 +560,10 @@ async def update_execution_profile(profile_id: str, payload: ExecutionProfileUpd
     except BrokerStorageError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if not changed: raise HTTPException(status_code=404, detail="Profile not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
     profile=next(item for item in repository().list_profiles(claims["sub"]) if item["public_id"]==profile_id)
-    return {"status":"updated","profile_id":profile_id,"profile":_profile_with_provider_readiness(profile)}
+    return {"status":"updated","profile_id":profile_id,"profile":_profile_with_provider_readiness(profile),
+        "warnings":[{"code":"legacy_profile_update_deprecated","message":"Use PATCH with the Execution Profile V2 contract."}]}
 
 
 @router.delete("/execution-profiles/{profile_id}")

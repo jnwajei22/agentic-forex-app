@@ -22,6 +22,8 @@ from app.services.providers.finnhub import FinnhubClient
 from app.services.providers.fred import FredClient
 from app.services.tradelocker.account_status import AccountStatusUnavailable, TradeLockerAccountStatusService
 from app.services.tradelocker.accounts import AccountResolutionError, BrokerAccountResolver
+from app.services.trading_policy import (classify_orders, count_open_positions, market_is_open,
+    normalize_instrument, resolve_universe, screen_candidates)
 from app.storage.brokers import BrokerConnection, BrokerRepository, BrokerStorageError
 from app.storage.execution import ExecutionRepository, utcnow
 
@@ -333,9 +335,9 @@ class AutonomousDemoService:
         risk["risk_per_trade_percent"] = min(float(risk["risk_per_trade_percent"]), 1.0)
         risk["daily_loss_limit_percent"] = min(float(risk.get("daily_loss_limit_percent", 3.0)), 3.0)
         risk["drawdown_cutoff_percent"] = min(float(risk.get("drawdown_cutoff_percent", 10.0)), 10.0)
-        risk["maximum_open_positions"] = min(int(risk.get("maximum_open_positions", 1)), 1)
-        risk["maximum_pending_orders"] = min(int(risk.get("maximum_pending_orders", 1)), 1)
-        risk["maximum_new_entries_per_day"] = min(int(risk.get("maximum_new_entries_per_day", 2)), 2)
+        risk["maximum_open_positions"] = min(max(int(risk.get("maximum_open_positions", 1)), 1), 100)
+        risk["maximum_pending_orders"] = min(max(int(risk.get("maximum_pending_orders", 1)), 0), 100)
+        risk["maximum_new_entries_per_day"] = min(max(int(risk.get("maximum_new_entries_per_day", 2)), 1), 100)
         risk["minimum_reward_risk"] = max(float(risk.get("minimum_reward_risk", 1.5)), 1.5)
         if profile.get("allowed_instruments"):
             risk["allowed_pairs"] = [normalize_pair(pair) for pair in profile["allowed_instruments"]]
@@ -353,6 +355,19 @@ class AutonomousDemoService:
         client = self._client(connection)
         try:
             discovered = await client.get_accounts()
+            profile_v2=profile.get("profile_v2") or {}
+            if (profile_v2.get("trading_policy") or {}).get("mode")=="adaptive" and hasattr(client,"get_symbols"):
+                symbols_payload=await client.get_symbols()
+                catalog=[item for row in client._instrument_rows(symbols_payload) if (item:=normalize_instrument(row)) is not None]
+                selected=resolve_universe(catalog,profile_v2.get("market_universe") or {"mode":"all_available"})
+                selected=[item for item in selected if market_is_open(item,utcnow())]
+                screening=screen_candidates(selected,maximum_screened=settings.autonomous_maximum_instruments_screened,
+                    maximum_deeply_analyzed=settings.autonomous_maximum_instruments_deeply_analyzed)
+                deep=set(screening["deep_candidates"])
+                risk["allowed_pairs"]=[item["broker_symbol"] for item in selected if item["instrument_id"] in deep]
+                risk["screening"]={**screening,"selected_instruments":len(selected),
+                    "maximum_upstream_requests_per_run":settings.autonomous_maximum_upstream_requests_per_run,
+                    "maximum_run_duration_seconds":settings.autonomous_maximum_run_duration_seconds}
         except TradeLockerError:
             raise AutonomousExecutionError("broker_unreachable", "TradeLocker account discovery is unavailable.") from None
         finally:
@@ -387,6 +402,22 @@ class AutonomousDemoService:
             **cache_scope,
         )
 
+    async def _broker_risk_counts(self,context:VerifiedDemoContext)->dict[str,int]|None:
+        client=self._client(context.connection,context)
+        if not all(hasattr(client,name) for name in ("get_config","get_open_positions","get_orders")):
+            await client.aclose();return None
+        try:
+            config=await client.get_config()
+            positions=map_configured_rows(config_response=config,data_response=await client.get_open_positions(),
+                config_key="positionsConfig",data_key="positions")
+            orders=map_configured_rows(config_response=config,data_response=await client.get_orders(),
+                config_key="ordersConfig",data_key="orders")
+        finally:await client.aclose()
+        classified=classify_orders(positions,orders)["counts"]
+        return {"open_positions":count_open_positions(positions),"pending_entry_orders":classified["pending_entry"],
+            "protective_stop_orders":classified["protective_stop_loss"],
+            "protective_take_profit_orders":classified["protective_take_profit"]}
+
     async def status(self, user_sub: str, profile_ref: str) -> dict[str, Any]:
         reasons = []
         context = None
@@ -404,14 +435,18 @@ class AutonomousDemoService:
         if fred_required and (not settings.fred_enabled or not settings.fred_api_key):
             reasons.append("required_macro_provider_unavailable")
         account = None
+        broker_counts = None
         if context:
             try:
                 account = await self.account_status_service.retrieve(user_sub, context.account_alias)
+                broker_counts = await self._broker_risk_counts(context)
                 if account.balance <= 0 or account.projected_balance <= 0 or account.available_funds <= 0:
                     reasons.append("account_funds_unavailable")
-                if account.positions_count >= context.risk["maximum_open_positions"]:
+                open_count=broker_counts["open_positions"] if broker_counts else account.positions_count
+                pending_count=broker_counts["pending_entry_orders"] if broker_counts else account.pending_orders_count
+                if open_count >= context.risk["maximum_open_positions"]:
                     reasons.append("maximum_open_positions_reached")
-                if account.pending_orders_count >= context.risk["maximum_pending_orders"]:
+                if pending_count >= context.risk["maximum_pending_orders"]:
                     reasons.append("maximum_pending_orders_reached")
             except (AccountStatusUnavailable,TradeLockerError,TradeLockerMappingError):
                 reasons.append("account_status_unavailable")
@@ -432,7 +467,10 @@ class AutonomousDemoService:
             "confirmed_demo":bool(context and context.demo_classification == "demo"),
             "balance":account.balance if account else None,"equity":account.projected_balance if account else None,
             "available_funds":account.available_funds if account else None,
-            "positions_count":account.positions_count if account else None,"pending_orders_count":account.pending_orders_count if account else None,
+            "positions_count":broker_counts["open_positions"] if broker_counts else account.positions_count if account else None,
+            "pending_orders_count":broker_counts["pending_entry_orders"] if broker_counts else account.pending_orders_count if account else None,
+            "protective_stop_orders":broker_counts["protective_stop_orders"] if broker_counts else None,
+            "protective_take_profit_orders":broker_counts["protective_take_profit_orders"] if broker_counts else None,
             "limits":context.risk if context else None,"allowed_pairs":context.risk["allowed_pairs"] if context else [],
             "ready_for_preview":not reasons,"ready_for_submission":not reasons,
         }
@@ -671,16 +709,25 @@ class AutonomousDemoService:
         high_watermark = self.execution.observe_equity(
             user_sub, context.connection_id, context.account_id, context.acc_num, equity
         )
+        classified = classify_orders(positions, orders)
+        open_positions = count_open_positions(positions)
+        pending_entries = classified["counts"]["pending_entry"]
         risk_state = {
             "daily_realized_pnl": account.today.net, "open_pnl": account.open_net_pnl,
             "daily_loss_remaining": max(0.0, account.balance * context.risk["daily_loss_limit_percent"] / 100 + daily_pnl),
             "maximum_new_trade_risk": account.balance * context.risk["risk_per_trade_percent"] / 100,
             "current_drawdown_percent": max(0.0, (high_watermark - equity) / high_watermark * 100) if high_watermark > 0 else 100.0,
-            "can_open_position": account.positions_count < context.risk["maximum_open_positions"] and account.pending_orders_count < context.risk["maximum_pending_orders"],
+            "open_positions": open_positions, "maximum_open_positions": context.risk["maximum_open_positions"],
+            "pending_entry_orders": pending_entries, "maximum_pending_entry_orders": context.risk["maximum_pending_orders"],
+            "protective_stop_orders": classified["counts"]["protective_stop_loss"],
+            "protective_take_profit_orders": classified["counts"]["protective_take_profit"],
+            "total_open_risk_pct": None,
+            "can_open_position": open_positions < context.risk["maximum_open_positions"] and pending_entries < context.risk["maximum_pending_orders"],
             "blocking_reasons": (["maximum_open_positions_reached"]
-                if account.positions_count >= context.risk["maximum_open_positions"] else [])
+                if open_positions >= context.risk["maximum_open_positions"] else [])
                 + (["maximum_pending_orders_reached"]
-                if account.pending_orders_count >= context.risk["maximum_pending_orders"] else []),
+                if pending_entries >= context.risk["maximum_pending_orders"] else []),
+            "order_classification": classified,
         }
         candle_metadata = [value.get("metadata", {}) for pair_data in market.values()
                            for value in pair_data.get("timeframes", {}).values()]
@@ -775,7 +822,7 @@ class AutonomousDemoService:
             raise AutonomousExecutionError("snapshot_expired", "The snapshot has expired.", status="rejected")
         pair = normalize_pair(proposal.pair)
         violations = []
-        if pair not in context.risk["allowed_pairs"] or pair not in ALLOWED_PAIRS:
+        if pair not in context.risk["allowed_pairs"]:
             violations.append("pair_not_allowed")
         if self.execution.has_active_preview(user_sub, context.account_id, context.acc_num, pair, utcnow().isoformat()):
             violations.append("duplicate_setup")
@@ -937,10 +984,6 @@ class AutonomousDemoService:
                 not providers["fred"]["available"] or providers["fred"]["stale"]
             ):
                 raise AutonomousExecutionError("required_macro_provider_unavailable","Required macro validation failed closed.",status="rejected")
-            if account.positions_count >= context.risk["maximum_open_positions"]:
-                raise AutonomousExecutionError("maximum_open_positions_reached", "The maximum open-position limit was reached.", status="rejected")
-            if account.pending_orders_count >= context.risk["maximum_pending_orders"]:
-                raise AutonomousExecutionError("maximum_pending_orders_reached", "The maximum pending-order limit was reached.", status="rejected")
             day_start=utcnow().replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
             if self.execution.new_entries_since(user_sub,context.account_id,day_start)>=context.risk["maximum_new_entries_per_day"]:
                 raise AutonomousExecutionError("daily_entry_limit","The profile's maximum new entries per day was reached.",status="rejected")
@@ -973,6 +1016,12 @@ class AutonomousDemoService:
                 before_positions, before_orders = await client.get_open_positions(), await client.get_orders()
                 mapped_positions = map_configured_rows(config_response=config, data_response=before_positions, config_key="positionsConfig", data_key="positions")
                 mapped_orders = map_configured_rows(config_response=config, data_response=before_orders, config_key="ordersConfig", data_key="orders")
+                classified = classify_orders(mapped_positions, mapped_orders)
+                open_positions = count_open_positions(mapped_positions)
+                if open_positions >= context.risk["maximum_open_positions"]:
+                    raise AutonomousExecutionError("maximum_open_positions_reached", "The maximum open-position limit was reached.", status="rejected")
+                if classified["counts"]["pending_entry"] >= context.risk["maximum_pending_orders"]:
+                    raise AutonomousExecutionError("maximum_pending_orders_reached", "The maximum pending-entry limit was reached.", status="rejected")
                 if any(str(_find_value(row, ("tradableInstrumentId", "instrumentId"))) == preview["instrument_id"] for row in mapped_positions + mapped_orders):
                     raise AutonomousExecutionError("equivalent_order_exists", "An equivalent position or order already exists.", status="rejected")
                 if autonomous_origin:

@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     autonomous_decision_max_retries: int = 1
     autonomous_decision_max_input_chars: int = 80000
     autonomous_default_minimum_confidence: float = 0.70
+    autonomous_maximum_instruments_screened: int = Field(default=100,ge=1,le=1000)
+    autonomous_maximum_instruments_deeply_analyzed: int = Field(default=5,ge=1,le=50)
+    autonomous_maximum_upstream_requests_per_run: int = Field(default=40,ge=1,le=500)
+    autonomous_maximum_run_duration_seconds: float = Field(default=45,gt=0,le=300)
     autonomous_max_arming_hours: int = 24
     openai_api_key: str | None = Field(default=None, repr=False)
     autonomous_scheduler_poll_seconds: float = Field(default=30,gt=0)

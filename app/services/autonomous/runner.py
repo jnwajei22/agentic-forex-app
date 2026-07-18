@@ -12,9 +12,11 @@ from app.services.autonomous.decision import DecisionAction, DecisionProvider, d
 from app.services.autonomous.execution import AutonomousDemoService, AutonomousExecutionError
 from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository, utcnow
+from app.brokers.tradelocker.client import TradeLockerError
+from app.services.trading_policy import market_is_open, normalize_instrument, resolve_universe
 
 
-FINAL_STATES={"trade","no_trade","blocked","error","skipped"}
+FINAL_STATES={"trade","no_trade","blocked","market_closed","error","skipped"}
 SAFE_PRE_SUBMIT_RETRY_REASONS={"provider_unavailable","market_snapshot_unavailable","broker_unreachable",
     "account_mapping_unavailable","account_status_unavailable","runner_internal_error",
     "tradelocker_rate_limit_exhausted"}
@@ -59,12 +61,26 @@ class AutonomousDecisionRunner:
             if not controls["live_autonomous_enabled"]:reasons.append("live_autonomous_disabled")
             else:reasons.append("live_autonomous_execution_not_implemented")
         else:reasons.append("account_environment_unverified")
-        if now.weekday()>=5:reasons.append("weekend_blocked")
-        allowed=set(profile.get("allowed_sessions") or [])
-        if allowed and not allowed.intersection(self._session(now)):reasons.append("outside_allowed_session")
         readiness=decision_provider_readiness(profile.get("decision_provider"),profile.get("model_identifier"))
         reasons.extend(readiness["blocking_reasons"])
         return list(dict.fromkeys(reasons))
+
+    async def _market_preflight(self,user_sub:str,profile:dict[str,Any],now:datetime)->dict[str,Any]:
+        context=await self.demo.context(user_sub,profile["public_id"],allow_autonomous=True)
+        client=self.demo._client(context.connection,context)
+        try: payload=await client.get_symbols()
+        except TradeLockerError: raise AutonomousExecutionError("market_universe_unavailable","The account market universe is unavailable.",reasons=["market_universe_unavailable"]) from None
+        finally: await client.aclose()
+        instruments=[item for row in client._instrument_rows(payload) if (item:=normalize_instrument(row)) is not None]
+        universe=(profile.get("profile_v2") or {}).get("market_universe") or {"mode":"custom","included_instrument_ids":profile.get("allowed_instruments",[])}
+        selected=resolve_universe(instruments,universe)
+        # During legacy symbol migration, match symbols as well as stable IDs.
+        if universe.get("mode")=="custom" and not selected:
+            wanted={str(value).replace("/","").upper() for value in universe.get("included_instrument_ids",[])}
+            selected=[item for item in instruments if item["broker_symbol"].replace("/","").upper() in wanted]
+        opened=[item for item in selected if market_is_open(item,now)]
+        return {"selected_market_universe":[item["instrument_id"] for item in selected],
+            "markets_currently_open":[item["instrument_id"] for item in opened],"open":bool(opened)}
 
     @staticmethod
     def _value(item:Any,names:set[str])->Any:
@@ -141,6 +157,10 @@ class AutonomousDecisionRunner:
         try:
             reasons=self._blocking_reasons(profile,now,user_sub)
             if reasons:return self._finish(run_id,"skipped",reasons)
+            if isinstance(self.demo,AutonomousDemoService):
+                market=await self._market_preflight(user_sub,profile,now)
+                if not market["open"]:
+                    return self._finish(run_id,"market_closed",["no_selected_market_open"],validation_json=market)
             self.execution.update_decision_run(run_id,state="snapshotting")
             snapshot=await self.demo.snapshot(user_sub,profile_ref,autonomous=True)
             if self._loss_cooldown_active(snapshot,int(profile.get("cooldown_minutes_after_loss") or 60),utcnow()):
@@ -157,7 +177,7 @@ class AutonomousDecisionRunner:
                 return self._finish(run_id,state,decision.reason_codes)
             validation=[]
             if decision.confidence<float(profile.get("minimum_confidence") or settings.autonomous_default_minimum_confidence):validation.append("confidence_below_threshold")
-            if decision.symbol not in profile.get("allowed_instruments",[]):validation.append("pair_not_allowed")
+            if decision.symbol not in snapshot.get("market",{}).get("pairs",{}):validation.append("pair_not_allowed")
             pair_context=context.get("market",{}).get(decision.symbol or "",{})
             if not pair_context.get("complete") or any(not item.get("complete") for item in pair_context.get("timeframes",{}).values()):validation.append("market_data_incomplete")
             if snapshot.get("news_blackouts"):validation.append("news_blackout")
@@ -207,7 +227,7 @@ class AutonomousDecisionRunner:
     def _public_run(record:dict[str,Any],duplicate:bool=False)->dict[str,Any]:
         state=record.get("state","unknown")
         context=record.get("context") or {};decision=record.get("decision") or {};account=context.get("account") or {};risk=context.get("risk_state") or {}
-        outcome="TRADE" if state=="trade" else "NO_TRADE" if state=="no_trade" else "BLOCKED" if state in {"blocked","skipped"} else "ERROR" if state=="error" else "RUNNING"
+        outcome="TRADE" if state=="trade" else "NO_TRADE" if state=="no_trade" else "MARKET_CLOSED" if state=="market_closed" else "SKIPPED" if state=="skipped" else "BLOCKED" if state=="blocked" else "ERROR" if state=="error" else "RUNNING"
         return {"schema_version":"1.0","status":state,"outcome":outcome,"run_id":record.get("id"),"run_key":record.get("run_key"),
             "profile_ref":record.get("profile_ref"),"snapshot_id":record.get("snapshot_id"),"context_hash":record.get("context_hash"),
             "decision":decision,"symbol":decision.get("symbol"),"side":decision.get("side"),

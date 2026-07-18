@@ -13,6 +13,7 @@ from app.services.autonomous.runner import AutonomousDecisionRunner, SAFE_PRE_SU
 from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository
 from app.storage.schedules import ScheduleRepository, ScheduleStorageError, utcnow
+from app.services.trading_policy import classify_market_group
 
 
 logger=logging.getLogger(__name__)
@@ -58,6 +59,27 @@ def next_scheduled_utc(after:datetime,timezone_name:str,local_times:list[str])->
     raise ScheduleStorageError("Unable to calculate the next schedule occurrence.")
 
 
+def _likely_open(profile:dict[str,Any],instant:datetime)->bool:
+    universe=(profile.get("profile_v2") or {}).get("market_universe") or {}
+    groups=set(universe.get("groups") or [])
+    if universe.get("mode")=="custom":
+        groups={classify_market_group(str(value))[0] for value in universe.get("included_instrument_ids",[])
+                if not str(value).isdigit()}
+    if not groups or "crypto" in groups:return True
+    current=instant.astimezone(timezone.utc)
+    if any(group.startswith("forex_") for group in groups):
+        return not (current.weekday()==5 or (current.weekday()==6 and current.hour<22) or (current.weekday()==4 and current.hour>=22))
+    return current.weekday()<5
+
+
+def next_likely_eligible_utc(after:datetime,timezone_name:str,local_times:list[str],profile:dict[str,Any])->datetime:
+    candidate=after
+    for _ in range(14*max(1,len(local_times))):
+        candidate=next_scheduled_utc(candidate,timezone_name,local_times)
+        if _likely_open(profile,candidate):return candidate
+    return candidate
+
+
 class AutonomousScheduleService:
     def __init__(self,*,schedules:ScheduleRepository|None=None,brokers:BrokerRepository|None=None,
                  execution:ExecutionRepository|None=None)->None:
@@ -73,38 +95,38 @@ class AutonomousScheduleService:
 
     def save(self,user_sub:str,profile_ref:str,*,timezone_name:str=DEFAULT_TIMEZONE,
              local_times:list[str]|None=None,enabled:bool=True,maximum_lateness_seconds:int=600)->dict[str,Any]:
-        self._profile(user_sub,profile_ref);times=validate_local_times(local_times or list(DEFAULT_LOCAL_TIMES))
+        profile=self._profile(user_sub,profile_ref);times=validate_local_times(local_times or list(DEFAULT_LOCAL_TIMES))
         if not 30<=maximum_lateness_seconds<=3600:raise ScheduleStorageError("Maximum lateness must be between 30 and 3600 seconds.")
         next_run=next_scheduled_utc(utcnow(),timezone_name,times).isoformat() if enabled else None
         return self._present(self.schedules.upsert_schedule(user_sub,profile_ref,timezone_name=timezone_name,
-            local_times=times,enabled=enabled,next_run_at=next_run,maximum_lateness_seconds=maximum_lateness_seconds))
+            local_times=times,enabled=enabled,next_run_at=next_run,maximum_lateness_seconds=maximum_lateness_seconds),profile)
 
     def set_enabled(self,user_sub:str,schedule_id:str,enabled:bool)->dict[str,Any]:
         schedule=self.schedules.get_schedule(user_sub,schedule_id)
         if not schedule:raise ScheduleStorageError("Autonomous schedule was not found.")
-        self._profile(user_sub,schedule["profile_ref"])
+        profile=self._profile(user_sub,schedule["profile_ref"])
         next_run=next_scheduled_utc(utcnow(),schedule["timezone"],schedule["expression"]["times"]).isoformat() if enabled else None
         self.schedules.set_enabled(user_sub,schedule_id,enabled,next_run)
-        return self._present(self.schedules.get_schedule(user_sub,schedule_id) or {})
+        return self._present(self.schedules.get_schedule(user_sub,schedule_id) or {},profile)
 
     def list(self,user_sub:str)->list[dict[str,Any]]:
         results=[]
         for item in self.schedules.list_schedules(user_sub):
             recent=self.schedules.list_dispatches(user_sub,1,item["profile_ref"])
-            results.append({**self._present(item),"latest_dispatch":recent[0] if recent else None})
+            results.append({**self._present(item,self._profile(user_sub,item["profile_ref"])),"latest_dispatch":recent[0] if recent else None})
         return results
 
     def status(self,user_sub:str,schedule_id:str)->dict[str,Any]:
         schedule=self.schedules.get_schedule(user_sub,schedule_id)
         if not schedule:raise ScheduleStorageError("Autonomous schedule was not found.")
         dispatches=self.schedules.list_dispatches(user_sub,10,schedule["profile_ref"])
-        return {**self._present(schedule),"recent_runs":dispatches}
+        return {**self._present(schedule,self._profile(user_sub,schedule["profile_ref"])),"recent_runs":dispatches}
 
     def daily_summary(self,user_sub:str,day:date|None=None)->dict[str,Any]:
         target=day or utcnow().date();start=datetime.combine(target,time.min,tzinfo=timezone.utc);end=start+timedelta(days=1)
         runs=[item for item in self.execution.recent_decision_runs(user_sub,200)
               if start<=datetime.fromisoformat(item["created_at"])<end]
-        outcomes={"TRADE":0,"NO_TRADE":0,"BLOCKED":0,"ERROR":0}
+        outcomes={"TRADE":0,"NO_TRADE":0,"BLOCKED":0,"MARKET_CLOSED":0,"SKIPPED":0,"ERROR":0}
         details=[]
         for item in runs:
             public=AutonomousDecisionRunner._public_run(item);outcome=public["outcome"]
@@ -122,10 +144,13 @@ class AutonomousScheduleService:
             "autonomous_controls":controls,"armed_profiles":0,"armed_profiles_deprecated":True,"runs":details}
 
     @staticmethod
-    def _present(schedule:dict[str,Any])->dict[str,Any]:
+    def _present(schedule:dict[str,Any],profile:dict[str,Any]|None=None)->dict[str,Any]:
         result={**schedule};zone=ZoneInfo(schedule["timezone"])
         for key in ("next_run_at","last_run_at"):
             result[f"{key}_local"]=datetime.fromisoformat(schedule[key]).astimezone(zone).isoformat() if schedule.get(key) else None
+        result["next_scheduled_check"]=schedule.get("next_run_at")
+        result["next_eligible_trading_run"]=(next_likely_eligible_utc(utcnow(),schedule["timezone"],schedule["expression"]["times"],profile).isoformat()
+            if schedule.get("enabled") and profile else None)
         return result
 
 

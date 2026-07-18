@@ -14,6 +14,7 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.config.settings import settings
+from app.models.execution_profile_v2 import ExecutionProfileV2, deep_merge, migrate_legacy_profile
 
 
 class BrokerStorageError(RuntimeError):
@@ -186,6 +187,8 @@ class BrokerRepository:
             for column,declaration in autonomous_columns.items():
                 if column not in profile_columns:
                     db.execute(f"ALTER TABLE execution_profiles ADD COLUMN {column} {declaration}")
+            if "profile_v2_json" not in profile_columns:
+                db.execute("ALTER TABLE execution_profiles ADD COLUMN profile_v2_json TEXT")
             now = _now()
             db.execute("""INSERT OR IGNORE INTO strategy_templates
                 (public_id,name,version,description,config_json,created_at)
@@ -453,17 +456,62 @@ class BrokerRepository:
             rows=db.execute("""SELECT p.public_id,p.name,p.execution_mode,p.enabled,p.risk_json,p.allowed_instruments_json,
                 p.session_rules_json,p.news_filter_enabled,p.autonomous_armed,p.armed_at,p.armed_until,
                 p.decision_provider,p.model_identifier,p.minimum_confidence,p.allowed_sessions_json,p.schedule_ref,
-                p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,
+                p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,p.profile_v2_json,
                 a.account_alias,a.public_id account_id,a.environment account_environment,a.is_demo,
                 a.available account_available,a.broker_active,a.locally_enabled,
                 t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version,t.config_json strategy_config_json
                 FROM execution_profiles p JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
                 JOIN strategy_templates t ON t.id=p.strategy_template_id WHERE u.auth0_sub=? ORDER BY p.name COLLATE NOCASE""",(auth0_sub,)).fetchall()
-        return [{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),
+        results=[{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),
             "autonomous_armed":bool(r["autonomous_armed"]),"autonomous_shadow_mode":bool(r["autonomous_shadow_mode"]),
             "risk":json.loads(r["risk_json"]),"allowed_instruments":json.loads(r["allowed_instruments_json"]),
             "session_rules":json.loads(r["session_rules_json"]),"allowed_sessions":json.loads(r["allowed_sessions_json"]),
             "strategy_config":json.loads(r["strategy_config_json"])} for r in rows]
+        for item in results:
+            if item.get("profile_v2_json"):
+                item["profile_v2"] = ExecutionProfileV2.model_validate_json(item["profile_v2_json"]).model_dump(mode="json")
+                item["migration_state"] = "native_v2"
+            else:
+                item["profile_v2"] = migrate_legacy_profile(item).model_dump(mode="json")
+                item["migration_state"] = "legacy_projected"
+        return results
+
+    def get_profile(self, auth0_sub: str, profile_ref: str) -> dict[str, Any] | None:
+        return next((item for item in self.list_profiles(auth0_sub) if item["public_id"] == profile_ref), None)
+
+    def update_profile_v2(self, auth0_sub: str, profile_ref: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+        current = self.get_profile(auth0_sub, profile_ref)
+        if current is None:
+            return None
+        normalized = ExecutionProfileV2.model_validate(deep_merge(current["profile_v2"], patch))
+        value = normalized.model_dump(mode="json")
+        risk = value["risk_policy"]
+        # Keep legacy readers operational during the compatibility window.
+        legacy_risk = {**current["risk"], "risk_per_trade_percent": risk["fixed_risk_pct"] if risk["mode"] == "fixed" else risk["base_risk_pct"],
+            "daily_loss_limit_percent": risk["daily_loss_limit_pct"], "drawdown_cutoff_percent": risk["drawdown_cutoff_pct"],
+            "maximum_open_positions": risk["maximum_open_positions"], "maximum_pending_orders": risk["maximum_pending_entry_orders"],
+            "maximum_new_entries_per_day": risk["maximum_new_entries_per_day"],
+            "minimum_reward_risk": value["exit_policy"]["take_profit"]["minimum_reward_to_risk"]}
+        universe = value["market_universe"]
+        legacy_instruments = universe["included_instrument_ids"] if universe["mode"] == "custom" else current["allowed_instruments"]
+        with self._connect() as db:
+            db.execute("""UPDATE execution_profiles SET profile_v2_json=?,risk_json=?,allowed_instruments_json=?,
+                minimum_confidence=?,enabled=?,updated_at=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",
+                (json.dumps(value), json.dumps(legacy_risk), json.dumps(legacy_instruments),
+                 value["trading_policy"]["minimum_confidence"], value["enabled"], _now(), profile_ref, auth0_sub))
+        return self.get_profile(auth0_sub, profile_ref)
+
+    def account_connection_context(self, auth0_sub: str, account_alias: str) -> dict[str, Any] | None:
+        row = self.get_account_record(auth0_sub, alias=account_alias)
+        if row is None:
+            return None
+        try:
+            password = self._fernet().decrypt(row["password_encrypted"]).decode()
+        except InvalidToken as exc:
+            raise BrokerStorageError("Stored broker credentials cannot be decrypted.") from exc
+        return {"base_url": row["base_url"], "username": row["username"], "password": password,
+            "server": row["server"], "account_id": str(row["broker_account_id"]), "account_number": str(row["acc_num"]),
+            "account_alias": row["account_alias"], "environment": row["environment"], "account_ref": row["public_id"]}
 
     def arm_autonomous_profile(self, auth0_sub: str, profile_ref: str, *, armed_until: str,
                                decision_provider: str="no_trade", model_identifier: str|None=None,
