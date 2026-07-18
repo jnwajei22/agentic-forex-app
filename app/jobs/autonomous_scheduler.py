@@ -19,6 +19,8 @@ from app.services.trading_policy import classify_market_group
 logger=logging.getLogger(__name__)
 DEFAULT_TIMEZONE="America/Chicago"
 DEFAULT_LOCAL_TIMES=("05:00","07:00","09:00","11:00","13:15")
+WEEKDAYS=("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
+MARKET_SESSION_TIMES={"asia":["19:00"],"london":["03:00"],"new_york":["08:00"],"overlap":["08:00"]}
 
 
 async def dispatch_autonomous_cycle(runner:AutonomousDecisionRunner,user_sub:str,profile_ref:str,
@@ -38,6 +40,38 @@ def validate_local_times(values:list[str])->list[str]:
     return result
 
 
+def normalize_recurrence(value:dict[str,Any]|None,legacy_times:list[str]|None=None)->dict[str,Any]:
+    raw=dict(value or {});kind=str(raw.get("type") or "daily")
+    if kind not in {"market_session","recurring_interval","daily","weekly","custom"}:
+        raise ScheduleStorageError("Schedule type is not supported.")
+    days=[str(day).lower() for day in raw.get("days",[]) if str(day).lower() in WEEKDAYS]
+    if kind in {"weekly","custom"} and not days:raise ScheduleStorageError("Weekly and custom schedules require at least one day.")
+    if kind=="market_session":
+        sessions=[str(item).lower() for item in raw.get("sessions",["london"])]
+        unknown=[item for item in sessions if item not in MARKET_SESSION_TIMES]
+        if unknown:raise ScheduleStorageError("A market session is not supported.")
+        times=validate_local_times([time for session in sessions for time in MARKET_SESSION_TIMES[session]])
+        return {"type":kind,"sessions":sessions,"days":days or list(WEEKDAYS[:5]),"times":times}
+    if kind=="recurring_interval":
+        start=str(raw.get("start_time") or "08:00");end=str(raw.get("end_time") or "17:00")
+        validate_local_times([start,end]);minutes=int(raw.get("interval_minutes") or 60)
+        if minutes<15 or minutes>1440:raise ScheduleStorageError("Interval must be between 15 and 1440 minutes.")
+        first=datetime.strptime(start,"%H:%M");last=datetime.strptime(end,"%H:%M")
+        if last<first:raise ScheduleStorageError("The interval end time must be after its start time.")
+        times=[];current=first
+        while current<=last and len(times)<96:
+            times.append(current.strftime("%H:%M"));current+=timedelta(minutes=minutes)
+        return {"type":kind,"start_time":start,"end_time":end,"interval_minutes":minutes,
+                "days":days or list(WEEKDAYS[:5]),"times":times}
+    times=validate_local_times(list(raw.get("times") or legacy_times or DEFAULT_LOCAL_TIMES))
+    return {"type":kind,"times":times,"days":days or (list(WEEKDAYS) if kind=="daily" else list(WEEKDAYS[:5]))}
+
+
+def _recurrence(schedule:dict[str,Any])->dict[str,Any]:
+    expression=schedule.get("expression") or {}
+    return normalize_recurrence(expression.get("recurrence"),expression.get("times"))
+
+
 def _valid_instants(day:date,local_time:str,zone:ZoneInfo)->list[datetime]:
     parsed=time.fromisoformat(local_time);naive=datetime.combine(day,parsed);results=[]
     for fold in (0,1):
@@ -54,6 +88,20 @@ def next_scheduled_utc(after:datetime,timezone_name:str,local_times:list[str])->
     for offset in range(0,9):
         day=local_after.date()+timedelta(days=offset)
         candidates=[instant for item in times for instant in _valid_instants(day,item,zone)]
+        future=[candidate for candidate in sorted(candidates) if candidate>after.astimezone(timezone.utc)]
+        if future:return future[0]
+    raise ScheduleStorageError("Unable to calculate the next schedule occurrence.")
+
+
+def next_recurrence_utc(after:datetime,timezone_name:str,recurrence:dict[str,Any])->datetime:
+    normalized=normalize_recurrence(recurrence)
+    try:zone=ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:raise ScheduleStorageError("The schedule timezone is not a valid IANA timezone.") from None
+    local_after=after.astimezone(zone);allowed=set(normalized["days"])
+    for offset in range(15):
+        day=local_after.date()+timedelta(days=offset)
+        if WEEKDAYS[day.weekday()] not in allowed:continue
+        candidates=[instant for item in normalized["times"] for instant in _valid_instants(day,item,zone)]
         future=[candidate for candidate in sorted(candidates) if candidate>after.astimezone(timezone.utc)]
         if future:return future[0]
     raise ScheduleStorageError("Unable to calculate the next schedule occurrence.")
@@ -94,18 +142,21 @@ class AutonomousScheduleService:
         return profile
 
     def save(self,user_sub:str,profile_ref:str,*,timezone_name:str=DEFAULT_TIMEZONE,
-             local_times:list[str]|None=None,enabled:bool=True,maximum_lateness_seconds:int=600)->dict[str,Any]:
-        profile=self._profile(user_sub,profile_ref);times=validate_local_times(local_times or list(DEFAULT_LOCAL_TIMES))
+             local_times:list[str]|None=None,recurrence:dict[str,Any]|None=None,enabled:bool=True,
+             maximum_lateness_seconds:int=600)->dict[str,Any]:
+        profile=self._profile(user_sub,profile_ref);rule=normalize_recurrence(recurrence,local_times)
+        times=rule["times"]
         if not 30<=maximum_lateness_seconds<=3600:raise ScheduleStorageError("Maximum lateness must be between 30 and 3600 seconds.")
-        next_run=next_scheduled_utc(utcnow(),timezone_name,times).isoformat() if enabled else None
+        next_run=next_recurrence_utc(utcnow(),timezone_name,rule).isoformat() if enabled else None
         return self._present(self.schedules.upsert_schedule(user_sub,profile_ref,timezone_name=timezone_name,
-            local_times=times,enabled=enabled,next_run_at=next_run,maximum_lateness_seconds=maximum_lateness_seconds),profile)
+            local_times=times,recurrence=rule,enabled=enabled,next_run_at=next_run,
+            maximum_lateness_seconds=maximum_lateness_seconds),profile)
 
     def set_enabled(self,user_sub:str,schedule_id:str,enabled:bool)->dict[str,Any]:
         schedule=self.schedules.get_schedule(user_sub,schedule_id)
         if not schedule:raise ScheduleStorageError("Autonomous schedule was not found.")
         profile=self._profile(user_sub,schedule["profile_ref"])
-        next_run=next_scheduled_utc(utcnow(),schedule["timezone"],schedule["expression"]["times"]).isoformat() if enabled else None
+        next_run=next_recurrence_utc(utcnow(),schedule["timezone"],_recurrence(schedule)).isoformat() if enabled else None
         self.schedules.set_enabled(user_sub,schedule_id,enabled,next_run)
         return self._present(self.schedules.get_schedule(user_sub,schedule_id) or {},profile)
 
@@ -146,10 +197,15 @@ class AutonomousScheduleService:
     @staticmethod
     def _present(schedule:dict[str,Any],profile:dict[str,Any]|None=None)->dict[str,Any]:
         result={**schedule};zone=ZoneInfo(schedule["timezone"])
+        recurrence=_recurrence(schedule);result["schedule_type"]=recurrence["type"];result["recurrence"]=recurrence
         for key in ("next_run_at","last_run_at"):
             result[f"{key}_local"]=datetime.fromisoformat(schedule[key]).astimezone(zone).isoformat() if schedule.get(key) else None
         result["next_scheduled_check"]=schedule.get("next_run_at")
-        result["next_eligible_trading_run"]=(next_likely_eligible_utc(utcnow(),schedule["timezone"],schedule["expression"]["times"],profile).isoformat()
+        previews=[];cursor=utcnow()
+        if schedule.get("enabled"):
+            for _ in range(5):cursor=next_recurrence_utc(cursor,schedule["timezone"],recurrence);previews.append(cursor.isoformat())
+        result["next_run_times"]=previews
+        result["next_eligible_trading_run"]=(next_likely_eligible_utc(utcnow(),schedule["timezone"],recurrence["times"],profile).isoformat()
             if schedule.get("enabled") and profile else None)
         return result
 
@@ -162,7 +218,7 @@ class AutonomousSchedulerWorker:
 
     @staticmethod
     def _next(schedule:dict[str,Any],after:datetime)->datetime:
-        return next_scheduled_utc(after,schedule["timezone"],schedule["expression"]["times"])
+        return next_recurrence_utc(after,schedule["timezone"],_recurrence(schedule))
 
     async def run_once(self,now:datetime|None=None)->dict[str,int]:
         current=now or utcnow();self.schedules.heartbeat(self.worker_id,"running",{"phase":"poll"})

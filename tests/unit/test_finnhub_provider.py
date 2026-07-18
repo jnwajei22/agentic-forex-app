@@ -78,6 +78,19 @@ async def test_news_is_bounded_and_concise(monkeypatch):
     client = finnhub.FinnhubClient(httpx.MockTransport(lambda request: httpx.Response(200, json=rows)))
     items = await client.market_news("forex", 2)
     assert len(items) == 2 and len(items[0].summary) == 500
+
+
+@pytest.mark.asyncio
+async def test_search_and_quote_are_normalized(monkeypatch):
+    monkeypatch.setattr(settings,"finnhub_enabled",True);monkeypatch.setattr(settings,"finnhub_api_key","key")
+    def handler(request):
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200,json={"result":[{"symbol":"AAPL","displaySymbol":"AAPL","description":"Apple","type":"Common Stock"}]})
+        return httpx.Response(200,json={"c":200,"dp":1.5,"t":1784000000})
+    client=finnhub.FinnhubClient(httpx.MockTransport(handler))
+    assert (await client.symbol_search("apple"))[0]["source"]=="Finnhub"
+    assert (await client.quote("AAPL"))["price"]==200
+    await client.aclose()
     await client.aclose()
 
 

@@ -5,7 +5,7 @@ import uuid
 
 import anyio
 import jwt
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
@@ -28,6 +28,7 @@ from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
 from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
+from app.services.market_workspace import MarketWorkspaceService
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -122,7 +123,8 @@ class AutonomousArmRequest(BaseModel):
 class AutonomousScheduleRequest(BaseModel):
     model_config=ConfigDict(extra="forbid")
     timezone: str = Field(default="America/Chicago",min_length=1,max_length=80)
-    local_times: list[str] = Field(default_factory=lambda:["05:00","07:00","09:00","11:00","13:15"],min_length=1,max_length=24)
+    local_times: list[str] | None = Field(default=None,min_length=1,max_length=24)
+    recurrence: dict[str,Any] | None = None
     enabled: bool = True
     maximum_lateness_seconds: int = Field(default=600,ge=30,le=3600)
 
@@ -177,6 +179,8 @@ def _profile_contract(profile: dict[str, Any], instruments: list[dict[str, Any]]
     warnings = ([{"code":"legacy_profile_projected","message":"This legacy profile is projected into V2 and will be persisted on its next PATCH."}]
         if migration != "native_v2" else [])
     return {"profile_id":profile["public_id"], "account_id":profile["account_id"], "account_alias":profile["account_alias"],
+        "account_number":profile.get("account_number"),"broker_name":profile.get("broker_name"),
+        "account_environment":profile.get("account_environment"),"nickname":profile.get("nickname"),
         "profile":profile["profile_v2"], "supported_enum_options":_capabilities(profile, instruments),
         "server_defaults":ExecutionProfileV2().model_dump(mode="json"),
         "field_validation_ranges":{"minimum_confidence":{"minimum":0,"maximum":1},"risk_pct_per_trade":{"exclusive_minimum":0,"maximum":1},
@@ -205,6 +209,60 @@ async def _account_instruments(user_sub: str, account_alias: str) -> tuple[dict[
 async def me(claims: dict = Depends(current_claims)) -> dict:
     repository().ensure_user(claims["sub"], claims.get("email"))
     return {"sub": claims["sub"], "email": claims.get("email")}
+
+
+async def _market_response(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    service=MarketWorkspaceService()
+    try:return await getattr(service,method)(*args,**kwargs)
+    finally:await service.aclose()
+
+
+@router.get("/markets/search")
+async def market_search(q:str=Query(min_length=1,max_length=80),limit:int=Query(25,ge=1,le=50),
+                        claims:dict=Depends(current_claims))->dict:
+    return await _market_response("search",q,limit)
+
+
+@router.get("/markets/overview")
+async def market_overview(symbols:str|None=None,claims:dict=Depends(current_claims))->dict:
+    values=[value.strip() for value in (symbols or "").split(",") if value.strip()]
+    return await _market_response("overview",values or None)
+
+
+@router.get("/markets/news")
+async def market_news(category:str="general",limit:int=Query(20,ge=1,le=50),
+                      claims:dict=Depends(current_claims))->dict:
+    return await _market_response("news",category,limit)
+
+
+@router.get("/markets/calendar")
+async def market_calendar(start:date|None=None,end:date|None=None,limit:int=Query(50,ge=1,le=100),
+                          claims:dict=Depends(current_claims))->dict:
+    first=start or date.today();last=end or first+timedelta(days=14)
+    if last<first or (last-first).days>93:raise HTTPException(status_code=422,detail="Calendar range must be 0 to 93 days.")
+    return await _market_response("calendar",first,last,limit)
+
+
+@router.get("/markets/macro")
+async def market_macro(claims:dict=Depends(current_claims))->dict:
+    return await _market_response("macro")
+
+
+@router.get("/markets/{symbol}")
+async def market_symbol(symbol:str,claims:dict=Depends(current_claims))->dict:
+    return await _market_response("symbol",symbol)
+
+
+@router.get("/accounts/{account_alias}/tradability/{symbol}")
+async def account_tradability(account_alias:str,symbol:str,claims:dict=Depends(current_claims))->dict:
+    context,instruments=await _account_instruments(claims["sub"],account_alias)
+    requested=symbol.casefold()
+    match=next((item for item in instruments if requested in {
+        str(item.get("symbol","")).casefold(),str(item.get("broker_symbol","")).casefold(),
+        str(item.get("id","")).casefold(),str(item.get("instrument_id","")).casefold()}),None)
+    return {"account_alias":account_alias,"symbol":symbol,"available":match is not None,
+            "currently_tradable":bool(match and match.get("tradeable",match.get("tradable",True))),
+            "instrument":match,"environment":context.get("environment"),"source":"TradeLocker"}
 
 
 @router.get("/broker/status")
@@ -614,7 +672,8 @@ async def patch_autonomous_controls(payload:AutonomousControlsUpdate,claims:dict
 
 @router.get("/autonomous-controls/audit")
 async def autonomous_control_audit(claims:dict=Depends(current_claims))->dict:
-    return {"events":ExecutionRepository().autonomous_control_audit(claims["sub"])}
+    events=ExecutionRepository().autonomous_control_audit(claims["sub"])
+    return {"events":[{**event,"occurred_at":event.get("changed_at")} for event in events]}
 
 
 @router.get("/execution-profiles/{profile_id}/autonomy/status")
@@ -637,7 +696,8 @@ async def list_autonomous_schedules_api(claims:dict=Depends(current_claims))->di
 @router.post("/execution-profiles/{profile_id}/autonomy/schedule")
 async def save_autonomous_schedule(profile_id:str,payload:AutonomousScheduleRequest,claims:dict=Depends(current_claims))->dict:
     try:return AutonomousScheduleService().save(claims["sub"],profile_id,timezone_name=payload.timezone,
-        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+        local_times=payload.local_times,recurrence=payload.recurrence,enabled=payload.enabled,
+        maximum_lateness_seconds=payload.maximum_lateness_seconds)
     except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
 
 
@@ -646,7 +706,8 @@ async def edit_autonomous_schedule(schedule_id:str,payload:AutonomousScheduleReq
     repo=ScheduleRepository();existing=repo.get_schedule(claims["sub"],schedule_id)
     if not existing:raise HTTPException(status_code=404,detail="Schedule not found.")
     try:return AutonomousScheduleService(schedules=repo).save(claims["sub"],existing["profile_ref"],timezone_name=payload.timezone,
-        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+        local_times=payload.local_times,recurrence=payload.recurrence,enabled=payload.enabled,
+        maximum_lateness_seconds=payload.maximum_lateness_seconds)
     except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
 
 

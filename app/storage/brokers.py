@@ -111,6 +111,7 @@ class BrokerRepository:
                     broker_account_id TEXT NOT NULL,
                     acc_num TEXT NOT NULL,
                     account_alias TEXT NOT NULL COLLATE NOCASE,
+                    nickname TEXT,
                     account_name TEXT,
                     currency TEXT,
                     environment TEXT NOT NULL CHECK(environment IN ('demo','live','unknown')),
@@ -149,6 +150,9 @@ class BrokerRepository:
                     FOREIGN KEY(broker_account_id) REFERENCES broker_accounts(id) ON DELETE RESTRICT,
                     FOREIGN KEY(strategy_template_id) REFERENCES strategy_templates(id) ON DELETE RESTRICT);
             """)
+            account_columns={row["name"] for row in db.execute("PRAGMA table_info(broker_accounts)")}
+            if "nickname" not in account_columns:
+                db.execute("ALTER TABLE broker_accounts ADD COLUMN nickname TEXT")
             profile_sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_profiles'").fetchone()
             if profile_sql and "demo_enabled" in (profile_sql["sql"] or ""):
                 db.execute("PRAGMA foreign_keys=OFF")
@@ -316,7 +320,9 @@ class BrokerRepository:
                 MAX(a.is_default_analysis) is_default
                 FROM broker_connections b JOIN users u ON u.id=b.user_id LEFT JOIN broker_accounts a ON a.connection_id=b.id
                 WHERE u.auth0_sub=? GROUP BY b.id ORDER BY b.id""", (auth0_sub,)).fetchall()
-        return [{**dict(r), "connection_id": r["public_id"], "enabled": r["status"] == "active", "is_default":bool(r["is_default"])} for r in rows]
+        return [{**dict(r), "connection_id": r["public_id"], "broker_name": r["server"],
+                 "platform_name": "TradeLocker", "enabled": r["status"] == "active",
+                 "is_default":bool(r["is_default"])} for r in rows]
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -362,14 +368,17 @@ class BrokerRepository:
 
     def list_accounts(self, auth0_sub: str) -> list[dict[str, Any]]:
         with self._connect() as db:
-            rows=db.execute("""SELECT a.public_id,a.account_alias,a.account_name,a.currency,a.environment,a.is_demo,a.broker_active,
+            rows=db.execute("""SELECT a.public_id,a.acc_num account_number,a.account_alias,a.nickname,a.account_name,a.currency,a.environment,a.is_demo,a.broker_active,
                 a.locally_enabled,a.available,a.is_default_analysis,a.last_verified_at,a.unavailable_since,b.public_id connection_id,b.label connection_label,b.server,b.broker_name
                 FROM broker_accounts a JOIN users u ON u.id=a.user_id JOIN broker_connections b ON b.id=a.connection_id
                 WHERE u.auth0_sub=? ORDER BY a.is_default_analysis DESC,a.account_alias COLLATE NOCASE""",(auth0_sub,)).fetchall()
         profiles=self.list_profiles(auth0_sub)
         result=[]
         for r in rows:
-            item={**dict(r),"account_id":r["public_id"],"broker_active":bool(r["broker_active"]),"locally_enabled":bool(r["locally_enabled"]),"available":bool(r["available"]),"is_default_analysis":bool(r["is_default_analysis"])}
+            item={**dict(r),"account_id":r["public_id"],"broker_name":r["server"],
+                  "platform_name":"TradeLocker","broker_active":bool(r["broker_active"]),
+                  "locally_enabled":bool(r["locally_enabled"]),"available":bool(r["available"]),
+                  "is_default_analysis":bool(r["is_default_analysis"])}
             item["profiles"]=[p for p in profiles if p["account_id"] == r["public_id"]]
             result.append(item)
         return result
@@ -396,9 +405,9 @@ class BrokerRepository:
                 WHERE u.auth0_sub=? AND {condition} LIMIT 1""",params).fetchone()
 
     def rename_account(self, auth0_sub: str, account_ref: str, alias: str) -> bool:
-        alias=self._slug(alias)
+        nickname=alias.strip();alias=self._slug(nickname)
         with self._connect() as db:
-            try: cur=db.execute("""UPDATE broker_accounts SET account_alias=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",(alias,account_ref,auth0_sub))
+            try: cur=db.execute("""UPDATE broker_accounts SET account_alias=?,nickname=? WHERE public_id=? AND user_id=(SELECT id FROM users WHERE auth0_sub=?)""",(alias,nickname,account_ref,auth0_sub))
             except sqlite3.IntegrityError: raise BrokerStorageError("That account alias is already in use.") from None
             return cur.rowcount==1
 
@@ -456,10 +465,12 @@ class BrokerRepository:
                 p.session_rules_json,p.news_filter_enabled,p.autonomous_armed,p.armed_at,p.armed_until,
                 p.decision_provider,p.model_identifier,p.minimum_confidence,p.allowed_sessions_json,p.schedule_ref,
                 p.autonomous_shadow_mode,p.cooldown_minutes_after_loss,p.profile_v2_json,
-                a.account_alias,a.public_id account_id,a.environment account_environment,a.is_demo,
+                a.account_alias,a.acc_num account_number,a.nickname,a.public_id account_id,a.environment account_environment,a.is_demo,
+                b.server broker_name,
                 a.available account_available,a.broker_active,a.locally_enabled,
                 t.public_id strategy_template_id,t.name strategy_name,t.version strategy_version,t.config_json strategy_config_json
                 FROM execution_profiles p JOIN users u ON u.id=p.user_id JOIN broker_accounts a ON a.id=p.broker_account_id
+                JOIN broker_connections b ON b.id=a.connection_id
                 JOIN strategy_templates t ON t.id=p.strategy_template_id WHERE u.auth0_sub=? ORDER BY p.name COLLATE NOCASE""",(auth0_sub,)).fetchall()
         results=[{**dict(r),"profile_id":r["public_id"],"enabled":bool(r["enabled"]),"news_filter_enabled":bool(r["news_filter_enabled"]),
             "autonomous_armed":bool(r["autonomous_armed"]),"autonomous_shadow_mode":bool(r["autonomous_shadow_mode"]),

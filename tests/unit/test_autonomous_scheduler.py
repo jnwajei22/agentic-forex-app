@@ -10,7 +10,24 @@ from app.jobs.autonomous_scheduler import (
     AutonomousScheduleService,
     AutonomousSchedulerWorker,
     next_scheduled_utc,
+    next_recurrence_utc,
+    normalize_recurrence,
 )
+
+
+def test_structured_recurrence_supports_all_builder_types():
+    after=datetime(2026,7,20,12,tzinfo=timezone.utc)
+    values=[
+        {"type":"daily","times":["09:00"]},
+        {"type":"weekly","days":["monday"],"times":["09:00"]},
+        {"type":"custom","days":["monday","wednesday"],"times":["10:00"]},
+        {"type":"market_session","sessions":["london"]},
+        {"type":"recurring_interval","start_time":"08:00","end_time":"10:00","interval_minutes":60},
+    ]
+    for value in values:
+        normalized=normalize_recurrence(value)
+        assert normalized["type"]==value["type"]
+        assert next_recurrence_utc(after,"America/Chicago",normalized)>after
 from app.services.autonomous.runner import AutonomousDecisionRunner
 from app.storage.brokers import BrokerRepository
 from app.storage.execution import ExecutionRepository

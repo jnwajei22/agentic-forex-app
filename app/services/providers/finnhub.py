@@ -135,9 +135,31 @@ class FinnhubClient:
             **{"from": start_seconds, "to": end_seconds},
         )
 
+    async def symbol_search(self, query: str, limit: int = 25) -> list[dict[str, Any]]:
+        payload = await self._get("/search", "symbol_search", q=query)
+        rows = payload.get("result", []) if isinstance(payload, dict) else []
+        return [{
+            "symbol": str(row.get("symbol", "")),
+            "display_symbol": str(row.get("displaySymbol") or row.get("symbol") or ""),
+            "description": str(row.get("description") or ""),
+            "type": str(row.get("type") or "unknown").lower(),
+            "source": "Finnhub",
+        } for row in rows[:limit] if isinstance(row, dict) and row.get("symbol")]
+
+    async def quote(self, symbol: str) -> dict[str, Any]:
+        row = await self._get("/quote", "quote", symbol=symbol)
+        if not isinstance(row, dict):
+            row = {}
+        return {
+            "symbol": symbol, "price": row.get("c"), "change": row.get("d"),
+            "change_percent": row.get("dp"), "high": row.get("h"), "low": row.get("l"),
+            "open": row.get("o"), "previous_close": row.get("pc"), "timestamp": row.get("t"),
+            "source": "Finnhub",
+        }
+
 
 def capability_status() -> dict[str, bool]:
     return {
         name: _capabilities.get(name) is None
-        for name in ("economic_calendar", "market_news", "forex_candles")
+        for name in ("economic_calendar", "market_news", "forex_candles", "symbol_search", "quote")
     }

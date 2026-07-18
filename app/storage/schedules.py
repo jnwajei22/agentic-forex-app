@@ -69,8 +69,12 @@ class ScheduleRepository:
         return result
 
     def upsert_schedule(self,user_sub:str,profile_ref:str,*,timezone_name:str,local_times:list[str],enabled:bool,
-                        next_run_at:str|None,maximum_lateness_seconds:int=600)->dict[str,Any]:
-        now=utcnow().isoformat();expression=json.dumps({"times":local_times},separators=(",",":"))
+                        next_run_at:str|None,maximum_lateness_seconds:int=600,
+                        recurrence:dict[str,Any]|None=None)->dict[str,Any]:
+        payload=recurrence or {"type":"daily","times":local_times}
+        # Keep times at the top level for legacy workers/readers during the compatibility window.
+        expression=json.dumps({"times":local_times,"recurrence":payload},separators=(",",":"))
+        now=utcnow().isoformat()
         with self._connect() as db:
             existing=db.execute("SELECT id,created_at FROM autonomous_schedules WHERE user_sub=? AND profile_ref=?",(user_sub,profile_ref)).fetchone()
             schedule_id=existing["id"] if existing else f"schedule_{uuid4().hex}"
