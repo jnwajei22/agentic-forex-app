@@ -50,6 +50,49 @@ def _client_for(subject: str) -> TestClient:
     return TestClient(app)
 
 
+def test_order_calculation_is_owned_read_only_and_never_submits(platform_storage,monkeypatch):
+    user="auth0|calculator";connection=platform_storage.save_connection(user,base_url="https://demo.example/backend-api",
+        username="user",password="password",server="HeroFX",environment="demo")
+    platform_storage.sync_accounts(user,connection.connection_ref,
+        {"accounts":[{"accountId":"external-1","accNum":"123","currency":"USD"}]})
+    account=platform_storage.list_accounts(user)[0]
+    class Client:
+        submitted=False
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def get_symbols(self):return [{"tradableInstrumentId":"1","symbol":"GBPUSD","assetClass":"forex",
+            "tickSize":.00001,"contractSize":100000,"minQty":.01,"qtyStep":.01,"marginRate":.02}]
+        async def get_quote(self,symbol):return {"d":{"bp":1.3452,"ap":1.34528}}
+        async def get_account_state_payload(self):return {"d":{"balance":100000}}
+        async def submit_order(self,*args,**kwargs):Client.submitted=True;raise AssertionError("calculation cannot submit")
+        _instrument_rows=staticmethod(lambda payload:payload)
+    monkeypatch.setattr(platform,"TradeLockerClient",Client)
+    request={"account_id":account["public_id"],"instrument_id":"forex:GBP/USD","side":"buy","order_type":"market",
+        "quantity":{"value":.5,"unit":"lot"},"stop_loss":{"mode":"pips","value":40},
+        "take_profit":{"mode":"reward_multiple","value":2}}
+    with _client_for(user) as client:
+        response=client.post("/api/trading/order-calculations",json=request)
+    assert response.status_code==200
+    result=response.json();assert result["entry_side"]=="Ask" and result["pip_value"]["value"]==5
+    assert result["stop_loss"]["distance_pips"]==40 and result["take_profit"]["reward_to_risk"]==2
+    assert Client.submitted is False and "preview_id" not in result
+
+    with _client_for("auth0|other-user") as client:
+        forbidden=client.post("/api/trading/order-calculations",json=request)
+    assert forbidden.status_code==404
+
+
+def test_order_calculation_rejects_unknown_account_without_broker_access(platform_storage,monkeypatch):
+    class ForbiddenClient:
+        def __init__(self,**kwargs):raise AssertionError("broker must not be called")
+    monkeypatch.setattr(platform,"TradeLockerClient",ForbiddenClient)
+    with _client_for("auth0|nobody") as client:
+        response=client.post("/api/trading/order-calculations",json={"account_id":"unknown","instrument_id":"forex:EUR/USD",
+            "side":"sell","quantity":{"value":1,"unit":"lot"}})
+    assert response.status_code==404
+
+
 def test_generic_provider_routes_project_legacy_tradelocker_records(platform_storage):
     connection = platform_storage.save_connection("auth0|generic", base_url="https://demo.example/backend-api",
         username="user", password="password", server="HeroFX", environment="demo")

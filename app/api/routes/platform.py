@@ -31,6 +31,7 @@ from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
 from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
 from app.services.market_workspace import MarketWorkspaceService
+from app.services.trading.order_calculations import calculate_order, forex_terms
 from app.providers.registry import provider_registry
 from app.services.instruments import InstrumentMappingError, instrument_mapper
 
@@ -59,6 +60,26 @@ class AccountSelection(BaseModel):
         validation_alias=AliasChoices("account_number", "accountNumber", "accNum")
     )
     connection_id: str | None = Field(default=None, validation_alias=AliasChoices("connection_id", "connectionId"))
+
+
+class CalculationValue(BaseModel):
+    mode: Literal["price", "pips", "reward_multiple", "rr"]
+    value: float = Field(gt=0)
+
+
+class CalculationQuantity(BaseModel):
+    value: float = Field(gt=0)
+    unit: Literal["lot", "share", "contract", "fractional_share"] = "lot"
+
+
+class OrderCalculationRequest(BaseModel):
+    account_id: str
+    instrument_id: str
+    side: Literal["buy", "sell"]
+    order_type: Literal["market", "limit", "stop"] = "market"
+    quantity: CalculationQuantity
+    stop_loss: CalculationValue | None = None
+    take_profit: CalculationValue | None = None
 
 
 class AccountAliasUpdate(BaseModel):
@@ -440,6 +461,69 @@ async def _execution_market_context(user_sub:str,account_alias:str,canonical_id:
         return ({"price":price,"bid":bid,"ask":ask,"timestamp":datetime.now(timezone.utc).isoformat(),
                  "source":"TradeLocker"} if price is not None else None),tradability
     except (TradeLockerError,HTTPException):return None,tradability
+
+
+@router.post("/trading/order-calculations")
+async def trading_order_calculations(payload:OrderCalculationRequest,claims:dict=Depends(current_claims))->dict:
+    """Read-only broker-authoritative ticket calculation; never creates a preview or submits an order."""
+    repo=repository();owned=next((item for item in repo.list_accounts(claims["sub"])
+        if item["public_id"]==payload.account_id or item["account_alias"].casefold()==payload.account_id.casefold()),None)
+    if not owned:raise HTTPException(status_code=404,detail="Trading account not found.")
+    context=repo.account_connection_context(claims["sub"],owned["account_alias"])
+    if not context:raise HTTPException(status_code=404,detail="Trading account not found.")
+    try:canonical=instrument_mapper.resolve(payload.instrument_id)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+    if canonical.asset_class!="forex":raise HTTPException(status_code=409,detail="Order calculations are currently supported for provider-identified forex instruments.")
+    requested=canonical.symbol.replace("/","").casefold()
+    try:
+        async with TradeLockerClient(base_url=context["base_url"],username=context["username"],password=context["password"],
+            server=context["server"],account_id=context["account_id"],account_number=context["account_number"]) as client:
+            symbols=await client.get_symbols();rows=TradeLockerClient._instrument_rows(symbols)
+            raw=next((row for row in rows if str(row.get("symbol") or row.get("name") or "").replace("/","").replace("_","").casefold()==requested),None)
+            if raw is None:raise HTTPException(status_code=409,detail="The selected account does not expose this instrument.")
+            normalized=normalize_instrument(raw)
+            if normalized is None:raise HTTPException(status_code=409,detail="Provider instrument metadata is unavailable.")
+            quote_raw=await client.get_quote(str(normalized["broker_symbol"]));bid=_quote_number(quote_raw,{"bid","bidprice","bp"});ask=_quote_number(quote_raw,{"ask","askprice","ap"})
+            quote_epoch=_quote_number(quote_raw,{"timestamp","time","updatedat","lastupdatetime"})
+            if quote_epoch and quote_epoch>10_000_000_000:quote_epoch/=1000
+            quote_timestamp=datetime.fromtimestamp(quote_epoch,timezone.utc) if quote_epoch else datetime.now(timezone.utc)
+            state=await client.get_account_state_payload()
+            equity=_quote_number(state,{"projectedbalance","equity","balance"})
+            account_currency=str(owned.get("currency") or "").upper() or None
+            quote_currency=str(normalized.get("quote_currency") or canonical.symbol[-3:]).upper()
+            rate=1.0 if account_currency==quote_currency else None
+            entry=ask if payload.side=="buy" else bid
+            base=canonical.symbol[:3].upper()
+            if rate is None and account_currency==base and entry:rate=1/entry
+            if rate is None and account_currency:
+                try:
+                    conversion=await client.get_quote(f"{quote_currency}{account_currency}")
+                    conversion_bid=_quote_number(conversion,{"bid","bidprice","bp"});conversion_ask=_quote_number(conversion,{"ask","askprice","ap"})
+                    if conversion_bid and conversion_ask:rate=(conversion_bid+conversion_ask)/2
+                except TradeLockerError:
+                    try:
+                        conversion=await client.get_quote(f"{account_currency}{quote_currency}")
+                        conversion_bid=_quote_number(conversion,{"bid","bidprice","bp"});conversion_ask=_quote_number(conversion,{"ask","askprice","ap"})
+                        if conversion_bid and conversion_ask:rate=2/(conversion_bid+conversion_ask)
+                    except TradeLockerError:pass
+    except HTTPException:raise
+    except TradeLockerError as exc:raise HTTPException(status_code=502,detail={"error":exc.code,"message":"Authoritative broker calculation data is unavailable."}) from None
+    metadata={"pip_size":_quote_number(raw,{"pipsize"}),"tick_size":normalized.get("tick_size"),
+        "price_precision":_quote_number(raw,{"priceprecision","digits","decimalplaces"}),
+        "contract_size":normalized.get("contract_size"),"quantity_step":normalized.get("quantity_increment"),
+        "minimum_quantity":normalized.get("minimum_quantity"),"maximum_quantity":normalized.get("maximum_quantity"),
+        "minimum_stop_distance":_quote_number(raw,{"minimumstopdistance","minstoplossdistance","stoplevel"}),
+        "leverage":_quote_number(raw,{"leverage","effectiveleverage"}),"margin_rate":normalized.get("margin"),
+        "quote_currency":quote_currency}
+    terms=forex_terms(canonical.symbol,metadata)
+    result=calculate_order(terms=terms,side=payload.side,quantity=payload.quantity.value,bid=bid,ask=ask,
+        quote_timestamp=quote_timestamp,quote_source="TradeLocker",stop_loss=payload.stop_loss.model_dump() if payload.stop_loss else None,
+        take_profit=payload.take_profit.model_dump() if payload.take_profit else None,account_currency=account_currency,
+        account_equity=equity,quote_to_account_rate=rate)
+    result["instrument"]={**canonical.model_dump(),"quantity_unit":terms.quantity_unit}
+    result["capabilities"]={"calculation":True,"preview":bool((owned.get("capabilities") or {}).get("order_preview")),
+        "submission":bool((owned.get("capabilities") or {}).get("order_submission"))}
+    return result
 
 
 @router.get("/markets/{canonical_id:path}/summary")
