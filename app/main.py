@@ -6,6 +6,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.forex import router as forex_router
 from app.api.routes.platform import router as platform_router
 from app.api.routes.oauth import router as oauth_router
+from app.api.routes.integrations import router as integrations_router
 from app.webhooks.tradingview import router as tradingview_router
 from app.mcp.server import mcp_app
 from app.mcp.auth import MCPAuthMiddleware
@@ -100,5 +101,6 @@ app.include_router(health_router)
 app.include_router(forex_router)
 app.include_router(platform_router)
 app.include_router(oauth_router)
+app.include_router(integrations_router)
 app.include_router(tradingview_router, prefix="/webhooks", tags=["webhooks"])
 app.mount("/mcp", mcp_app)

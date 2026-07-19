@@ -122,6 +122,15 @@ class OAuthRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_oauth_refresh_family
                     ON oauth_refresh_tokens(family_id);
+                CREATE TABLE IF NOT EXISTS oauth_client_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_sub TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_oauth_client_audit_owner
+                    ON oauth_client_audit(user_sub, occurred_at DESC);
                 """
             )
             for table in ("oauth_transactions", "oauth_authorization_codes", "oauth_access_tokens"):
@@ -136,6 +145,21 @@ class OAuthRepository:
         opaque = secrets.token_urlsafe(32)
         signature = hmac.new(self.secret.encode(), opaque.encode(), hashlib.sha256).hexdigest()
         return f"{opaque}.{signature}"
+
+    def _grant_id(self, user_sub: str, client_id: str) -> str:
+        digest = hmac.new(
+            self.secret.encode(), f"{user_sub}\0{client_id}".encode(), hashlib.sha256
+        ).hexdigest()
+        return f"grant_{digest[:32]}"
+
+    @staticmethod
+    def _record_client_audit(
+        connection: sqlite3.Connection, user_sub: str, grant_id: str, event_type: str
+    ) -> None:
+        connection.execute(
+            "INSERT INTO oauth_client_audit(user_sub,grant_id,event_type,occurred_at) VALUES(?,?,?,?)",
+            (user_sub, grant_id, event_type, _iso(_now())),
+        )
 
     def _valid_reference(self, reference: str) -> bool:
         opaque, separator, supplied = reference.partition(".")
@@ -250,6 +274,13 @@ class OAuthRepository:
         scope: str, resource: str, now: datetime, family_id: str | None = None,
         parent_token_hash: str | None = None,
     ) -> dict:
+        existing = connection.execute(
+            """SELECT 1 FROM oauth_access_tokens
+               WHERE user_sub=? AND client_id=? AND revoked_at IS NULL AND expires_at>?
+               UNION SELECT 1 FROM oauth_refresh_tokens
+               WHERE user_sub=? AND client_id=? AND revoked_at IS NULL AND expires_at>? LIMIT 1""",
+            (user_sub, client_id, _iso(now), user_sub, client_id, _iso(now)),
+        ).fetchone()
         access_token = secrets.token_urlsafe(40)
         refresh_token = secrets.token_urlsafe(48)
         access_expires = now + timedelta(seconds=settings.oauth_access_token_ttl_seconds)
@@ -270,6 +301,11 @@ class OAuthRepository:
             (refresh_hash, family_id or secrets.token_urlsafe(24), parent_token_hash,
              user_sub, client_id, scope, resource, _iso(now), _iso(refresh_expires)),
         )
+        if existing is None:
+            self._record_client_audit(
+                connection, user_sub, self._grant_id(user_sub, client_id),
+                "mcp_application_connected",
+            )
         return {
             "access_token": access_token, "token_type": "Bearer",
             "expires_in": settings.oauth_access_token_ttl_seconds,
@@ -316,6 +352,11 @@ class OAuthRepository:
                 scope=granted_scope, resource=resource, now=now,
                 family_id=row["family_id"], parent_token_hash=token_hash,
             )
+            if set(granted_scope.split()) != original_scopes:
+                self._record_client_audit(
+                    connection, row["user_sub"], self._grant_id(row["user_sub"], client_id),
+                    "mcp_permissions_updated",
+                )
             replacement_hash = _hash(result["refresh_token"])
             cursor = connection.execute(
                 """UPDATE oauth_refresh_tokens
@@ -334,6 +375,81 @@ class OAuthRepository:
                    WHERE token_hash=?""", (_iso(_now()), _hash(refresh_token)),
             )
             return cursor.rowcount == 1
+
+    def list_authorized_clients(self, user_sub: str) -> list[dict]:
+        with self._connect() as connection:
+            access = connection.execute(
+                "SELECT client_id,scope,created_at AS issued_at,expires_at,revoked_at FROM oauth_access_tokens WHERE user_sub=?",
+                (user_sub,),
+            ).fetchall()
+            refresh = connection.execute(
+                "SELECT client_id,scope,issued_at,expires_at,revoked_at FROM oauth_refresh_tokens WHERE user_sub=?",
+                (user_sub,),
+            ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in [*access, *refresh]:
+            grouped.setdefault(row["client_id"], []).append(row)
+        now = _now()
+        clients = []
+        for client_id, rows in grouped.items():
+            active = any(
+                not row["revoked_at"] and datetime.fromisoformat(row["expires_at"]) > now
+                for row in rows
+            )
+            revoked = any(row["revoked_at"] for row in rows)
+            current_rows = [
+                row for row in rows
+                if not row["revoked_at"] and datetime.fromisoformat(row["expires_at"]) > now
+            ]
+            scopes = sorted({scope for row in (current_rows or rows) for scope in row["scope"].split()})
+            clients.append({
+                "grant_id": self._grant_id(user_sub, client_id),
+                "client_name": "ChatGPT",
+                "client_type": "mcp",
+                "connected_at": min(row["issued_at"] for row in rows),
+                "last_used_at": None,
+                "granted_scopes": scopes,
+                "status": "active" if active else "revoked" if revoked else "authorization_expired",
+            })
+        return sorted(clients, key=lambda item: item["connected_at"], reverse=True)
+
+    def revoke_authorized_client(self, user_sub: str, grant_id: str) -> dict | None:
+        clients = self.list_authorized_clients(user_sub)
+        match = next((item for item in clients if item["grant_id"] == grant_id), None)
+        if match is None:
+            return None
+        with self._connect() as connection:
+            client_ids = {
+                row["client_id"] for table in ("oauth_access_tokens", "oauth_refresh_tokens")
+                for row in connection.execute(
+                    f"SELECT DISTINCT client_id FROM {table} WHERE user_sub=?", (user_sub,)
+                ).fetchall()
+                if self._grant_id(user_sub, row["client_id"]) == grant_id
+            }
+            if not client_ids:
+                return None
+            changed = False
+            stamp = _iso(_now())
+            for client_id in client_ids:
+                for table in ("oauth_access_tokens", "oauth_refresh_tokens"):
+                    cursor = connection.execute(
+                        f"UPDATE {table} SET revoked_at=COALESCE(revoked_at, ?) WHERE user_sub=? AND client_id=?",
+                        (stamp, user_sub, client_id),
+                    )
+                    changed = changed or cursor.rowcount > 0
+            if changed and match["status"] != "revoked":
+                self._record_client_audit(
+                    connection, user_sub, grant_id, "mcp_application_disconnected"
+                )
+        return {**match, "status": "revoked"}
+
+    def client_audit(self, user_sub: str, limit: int = 100) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,grant_id,event_type,occurred_at FROM oauth_client_audit WHERE user_sub=? ORDER BY occurred_at DESC LIMIT ?",
+                (user_sub, max(1, min(limit, 200))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def access_token_claims(self, token: str) -> dict | None:
         category, claims = self.access_token_status(token, CANONICAL_MCP_RESOURCE)

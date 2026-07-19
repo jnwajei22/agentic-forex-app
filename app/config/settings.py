@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     public_base_url: str = "https://mcp.justinnwajei.com"
     frontend_origin: str = "https://app.agenticforexdesk.com"
     chatgpt_return_url: str = "https://chatgpt.com"
+    chatgpt_setup_url: str | None = None
     oauth_authorization_url: str | None = None
     oauth_token_url: str | None = None
     oauth_transaction_secret: str | None = None

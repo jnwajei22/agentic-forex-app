@@ -26,6 +26,7 @@ from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
 from app.storage.user_experience import UserExperienceRepository
 from app.storage.runtime_settings import RuntimeSettingsRepository
+from app.storage.oauth import OAuthRepository, OAuthStorageError
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
@@ -1035,6 +1036,12 @@ async def activity(account_alias:str|None=None,profile_id:str|None=None,event_ty
         kind=("kill_switch_enabled" if enabled else "kill_switch_disabled") if control=="global_autonomous_kill_switch" else "safety_control_updated"
         events.append({"id":f"control-{record.get('id')}","event_type":kind,"occurred_at":record.get("changed_at"),
             "outcome":"CONFIRMED","reason_codes":[record.get("reason")] if record.get("reason") else []})
+    try:
+        for record in OAuthRepository().client_audit(claims["sub"],100):
+            events.append({"id":f"mcp-{record.get('id')}","event_type":record.get("event_type"),
+                "occurred_at":record.get("occurred_at"),"outcome":"CONFIRMED"})
+    except (OAuthStorageError, OSError):
+        pass
     def keep(item:dict[str,Any])->bool:
         stamp=str(item.get("occurred_at") or "")[:10]
         return (not account_alias or item.get("account_alias")==account_alias) and (not profile_id or item.get("profile_id")==profile_id) \

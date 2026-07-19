@@ -2,6 +2,10 @@ from __future__ import annotations
 
 
 CANONICAL_MCP_RESOURCE = "https://mcp.justinnwajei.com"
+CANONICAL_MCP_ENDPOINT = f"{CANONICAL_MCP_RESOURCE}/mcp"
+MCP_PROTECTED_RESOURCE_METADATA = (
+    f"{CANONICAL_MCP_RESOURCE}/.well-known/oauth-protected-resource"
+)
 
 
 def normalize_resource(value: str | None) -> str:
