@@ -391,10 +391,12 @@ async def market_news(category:str="general",limit:int=Query(20,ge=1,le=50),
 
 @router.get("/markets/calendar")
 async def market_calendar(start:date|None=None,end:date|None=None,limit:int=Query(50,ge=1,le=100),
+                          instrument:str|None=None,
                           claims:dict=Depends(current_claims))->dict:
     first=start or date.today();last=end or first+timedelta(days=14)
     if last<first or (last-first).days>93:raise HTTPException(status_code=422,detail="Calendar range must be 0 to 93 days.")
-    return await _market_response("calendar",first,last,limit)
+    try:return await _market_response("calendar",first,last,limit,instrument)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
 
 
 @router.get("/markets/macro")
@@ -402,9 +404,52 @@ async def market_macro(claims:dict=Depends(current_claims))->dict:
     return await _market_response("macro")
 
 
+def _quote_number(payload:Any,names:set[str])->float|None:
+    if isinstance(payload,dict):
+        for key,value in payload.items():
+            if key.casefold() in names:
+                try:return float(value)
+                except (TypeError,ValueError):pass
+        for value in payload.values():
+            found=_quote_number(value,names)
+            if found is not None:return found
+    if isinstance(payload,list):
+        for value in payload:
+            found=_quote_number(value,names)
+            if found is not None:return found
+    return None
+
+
+async def _execution_market_context(user_sub:str,account_alias:str,canonical_id:str)->tuple[dict|None,dict|None]:
+    context,instruments=await _account_instruments(user_sub,account_alias)
+    canonical=instrument_mapper.resolve(canonical_id);candidates={canonical.symbol.casefold(),canonical.symbol.replace("/","").casefold()}
+    match=next((item for item in instruments if candidates.intersection({
+        str(item.get("symbol","")).casefold(),str(item.get("broker_symbol","")).casefold()})),None)
+    tradability={"account_alias":account_alias,"available":match is not None,
+        "currently_tradable":bool(match and match.get("tradeable",match.get("tradable",True))),
+        "environment":context.get("environment"),"source":"TradeLocker"}
+    if not match:return None,tradability
+    symbol=str(match.get("broker_symbol") or match.get("symbol") or canonical.symbol)
+    try:
+        async with TradeLockerClient(base_url=context["base_url"],username=context["username"],password=context["password"],
+            server=context["server"],account_id=context["account_id"],account_number=context["account_number"]) as client:
+            raw=await client.get_quote(symbol)
+        bid=_quote_number(raw,{"bid","bidprice"});ask=_quote_number(raw,{"ask","askprice"})
+        price=_quote_number(raw,{"price","last","lastprice","mid","close"})
+        if price is None and bid is not None and ask is not None:price=(bid+ask)/2
+        return ({"price":price,"bid":bid,"ask":ask,"timestamp":datetime.now(timezone.utc).isoformat(),
+                 "source":"TradeLocker"} if price is not None else None),tradability
+    except (TradeLockerError,HTTPException):return None,tradability
+
+
 @router.get("/markets/{canonical_id:path}/summary")
-async def market_summary(canonical_id:str,claims:dict=Depends(current_claims))->dict:
-    try:return await _market_response("summary",canonical_id)
+async def market_summary(canonical_id:str,account_alias:str|None=None,claims:dict=Depends(current_claims))->dict:
+    try:
+        execution_quote=tradability=None
+        if account_alias:
+            try:execution_quote,tradability=await _execution_market_context(claims["sub"],account_alias,canonical_id)
+            except HTTPException:pass
+        return await _market_response("summary",canonical_id,execution_quote,tradability)
     except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
 
 

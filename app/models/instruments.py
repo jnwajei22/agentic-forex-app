@@ -29,5 +29,7 @@ class MarketSummary(BaseModel):
     instrument: CanonicalInstrument
     quote: dict | None = None
     market_status: dict
+    drivers: list[dict] = Field(default_factory=list)
+    tradability: dict | None = None
     sources: list[MarketSourceStatus]
     partial: bool = False
